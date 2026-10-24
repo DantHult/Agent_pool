@@ -28,6 +28,7 @@ def execute(params):
         notify('turn/completed',{'threadId':thread,'turn':{'id':turn,'status':'failed'}});return
     (working/'native_tools.py').write_text("def normalize(text):\n    return ' '.join(text.lower().split())\n" if profile!='a' else "def normalize(text):\n    return text.strip()\n")
     notify('item/completed',{'threadId':thread,'item':{'id':'inspect','type':'commandExecution','aggregatedOutput':'mock transport wrote genuine temporary source file','exitCode':0}})
+    if scenario.get('crash'):os._exit(7)
     notify('item/reasoning/textDelta',{'threadId':thread,'delta':'private-reasoning-must-not-persist'})
     delay=scenario.get('delay',0);deadline=time.monotonic()+delay
     while time.monotonic()<deadline:

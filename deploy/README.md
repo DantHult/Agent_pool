@@ -1,3 +1,11 @@
+# Shared invite-only HTTPS deployment
+
+For multiple human computers, start with [MULTI_COMPUTER.md](../docs/MULTI_COMPUTER.md). It contains exact account bootstrap, HTTPS reverse proxy/service commands, safe LAN testing, roles, invitations, authorized repository import and three-device demo instructions. Use `--auth invite` (the CLI default), persistent storage and the supplied `shared.env.example`, `Caddyfile.shared` and `relay.service`. Shared execution uses the optional organization API backend below. Native consumer profiles are disabled in shared mode and must never be uploaded/copied to a server.
+
+Observed evidence: three member browser sessions plus independent Organizer/Outsider sessions passed a real-Chrome fallback on one Mac with simulated inference, real file/checkpoint/test activity and restart persistence. Real physical multi-host/live organization execution remains **NOT VERIFIED**. See [MULTI_COMPUTER_STATUS.md](../docs/MULTI_COMPUTER_STATUS.md).
+
+The local-owner native dashboard now requires `--auth local-owner --backend native` and an offline-pinned account; it rejects demo/shared/public/proxied use. See [LOCAL_NATIVE_DASHBOARD.md](../docs/LOCAL_NATIVE_DASHBOARD.md). It does not authorize cross-person subscription execution.
+
 # Native Codex on macOS
 
 Relay can run three local `codex app-server --stdio` processes. Each process has its own private `CODEX_HOME`, independent ChatGPT login and private Git clones. The native backend needs Python, Git, macOS and the official Codex CLI. **Docker, `RELAY_ORG_OPENAI_API_KEY`, `RELAY_CODEX_MODEL`, the inference proxy and separate API billing are not required.** The default model comes from Codex; `RELAY_NATIVE_MODEL` is optional.
@@ -47,10 +55,11 @@ Only a fully verified run writes `"live_verified": true` to `live-proof/native-s
 For the dashboard:
 
 ```sh
-python3 -m relay.server --backend native --data ./native-dashboard --port 8000
+python3 scripts/manage_accounts.py bootstrap --local-owner --data ./local-native-data --email owner@example.com --name 'Local Owner'
+python3 -m relay.server --auth local-owner --backend native --data ./local-native-data --public-url http://127.0.0.1:8000
 ```
 
-Use Alex (`alice`) unless `RELAY_NATIVE_OWNER` names another configured local owner. Enroll three **Native Codex** workers with profiles A, B and C and approve the selected project. Choose a native worker explicitly in the composer; automatic demo selection still supports the simulation. Select the pause-after-turn option for a planned handoff, then explicitly choose another native worker and press **Switch Worker**. The UI uses two phases by default; the smoke requests three. For custom configuration, both scripts and server accept `--env-file .env`; only load a local file that you have configured. No `.env` is needed for the native commands above.
+Sign in with the dedicated offline-pinned Relay owner account. Use the **NATIVE LOCAL profiles** panel to select a profile for the project or prepare a successor, then explicitly request the handoff. Demo/shared identity selection cannot enroll or execute native workers. Choose a native worker explicitly in the composer; automatic demo selection still supports the simulation. Select the pause-after-turn option for a planned handoff, then explicitly choose another native worker and press **Switch Worker**. The UI uses two phases by default; the smoke requests three. For custom configuration, both scripts and server accept `--env-file .env`; only load a local file that you have configured. No `.env` is needed for the native commands above.
 
 ## Native execution boundaries and recovery
 
@@ -89,7 +98,7 @@ python3 scripts/live_smoke.py --backend docker-api --env-file .env --check
 ```sh
 python3 scripts/live_smoke.py --backend docker-api --env-file .env --run-live --data ./live-proof
 # To use the same configuration in the web app:
-python3 -m relay.server --env-file .env
+python3 -m relay.server --auth demo --env-file .env
 ```
 
 A passing readiness check establishes local configuration/image/network availability, not successful API authorization, model access or a genuine completed coding task. The opt-in smoke remains the live proof.
@@ -113,7 +122,7 @@ export RELAY_CODEX_IMAGE=relay-codex:local
 export RELAY_CODEX_NETWORK=relay-codex-internal
 export RELAY_CODEX_PROXY_URL=http://relay-codex-proxy:8080/v1
 export RELAY_CODEX_TIMEOUT_SECONDS=180
-python3 -m relay.server
+python3 -m relay.server --auth demo
 ```
 
 The `.env.example` file is not auto-loaded by Relay. Docker Compose may read your local `.env`; use environment injection or an external secret manager for deployed setups. Never commit a populated `.env`.
@@ -131,7 +140,7 @@ The outer Docker container is the execution sandbox. Codex is explicitly given `
 
 Cancellation removes the task-labeled container and kills its CLI connection. A separate PID1 watchdog stops the command process group after the configured deadline, even if the host loses its Docker connection. If container removal cannot be confirmed, the adapter reports `safe_to_release=False`; Relay retains the writer lease for administrator inspection instead of starting another writer. Recovery identifies only Relay-managed containers with the persisted task ID. Restore Docker, verify/stop the affected container, then restart Relay to recover safely. No uncertain tool is automatically replayed.
 
-The sample application remains loopback-only with local demo login. This sandbox configuration does not make Relay's identity system production-ready. Before remote hosting, implement real SSO/session authentication, TLS, tenant-scoped proxy secrets, protected Docker control access, retention limits, and volume backups. Quota is shared organization API quota; switching logical workers does not create capacity or reset usage limits.
+The explicit demo identity mode remains loopback-only. For multiple human devices, use the implemented invite-account/session boundary and HTTPS configuration in MULTI_COMPUTER.md. This container configuration alone does not authenticate humans. Deployment still requires protected Docker control, secret handling, retention/backups and an external security review; established SSO/MFA remains future work. Quota is shared organization API quota; switching logical workers does not create capacity or reset usage limits.
 
 ## Live single-worker and A→B proof
 

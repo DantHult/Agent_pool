@@ -4,7 +4,7 @@ const $ = id => document.getElementById(id);
 const terminalStates = new Set(['completed', 'failed', 'cancelled']);
 const executionModes = {
   simulation: 'Demo / simulated',
-  native: 'Native Codex · ChatGPT',
+  native: 'NATIVE LOCAL · Codex',
   organization_api: 'Organization API',
   personal_supported: 'Personal subscription · unsupported'
 };
@@ -29,6 +29,7 @@ let csrfToken = '';
 let registration = false;
 let liveSource = null;
 let liveTimer = null;
+let nativeProfiles = null;
 
 const esc = value => String(value ?? '').replace(/[&<>"']/g, character => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
@@ -46,7 +47,7 @@ async function api(path, body) {
     const failure = new Error(data.error || 'Request failed');
     failure.status = response.status;
     failure.code = data.code;
-    if (response.status === 401 && authMode === 'invite') showSignIn();
+    if (response.status === 401 && authMode !== 'demo') showSignIn();
     throw failure;
   }
   return data;
@@ -107,6 +108,7 @@ function invalidateView() {
   lastConversation = null;
   events = [];
   detail = null;
+  nativeProfiles = null;
   selectedStartWorker = '';
   selectedTarget = '';
   clearHistory();
@@ -155,6 +157,10 @@ async function load(force = false) {
     if (version !== viewVersion || serial !== refreshSerial) return;
     const nextProject = nextOverview.projects.some(item => item.id === project)
       ? project : nextOverview.projects[0]?.id;
+    if (authMode === 'local-owner') {
+      nativeProfiles = await api('native/profiles' + (nextProject ? '?project_id=' + encodeURIComponent(nextProject) : ''));
+      renderNativeProfiles(nextProject);
+    }
     if (!nextProject) {
       overview = nextOverview;
       project = null;
@@ -195,7 +201,10 @@ async function load(force = false) {
     render();
     $('timeline').scrollTop = nearBottom ? $('timeline').scrollHeight : scroll;
   } finally {
-    if (version === viewVersion && serial === refreshSerial) loading = false;
+    if (version === viewVersion && serial === refreshSerial) {
+      loading = false;
+      if (authMode === 'local-owner') renderNativeProfiles();
+    }
   }
 }
 
@@ -239,10 +248,10 @@ function renderWorkerSelectors(workers, task) {
 function eventOrigin(event) {
   let metadata = {};
   try { metadata = typeof event.metadata === 'string' ? JSON.parse(event.metadata) : event.metadata || {}; } catch {}
-  if (metadata.origin === 'codex') return 'LIVE CODEX';
+  if (metadata.origin === 'codex') return metadata.execution_mode === 'native' ? 'NATIVE LOCAL' : 'ORG API';
   if (metadata.origin === 'simulation') return 'SIMULATED';
-  if (metadata.origin === 'human' || event.role === 'user') return 'HUMAN';
-  return metadata.execution_mode === 'native' ? 'RELAY / NATIVE TASK' : metadata.execution_mode === 'organization_api' ? 'RELAY / API TASK' : 'RELAY';
+  if (metadata.origin === 'human' || event.role === 'user') return metadata.execution_mode === 'native' ? 'HUMAN / NATIVE LOCAL' : metadata.execution_mode === 'organization_api' ? 'HUMAN / ORG API' : 'HUMAN / SIMULATED';
+  return metadata.execution_mode === 'native' ? 'RELAY / NATIVE LOCAL' : metadata.execution_mode === 'organization_api' ? 'RELAY / API TASK' : 'RELAY';
 }
 
 function eventFacts(event) {
@@ -263,18 +272,21 @@ function render() {
   document.querySelector('.conversation div').innerHTML = esc(currentProject?.name || project) + '<small>One conversation. Every worker.</small>';
   $('conversationId').textContent = detail.conversation.id;
   $('authBadge').textContent = overview.auth?.mode === 'local_demo'
-    ? '● Local demo login · not production authentication' : '● ' + (overview.auth?.mode || 'Local demo login');
+    ? '● Local demo login · not production authentication' : '● Signed in · ' + overview.user.name;
   const task = activeTask();
   const workers = projectWorkers();
   $('taskState').textContent = task?.state || detail.tasks[0]?.state || 'Ready';
   $('pauseAfterTurn').disabled = busy || !!task;
+  if (authMode === 'local-owner') $('authBadge').textContent = '● NATIVE LOCAL · owner ' + overview.user.name;
   $('timeline').innerHTML = events.length ? events.map(event => `<article class="event ${esc(event.event_type)} ${esc(event.role)}"><div class="event-head"><span>${esc(event.worker_id ? workerName(event.worker_id) : event.role === 'user' ? 'YOU' : 'RELAY')} · ${esc(event.event_type)} · ${esc(eventOrigin(event))}</span><time datetime="${esc(event.timestamp)}">${esc(displayDate(event.timestamp))}</time></div>${esc(event.content)}${eventFacts(event)}</article>`).join('') : '<div class="welcome"><div class="welcome-icon">⇄</div><h2>A fresh start. A continuous thread.</h2><p>Choose an approved worker and give it a task. Code, tests, and visible history stay with this project.</p><div class="steps"><span>01 Start a task</span><span>02 Save a checkpoint</span><span>03 Pass the context</span></div></div>';
   $('workers').innerHTML = workers.length ? workers.map(worker => renderWorker(worker, task)).join('') : '<div class="empty">No workers are visible for this project. Enroll your own worker or ask an owner to approve this project.</div>';
+  const nativeWorkerCount = workers.filter(worker => worker.execution_mode === 'native').length;
+  const hasOrgWorkers = workers.some(worker => worker.execution_mode === 'organization_api');
   const liveNative = workers.filter(worker => worker.execution_mode === 'native' && worker.health?.available).length;
   const liveApi = workers.some(worker => worker.execution_mode === 'organization_api' && worker.health?.available);
   const simulationCount = workers.filter(worker => worker.execution_mode === 'simulation').length;
-  $('connectionTitle').textContent = liveNative ? `${liveNative} native ChatGPT profile${liveNative === 1 ? '' : 's'} ready` : liveApi ? 'Organization API runtime configured' : `${simulationCount} simulated worker${simulationCount === 1 ? '' : 's'}`;
-  $('connectionDetail').textContent = liveNative ? 'Local App Servers · owner initiated · execution results recorded per task' : liveApi ? 'Backend health only; each execution reports its own result' : 'Select a configured native or API worker for live execution';
+  $('connectionTitle').textContent = nativeWorkerCount ? `NATIVE LOCAL · ${nativeWorkerCount} enrolled worker${nativeWorkerCount === 1 ? '' : 's'}` : liveApi ? 'ORG API runtime configured' : hasOrgWorkers ? 'ORG API runtime unavailable' : `${simulationCount} simulated worker${simulationCount === 1 ? '' : 's'}`;
+  $('connectionDetail').textContent = nativeWorkerCount ? 'Local App Servers · owner initiated · availability and actual results recorded per worker/task' : liveApi ? 'Backend health only; each execution reports its own result' : 'Select a configured native or API worker for live execution';
   $('connectionDot').classList.toggle('api-connected', !!liveNative || liveApi);
   const unsupported = overview.personal_subscription || detail.personal_subscription;
   if (unsupported?.reason) $('personalReason').textContent = unsupported.reason;
@@ -285,7 +297,12 @@ function render() {
   $('demo').disabled = busy || !!task;
   document.querySelector('.send').disabled = busy || !!task;
   renderWorkerSelectors(workers, task);
-  if (task?.execution_mode === 'native') $('switch').disabled = busy || !selectedTarget;
+  if (task?.execution_mode === 'native') {
+    const source = workers.find(worker => worker.id === task.worker_id);
+    const exhausted = source?.capacity?.availability === 'quota_blocked';
+    $('switch').disabled = busy || !selectedTarget || exhausted;
+    $('resume').disabled = busy || exhausted || task.state !== 'handoff_pending';
+  }
   const selectedMode = workers.find(worker => worker.id === selectedStartWorker)?.execution_mode;
   $('composerNote').textContent = selectedMode === 'native'
     ? 'NATIVE CODEX · Your local ChatGPT profile · Choose handoff targets explicitly'
@@ -296,10 +313,12 @@ function render() {
       : 'Automatic mode · Validator demo uses simulation; approved API tasks use organization funding. Unavailable work queues.';
   renderArtifact();
   bindWorkerSettings();
+  renderNativeProfiles();
   setControlsDisabled(busy);
   const writable = currentCanWrite();
   $('pause').disabled = busy || !task || !writable || !['running', 'queued'].includes(task.state);
-  $('resume').disabled = busy || !task || !writable || task.state !== 'handoff_pending';
+  const sourceWorker = workers.find(worker => worker.id === task?.worker_id);
+  $('resume').disabled = busy || !task || !writable || task.state !== 'handoff_pending' || sourceWorker?.capacity?.availability === 'quota_blocked' || !eligible(sourceWorker || {});
   $('handoffPhases').disabled = busy || !!task || !writable;
   $('demo').hidden = authMode !== 'demo';
   if (!writable) {
@@ -498,6 +517,25 @@ $('enrollmentForm').onsubmit = async event => {
     ? 'Worker registered as unsupported. Personal subscription execution remains disabled.' : 'Worker enrolled. Eligibility is evaluated against project approval, owner opt-in, capacity, and runtime health.');
 };
 
+function renderNativeProfiles(selectedProject = project) {
+  $('localNativePanel').hidden = authMode !== 'local-owner';
+  if (!nativeProfiles || authMode !== 'local-owner') return;
+  $('localNativeOwner').textContent = 'Pinned owner: ' + (overview?.user.name || nativeProfiles.profiles[0]?.owner_name || 'Local owner');
+  $('localNativeProfiles').innerHTML = nativeProfiles.profiles.map(profile => `<article class="native-profile"><strong>Codex ${esc(profile.profile.toUpperCase())}</strong><span class="pill">${esc(profile.status)}</span><p>${esc(profile.reason)}</p><button class="outline" data-native-profile="${esc(profile.profile)}" ${busy || loading || !detail || !selectedProject || !profile.available ? 'disabled' : ''}>${activeTask() ? 'Prepare ' + esc(profile.profile.toUpperCase()) + ' for handoff' : 'Select ' + esc(profile.profile.toUpperCase()) + ' for this project'}</button></article>`).join('');
+  document.querySelectorAll('[data-native-profile]').forEach(button => button.onclick = async () => {
+    if (busy || !selectedProject) return;
+    busy = true;
+    try {
+      const worker = await api('native/profiles/enroll', {profile: button.dataset.nativeProfile, project_id: selectedProject});
+      if (activeTask()) selectedTarget = worker.id;
+      else selectedStartWorker = worker.id;
+      await load(true);
+      showNotice(activeTask() ? 'Native successor prepared. Use Request Handoff to authorize its execution explicitly.' : 'NATIVE LOCAL profile selected. Enter your coding objective; no simulation will be substituted.');
+    } catch (failure) { showError(failure); }
+    finally { busy = false; if (detail) render(); }
+  });
+}
+
 function currentCanWrite() {
   return overview?.projects?.find(item => item.id === project)?.can_write !== false;
 }
@@ -510,13 +548,14 @@ function showWorkspaceIdentity(value) {
   $('identityLabel').hidden = !demo;
   $('signedInName').hidden = demo;
   $('signedInName').textContent = value.user.name;
+  document.querySelector('.profile > .avatar').textContent = value.user.name.split(/\s+/).map(part => part[0]).join('').slice(0, 2).toUpperCase();
   $('logout').hidden = demo;
   $('organizationName').textContent = value.organizations[0]?.name || 'Relay';
-  $('organizationMode').textContent = demo ? 'Local demo organization' : 'Invite-only organization';
-  $('inviteMember').hidden = demo || value.user.role !== 'admin';
-  $('manageMembers').hidden = demo || value.user.role !== 'admin';
+  $('organizationMode').textContent = authMode === 'local-owner' ? 'Local owner · loopback only' : demo ? 'Local demo organization' : 'Invite-only organization';
+  $('inviteMember').hidden = authMode !== 'invite' || value.user.role !== 'admin';
+  $('manageMembers').hidden = authMode !== 'invite' || value.user.role !== 'admin';
   $('workerMode').querySelectorAll('option').forEach(option => {
-    option.disabled = !demo && ['native', 'personal_supported'].includes(option.value);
+    option.disabled = option.value === 'native' ? authMode !== 'local-owner' || !value.auth.native_enabled : option.value === 'personal_supported' && !demo;
   });
 }
 
@@ -555,7 +594,7 @@ function subscribe(conversation, after) {
   // EventSource reconnects with Last-Event-ID. Polling remains the fallback.
 }
 
-$('toggleRegistration').onclick = () => { registration = !registration; renderRegistration(); };
+$('toggleRegistration').onclick = () => { if (authMode !== 'invite') return; registration = !registration; renderRegistration(); };
 $('accountForm').onsubmit = async event => {
   event.preventDefault();
   const button = $('accountForm').querySelector('button[type="submit"]');
@@ -612,10 +651,12 @@ $('membersForm').onsubmit = async event => {
 async function init() {
   const config = await api('auth/config');
   authMode = config.mode;
-  if (authMode === 'invite') {
+  if (authMode !== 'demo') {
     $('prompt').value = '';
+    $('toggleRegistration').hidden = authMode === 'local-owner';
+    $('accountTitle').textContent = authMode === 'local-owner' ? 'Sign in as the local owner' : 'Sign in to Relay';
     const fragment = new URLSearchParams(location.hash.slice(1));
-    if (fragment.has('invite')) {
+    if (authMode === 'invite' && fragment.has('invite')) {
       registration = true;
       $('invitationToken').value = fragment.get('invite');
       history.replaceState(null, '', location.pathname);

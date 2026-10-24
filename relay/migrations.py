@@ -114,7 +114,8 @@ def migrate_native(db):
 
 
 def migrate_accounts(db):
-    if db.execute('SELECT 1 FROM schema_migrations WHERE version=5').fetchone():return
+    if db.execute('SELECT 1 FROM schema_migrations WHERE version=5').fetchone():
+        migrate_local_owner(db);return
     db.execute('BEGIN IMMEDIATE')
     try:
         statements=[
@@ -126,6 +127,18 @@ def migrate_accounts(db):
         ]
         for statement in statements:db.execute(statement)
         db.execute('INSERT INTO schema_migrations VALUES(5,?)',(datetime.now(timezone.utc).isoformat(),))
+        db.execute('COMMIT')
+    except Exception:
+        db.execute('ROLLBACK');raise
+    migrate_local_owner(db)
+
+
+def migrate_local_owner(db):
+    if db.execute('SELECT 1 FROM schema_migrations WHERE version=6').fetchone():return
+    db.execute('BEGIN IMMEDIATE')
+    try:
+        db.execute('CREATE TABLE local_owner_binding(singleton INTEGER PRIMARY KEY CHECK(singleton=1),user_id TEXT NOT NULL,os_uid INTEGER NOT NULL,created_at REAL NOT NULL)')
+        db.execute('INSERT INTO schema_migrations VALUES(6,?)',(datetime.now(timezone.utc).isoformat(),))
         db.execute('COMMIT')
     except Exception:
         db.execute('ROLLBACK');raise

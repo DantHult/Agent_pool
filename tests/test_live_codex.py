@@ -132,6 +132,21 @@ class LiveTransportIntegrationTests(unittest.TestCase):
         restored=self.relay.detail('alice','demo');self.assertEqual(restored['execution_runs'],detail['execution_runs'])
         self.assertEqual(self.relay.events('alice',self.conversation,limit=100)['events'],full)
         self.assertEqual(restored['workspace']['files']['tags.py'],detail['workspace']['files']['tags.py'])
+    def test_three_phase_api_handoff_keeps_middle_turn_partial_instruction(self):
+        third=self.enroll('Live C');self.adapters[third].script=PHASE_B.replace('mock-native-B','mock-native-C')
+        task=self.relay.mutate('alice','prompt',{'conversation_id':self.conversation,'worker_id':self.a,'prompt':PROMPT,'pause_after_turn':True,'native_phases':3})
+        first=self.wait(task,'handoff_pending')
+        self.relay.mutate('alice','switch',{'task_id':task['id'],'generation':first['generation'],'target_worker_id':self.b})
+        second=self.wait(task,'handoff_pending')
+        self.assertEqual(second['execution_phase'],2)
+        transmitted=(self.root/(self.b+'.prompt')).read_text()
+        self.assertIn('PHASE 2 / HANDOFF BOUNDARY (3 planned phases)',transmitted)
+        self.assertIn('Leave substantive implementation or tests unfinished',transmitted)
+        self.relay.mutate('alice','switch',{'task_id':task['id'],'generation':second['generation'],'target_worker_id':third})
+        self.assertEqual(self.wait(task,'completed')['conversation_id'],self.conversation)
+        detail=self.relay.detail('alice','demo')
+        self.assertEqual(len(detail['execution_runs']),3);self.assertEqual(len(detail['handoffs']),2)
+        self.assertEqual(len({r['native_thread_id'] for r in detail['execution_runs']}),3)
     def test_switch_during_running_transport_waits_for_process_stop(self):
         self.adapters[self.a].block=True
         task=self.start(False); deadline=time.monotonic()+5

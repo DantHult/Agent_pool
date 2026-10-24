@@ -23,6 +23,7 @@ from .app_server import AppServerClient,AppServerError,PERMISSION_NAME,server_co
 from .codex_events import progress_from_message
 from .security import clean,scrub
 from .workspace import Workspace
+from .native_environment import RUNTIME_NAMES,hydrate,toolchain_signature,workspace_environment
 
 PROFILE_IDS=('a','b','c')
 
@@ -41,13 +42,13 @@ def initialize_profiles():
 
 def thread_options(working):
     params={'cwd':str(working),'runtimeWorkspaceRoots':[str(working)],'permissions':PERMISSION_NAME,'approvalPolicy':'never','ephemeral':True,
-            'config':{'shell_environment_policy.set':{'PATH':os.environ.get('PATH','/usr/bin:/bin'),'HOME':str(working),'TMPDIR':str(working/'.tmp')}}}
+            'config':{'shell_environment_policy.set':workspace_environment(working)}}
     if os.environ.get('RELAY_NATIVE_MODEL'):params['model']=os.environ['RELAY_NATIVE_MODEL']
     return params
 
 class NativeSession:
     def __init__(self,profile):
-        self.profile=profile;self.lock=threading.Lock();self.client=None;self.account_hash=None;self.profile_lock=None;self.probed=False
+        self.profile=profile;self.lock=threading.Lock();self.client=None;self.account_hash=None;self.profile_lock=None;self.probed=False;self.tools_signature=None
     def connect(self):
         home,workspaces=profile_paths(self.profile)
         if not home.is_dir() or home.is_symlink() or not workspaces.is_dir() or workspaces.is_symlink():
@@ -56,7 +57,8 @@ class NativeSession:
             if (path.stat().st_mode&0o077) or path.stat().st_uid!=os.getuid():raise AppServerError('Native profile and workspace directories must be owned by the current OS user with mode 0700')
         codex=shutil.which(os.environ.get('RELAY_CODEX_BIN','codex'))
         if not codex:raise AppServerError('Codex CLI is not installed or not on PATH')
-        if self.client and not self.client.closed and self.client.process.poll() is None:return self.client
+        signature=toolchain_signature()
+        if self.client and not self.client.closed and self.client.process.poll() is None and signature==self.tools_signature:return self.client
         if self.client:self.client.close();self.client=None;self.probed=False;self.account_hash=None
         if self.profile_lock is None:
             self.profile_lock=open(home/'relay.lock','a+')
@@ -67,6 +69,7 @@ class NativeSession:
         try:
             self.client=AppServerClient(server_command(codex),server_environment(home),home)
             self.client.initialize()
+            self.tools_signature=signature
         except Exception:
             self.close();raise
         return self.client
@@ -125,11 +128,11 @@ def close_native_sessions():
     for session in sessions:session.close()
 atexit.register(close_native_sessions)
 
-def native_readiness():
+def native_readiness(profiles=PROFILE_IDS):
     checks=[('Native macOS execution host',platform.system()=='Darwin'),('Codex CLI installed',bool(shutil.which(os.environ.get('RELAY_CODEX_BIN','codex'))))]
     details=[];identities=[]
     if not all(ok for _,ok in checks):return checks,details
-    for profile in PROFILE_IDS:
+    for profile in profiles:
         try:
             session=session_for(profile)
             with session.lock:
@@ -151,17 +154,21 @@ class NativeCodexAdapter:
     def __init__(self,worker):
         self.worker=worker;self.profile=worker.get('native_profile');self._active={}
     def health(self):
-        base={'available':False,'connected':False,'mode':'native','capabilities':self.capabilities}
-        if os.environ.get('RELAY_ENABLE_NATIVE')!='1':return {**base,'reason':'Native execution disabled; use --backend native or enable RELAY_ENABLE_NATIVE'}
+        base={'available':False,'connected':False,'mode':'native','status':'unavailable','authentication':'unknown','capabilities':self.capabilities}
+        if not self.worker.get('_native_enabled',os.environ.get('RELAY_ENABLE_NATIVE')=='1'):return {**base,'reason':'Native execution disabled; use --auth local-owner --backend native'}
         if platform.system()!='Darwin':return {**base,'reason':'Native execution requires macOS sandbox support'}
-        if self.worker.get('owner_type')!='user' or self.worker.get('owner_id')!=native_owner():return {**base,'reason':'Native subscription is restricted to its configured local owner'}
+        expected_owner=self.worker.get('_native_owner_id') or native_owner()
+        if self.worker.get('owner_type')!='user' or self.worker.get('owner_id')!=expected_owner:return {**base,'reason':'Native subscription is restricted to its configured local owner'}
+        if self.worker.get('state')=='quota_blocked':return {**base,'status':'quota_blocked','reason':'Provider reported this profile exhausted; wait for capacity. No automatic account rotation.'}
         try:
             session=session_for(self.profile)
-            if not session.lock.acquire(blocking=False):return {**base,'reason':'Native profile is executing another task'}
+            if not session.lock.acquire(blocking=False):return {**base,'status':'busy','reason':'Native profile is executing another task'}
             try:session.connect();session.permissions(profile_paths(self.profile)[1]);session.probe();session.auth()
             finally:session.lock.release()
-            return {**base,'available':True,'reason':'Local ChatGPT profile authenticated; execution must be initiated by its owner. No API key or Docker required.'}
-        except (ValueError,AppServerError,OSError) as exc:return {**base,'reason':clean(str(exc))}
+            return {**base,'available':True,'status':'available','authentication':'chatgpt','reason':'Local ChatGPT profile authenticated; execution must be initiated by its owner. No API key or Docker required.'}
+        except (ValueError,AppServerError,OSError) as exc:
+            message=clean(str(exc))
+            return {**base,'status':'unauthenticated' if 'ChatGPT login' in message else 'unavailable','reason':message}
     def cancel(self,task_id):
         active=self._active.get(task_id)
         if active:active['cancel'].set()
@@ -177,13 +184,20 @@ class NativeCodexAdapter:
         subprocess.run(['git','-c','core.hooksPath=/dev/null','clone','--quiet','--no-hardlinks','--no-local',str(source),str(target)],env=env,check=True,capture_output=True,timeout=15)
         metadata=source/'.relay'
         if metadata.is_dir() and not metadata.is_symlink():shutil.copytree(metadata,target/'.relay',symlinks=False,dirs_exist_ok=True)
-        (target/'.tmp').mkdir();return target,expected
+        environment=hydrate(target)
+        # Local exclusions cannot be edited by model commands (.git is read-only).
+        # Runtime assets must never reach redaction/checkpoint file limits or Git.
+        with (target/'.git/info/exclude').open('a') as output:
+            output.write('\n'+''.join(name+'/\n' for name in sorted(RUNTIME_NAMES)))
+        (target/'.native/environment.json').write_text(json.dumps(environment,indent=2))
+        return target,expected
     def _publish(self,canonical,working,expected):
         source_ws=Workspace(working.parent);canonical_ws=Workspace(canonical.parent)
-        source_ws.redact_files(working.name)
+        source_ws.redact_files(working.name,excluded_names=RUNTIME_NAMES)
         if canonical_ws.git(canonical,'rev-parse','HEAD')!=expected:raise ValueError('Conflicting canonical checkpoint; native worktree retained for review')
-        source_ws.git(working,'add','-A','--','.',':(exclude).relay',':(exclude).tmp')
-        patch=source_ws.git(working,'diff','--cached','--binary','--no-ext-diff',expected,'--','.',':(exclude).relay',':(exclude).tmp')
+        exclusions=[':(exclude).relay',*(':(exclude,glob)**/'+name+'/**' for name in sorted(RUNTIME_NAMES))]
+        source_ws.git(working,'add','-A','--','.',*exclusions)
+        patch=source_ws.git(working,'diff','--cached','--binary','--no-ext-diff',expected,'--','.',*exclusions)
         if patch:
             if len(patch)>20_000_000:raise ValueError('Native patch exceeds size limit')
             canonical_ws.git(canonical,'apply','--check','--binary','-',input=patch+'\n')
@@ -197,13 +211,16 @@ class NativeCodexAdapter:
         try:
             session.auth();client=session.connect();client.drain()
             working,expected=self._prepare(workspace)
+            environment=json.loads((working/'.native/environment.json').read_text())
+            emit('native_environment',environment['message'],environment)
             session.permissions(working)
             native=client.request('thread/start',thread_options(working))['thread']['id']
             emit('session_started','Started a fresh native Codex thread',{'native_thread_id':native,'native_profile':self.profile})
             phases=int(task.get('native_phases',2));index=int(task.get('execution_phase',0))
             phase=f'Complete useful phase {index+1} of {phases}; leave meaningful pending work for the next owner-initiated handoff.' if task.get('pause_after_turn') and index<phases-1 else 'Complete the remaining objective, inspect previous changes and run tests.'
             text=('Work only in the current private workspace. Read .relay/HANDOFF.md and relevant .relay/history. Never read or request authentication credentials. '
-                  'Git checkpoints are managed by Relay; do not modify .git or .relay. For Python tests use '+shlex.quote(sys.executable)+'. '
+                  'Git checkpoints are managed by Relay; do not modify .git or .relay. Use python/python3 from PATH (the private .venv when prepared), and the approved node/npm on PATH. '
+                  'Read .native/environment.json for dependency readiness. Package downloads are disabled; do not retry network installation. '
                   'Preserve existing work and report actual completed work, pending steps, tests and errors using the result schema. '+phase+'\n\nOriginal request:\n'+task['objective']+'\n\nWorking context:\n'+json.dumps(context)[:30000])
             schema=json.loads((Path(__file__).resolve().parent.parent/'deploy/result.schema.json').read_text())
             turn=client.request('turn/start',{'threadId':native,'input':[{'type':'text','text':text}],'cwd':str(working),'runtimeWorkspaceRoots':[str(working)],'permissions':PERMISSION_NAME,'approvalPolicy':'never','outputSchema':schema})['turn']['id']

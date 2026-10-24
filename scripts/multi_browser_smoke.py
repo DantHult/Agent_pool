@@ -63,10 +63,11 @@ def run(data,chrome):
                 tab.reload();tab.wait_for_function("() => document.getElementById('taskState').textContent==='completed'")
                 assert tab.locator('#conversationId').inner_text()==conversation
                 assert 'Ran 5 tests' in tab.locator('#timeline').inner_text()
-            detail=server.relay.detail(admin_id,project);task=detail['tasks'][0]
-            assert len(detail['execution_runs'])==3 and not server.relay.rows('SELECT * FROM workspace_leases')
-            with server.relay.lock:server.relay.event(task,'tool_output','AUTHORIZED-PROJECT-ARTIFACT '*1000)
-            artifact=server.relay.rows("SELECT json_extract(metadata,'$.artifact_id') AS id FROM events WHERE json_extract(metadata,'$.artifact_id') IS NOT NULL LIMIT 1")[0]['id']
+            with server.relay.lock:
+                detail=server.relay.detail(admin_id,project);task=detail['tasks'][0]
+                assert len(detail['execution_runs'])==3 and not server.relay.rows('SELECT * FROM workspace_leases')
+                server.relay.event(task,'tool_output','AUTHORIZED-PROJECT-ARTIFACT '*1000)
+                artifact=server.relay.rows("SELECT json_extract(metadata,'$.artifact_id') AS id FROM events WHERE json_extract(metadata,'$.artifact_id') IS NOT NULL LIMIT 1")[0]['id']
             # Fourth account is invited to the organization, without project access.
             invited=server.identity_provider.invite(admin_id,{'email':'outsider@relay.invalid'})
             outsider=page();outsider.goto(origin+'/#invite='+invited['invitation_token'])
@@ -84,7 +85,7 @@ def run(data,chrome):
                 tab.reload();tab.wait_for_function("() => document.getElementById('taskState').textContent==='completed'")
                 assert tab.locator('#conversationId').inner_text()==conversation
                 assert 'Ran 5 tests' in tab.locator('#timeline').inner_text()
-            restored=server.relay.detail(admin_id,project)
+            with server.relay.lock:restored=server.relay.detail(admin_id,project)
             assert restored['execution_runs']==detail['execution_runs'] and restored['checkpoints']==detail['checkpoints']
             alex.locator('[data-tab=checkpoints]').click();alex.screenshot(path=str(directory/'three-browser-proof.png'),full_page=True)
             report={'mode':'simulated-inference','browser':'real installed Chrome','isolated_browser_contexts':len(contexts),'authorized_humans':3,'unauthorized_account_blocked':True,'restart_persistence':True,'conversation_id':conversation,'task_id':task['id'],'project_id':project,'worker_ids':workers,'execution_runs':restored['execution_runs'],'checkpoint_ids':[c['git_commit'] for c in restored['checkpoints']],'generated_tests_passed':5,'real_multi_host_verified':False,'live_organization_api_verified':False}

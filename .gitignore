@@ -13,3 +13,13 @@ data-other/
 live-proof/
 live-proof-custom/
 .relay-native/
+
+# Shared account databases, browser proofs and local deployment secrets.
+shared-data/
+multi-proof/
+*.env
+*.pem
+*.key
+# Local-owner account data and disposable native dashboard proof.
+local-native-data/
+native-dashboard-proof/

@@ -49,13 +49,15 @@ class Handler(BaseHTTPRequestHandler):
         return token.value if token else ''
     def identity(self):
         token=self.token()
-        if not token:raise LoginRequired('Sign in to Relay') if self.server.auth_mode=='invite' else PermissionError('Sign in to the local demo')
+        if not token:raise LoginRequired('Sign in to Relay') if self.server.auth_mode!='demo' else PermissionError('Sign in to the local demo')
         return self.server.identity_provider.resolve(token)
     def cookie(self,token):
-        ttl=self.server.identity_provider.ttl if self.server.auth_mode=='invite' else 28800
+        ttl=self.server.identity_provider.ttl if self.server.auth_mode!='demo' else 28800
         return f'{self.server.cookie_name}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={ttl if token else 0}'+('; Secure' if self.server.secure else '')
     def guard(self,mutation=False):
         host=self.headers.get('Host','');origin=self.headers.get('Origin')
+        if self.server.auth_mode=='local-owner':
+            if not ipaddress.ip_address(self.client_address[0]).is_loopback or any(name.lower()=='forwarded' or name.lower().startswith('x-forwarded-') for name in self.headers):raise PermissionError('Local-owner mode rejects remote or forwarded requests')
         if self.server.auth_mode=='demo':
             hosts=(f'127.0.0.1:{self.server.server_port}',f'localhost:{self.server.server_port}')
             origins=tuple('http://'+value for value in hosts)
@@ -63,10 +65,10 @@ class Handler(BaseHTTPRequestHandler):
             hosts=(urlparse(self.server.public_url).netloc,);origins=(self.server.public_url,)
             if self.server.secure and self.headers.get('X-Forwarded-Proto')!='https':raise PermissionError('Use the configured HTTPS endpoint')
         if host not in hosts:raise PermissionError('Invalid host')
-        if (origin and origin not in origins) or (mutation and self.server.auth_mode=='invite' and not origin):raise PermissionError('A same-origin request is required')
+        if (origin and origin not in origins) or (mutation and self.server.auth_mode!='demo' and not origin):raise PermissionError('A same-origin request is required')
         if self.headers.get('Sec-Fetch-Site')=='cross-site':raise PermissionError('Cross-site request blocked')
     def csrf(self):
-        if self.server.auth_mode!='invite':return
+        if self.server.auth_mode=='demo':return
         import hmac
         if not hmac.compare_digest(self.headers.get('X-Relay-CSRF',''),csrf_token(self.token())):raise PermissionError('Session security check failed; reload Relay and try again')
     def client_key(self):
@@ -108,18 +110,21 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.guard();url=urlparse(self.path);path=url.path;q=parse_qs(url.query);relay=self.server.relay
             if path=='/healthz':return self.reply(200,{'status':'ok'})
-            if path=='/api/auth/config':return self.reply(200,{'mode':self.server.auth_mode,'secure':self.server.secure,'registration':'invite-only' if self.server.auth_mode=='invite' else 'demo'})
+            if path=='/api/auth/config':return self.reply(200,{'mode':self.server.auth_mode,'secure':self.server.secure,'registration':'offline-owner-only' if self.server.auth_mode=='local-owner' else 'invite-only' if self.server.auth_mode=='invite' else 'demo'})
             if not path.startswith('/api/'):
                 names={'/':'index.html','/app.js':'app.js','/style.css':'style.css'}
                 if path not in names:return self.reply(404,{'error':'Not found'})
                 name=names[path];mime={'html':'text/html; charset=utf-8','js':'text/javascript; charset=utf-8','css':'text/css; charset=utf-8'}[name.split('.')[-1]]
                 return self.reply(200,(STATIC/name).read_bytes(),mime)
             user=self.identity()
-            if path=='/api/auth/session':return self.reply(200,{'user':relay.user(user),'csrf_token':csrf_token(self.token()) if self.server.auth_mode=='invite' else None})
+            if path=='/api/auth/session':
+                with relay.lock:profile=relay.user(user)
+                return self.reply(200,{'user':profile,'csrf_token':csrf_token(self.token()) if self.server.auth_mode!='demo' else None})
             if re.fullmatch(r'/api/conversations/[^/]+/stream',path):return self.stream(user,path.split('/')[3],int(q.get('after',[self.headers.get('Last-Event-ID','0')])[0]))
             if self.headers.get('Upgrade'):raise ValueError('WebSocket transport is not enabled; use event-stream or polling')
             with relay.lock:
                 if path=='/api/overview':result=relay.overview(user)
+                elif path=='/api/native/profiles':result=relay.native_profiles(user,q.get('project_id',[None])[0])
                 elif path=='/api/workers':result=relay.workers(user,q.get('project_id',[None])[0],q.get('mine',['0'])[0]=='1')
                 elif re.fullmatch(r'/api/projects/[^/]+/(diff|download)',path):
                     project=path.split('/')[3];relay.access(user,project);detail=relay.detail(user,project)
@@ -148,7 +153,8 @@ class Handler(BaseHTTPRequestHandler):
             data=json.loads(self.rfile.read(length));path=urlparse(self.path).path
             if not path.startswith('/api/') or not isinstance(data,dict):raise ValueError('JSON object and API route required')
             method=path.removeprefix('/api/');provider=self.server.identity_provider;relay=self.server.relay
-            if self.server.auth_mode=='invite' and method in ('login','auth/register'):
+            if self.server.auth_mode=='local-owner' and (method=='auth/register' or method.startswith('invitations') or method=='membership'):raise PermissionError('Local-owner mode cannot register or delegate to other users')
+            if self.server.auth_mode!='demo' and method in ('login','auth/register'):
                 fields={'email','password'} if method=='login' else {'email','password','name','invitation_token'}
                 if set(data)-fields:raise ValueError('Unexpected Relay account fields; provider credentials are never accepted')
                 if method=='auth/register':
@@ -160,16 +166,19 @@ class Handler(BaseHTTPRequestHandler):
                 token=provider.login(data['user_id']);return self.reply(200,{'ok':True},cookie=self.cookie(token))
             user=self.identity();self.csrf()
             if method in ('logout','auth/logout-all'):
-                if method=='auth/logout-all' and self.server.auth_mode=='invite':provider.revoke_sessions(user)
+                if method=='auth/logout-all' and self.server.auth_mode!='demo':provider.revoke_sessions(user)
                 else:provider.logout(self.token())
                 return self.reply(200,{'ok':True},cookie=self.cookie(''))
-            if self.server.auth_mode=='invite':
+            if self.server.auth_mode!='demo':
                 if method=='invitations':
                     result=provider.invite(user,data);result['invitation_url']=self.server.public_url+'/#invite='+result.pop('invitation_token')
                     return self.reply(201,result)
                 if method=='invitations/revoke':return self.reply(200,provider.revoke_invite(user,data['id']))
                 if method=='invitations/accept':return self.reply(200,provider.accept(data,user,self.client_key()))
                 if method=='auth/revoke-sessions':return self.reply(200,provider.revoke_sessions(user,data.get('user_id')))
+            if method=='native/profiles/enroll':
+                with relay.lock:result=relay.enroll_native_profile(user,data.get('profile'),data['project_id'])
+                return self.reply(200,result)
             result=relay.mutate(user,method,data);self.reply(200,result)
         except Exception as exc:self.failure(exc)
 
@@ -205,7 +214,7 @@ def make_server(root,port=8000,auth_mode=None,origin=None,allow_http=False):
     # Legacy programmatic construction remains loopback demo for existing callers.
     # The deployable CLI explicitly selects invite authentication by default.
     mode=auth_mode or os.environ.get('RELAY_AUTH_MODE','demo')
-    if mode not in ('demo','invite'):raise ValueError('Unknown authentication mode; use invite or explicit local demo')
+    if mode not in ('demo','invite','local-owner'):raise ValueError('Unknown authentication mode; use invite, local-owner or explicit local demo')
     Path(root).mkdir(parents=True,exist_ok=True);lock=open(Path(root)/'server.lock','a+');server=None
     try:
         try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
@@ -214,17 +223,31 @@ def make_server(root,port=8000,auth_mode=None,origin=None,allow_http=False):
             try:metadata=json.load(lock);metadata=metadata if isinstance(metadata,dict) else {}
             except (ValueError,OSError):metadata={}
             raise ServerAlreadyRunning(root,metadata) from None
-        if mode=='invite' and os.getuid()==0:raise ValueError('Run the shared Relay server as a non-root OS user')
+        if mode!='demo' and os.getuid()==0:raise ValueError('Run the shared Relay server as a non-root OS user')
         configured=public_origin(origin or os.environ.get('RELAY_PUBLIC_URL',''),allow_http) if mode=='invite' else None
+        if mode=='local-owner':
+            selected=origin or os.environ.get('RELAY_PUBLIC_URL') or f'http://127.0.0.1:{port}'
+            configured=public_origin(selected,True)
+            parsed=urlparse(configured)
+            if parsed.scheme!='http' or parsed.hostname not in ('localhost','127.0.0.1'):raise ValueError('Local-owner mode requires a direct HTTP loopback origin; shared/public/proxied deployment is forbidden')
+            if (parsed.port if parsed.port is not None else 80)!=port:raise ValueError('Local-owner origin port must match the loopback listener')
         server=RelayServer(('127.0.0.1',port),Handler);server.workspace_lock=lock
         server.auth_mode=mode;server.secure=bool(configured and configured.startswith('https://'))
         if configured and urlparse(configured).port==0:configured=configured[:-1]+str(server.server_port)
         server.public_url=configured or f'http://127.0.0.1:{server.server_port}'
-        server.cookie_name='__Host-relay_session' if server.secure else 'relay_session'
-        server.relay=Relay(root,demo=mode=='demo')
+        server.cookie_name='relay_local_owner_session' if mode=='local-owner' else '__Host-relay_session' if server.secure else 'relay_session'
+        server.relay=Relay(root,demo=mode=='demo',native_enabled=False)
+        owner_id=None
+        if mode=='local-owner':
+            bindings=server.relay.rows('SELECT * FROM local_owner_binding WHERE singleton=1')
+            if not bindings or bindings[0]['os_uid']!=os.getuid():raise ValueError('No matching local-owner pin. Bootstrap a dedicated directory with scripts/manage_accounts.py bootstrap --local-owner')
+            owner_id=bindings[0]['user_id']
+            accounts=server.relay.rows('SELECT user_id FROM accounts WHERE disabled=0')
+            if len(accounts)!=1 or accounts[0]['user_id']!=owner_id:raise ValueError('Local-owner mode requires its one pinned account; use a dedicated data directory')
+            server.relay.local_owner_id=owner_id;server.relay.native_enabled=True
         ttl=int(os.environ.get('RELAY_SESSION_TTL_SECONDS','28800'));idle=int(os.environ.get('RELAY_SESSION_IDLE_SECONDS','1800'))
         if not 600<=ttl<=86400 or not 60<=idle<=ttl:raise ValueError('Session TTL must be 600–86400 seconds and idle limit 60 seconds up to TTL')
-        server.identity_provider=InviteIdentityProvider(server.relay,ttl,idle) if mode=='invite' else LocalDemoIdentityProvider(server.relay.user)
+        server.identity_provider=InviteIdentityProvider(server.relay,ttl,idle,owner_id=owner_id) if mode!='demo' else LocalDemoIdentityProvider(server.relay.user)
         if mode=='demo':server.sessions=server.identity_provider.sessions
         lock.seek(0);lock.truncate();json.dump({'pid':os.getpid(),'url':server.public_url},lock);lock.flush()
         return server
@@ -233,15 +256,16 @@ def make_server(root,port=8000,auth_mode=None,origin=None,allow_http=False):
         lock.close();raise
 
 def main():
-    parser=argparse.ArgumentParser();parser.add_argument('--backend',choices=('native','docker-api'));parser.add_argument('--auth',choices=('invite','demo'));parser.add_argument('--port',type=int,default=8000);parser.add_argument('--data',default=None);parser.add_argument('--env-file',type=Path);parser.add_argument('--public-url');parser.add_argument('--allow-http-local',action='store_true');args=parser.parse_args()
+    parser=argparse.ArgumentParser();parser.add_argument('--backend',choices=('native','docker-api'));parser.add_argument('--auth',choices=('invite','demo','local-owner'));parser.add_argument('--port',type=int,default=8000);parser.add_argument('--data',default=None);parser.add_argument('--env-file',type=Path);parser.add_argument('--public-url');parser.add_argument('--allow-http-local',action='store_true');args=parser.parse_args()
     try:
         if args.env_file:load_env_file(args.env_file)
         mode=args.auth or os.environ.get('RELAY_AUTH_MODE','invite')
-        if args.backend=='native' and mode!='demo':raise ValueError('Native subscription workers are local-owner only; shared servers use organization API workers')
+        if args.backend=='native' and mode!='local-owner':raise ValueError('Native dashboard execution requires --auth local-owner; demo/shared identities cannot authorize it')
+        if mode=='local-owner' and args.backend!='native':raise ValueError('Local-owner mode requires the explicit --backend native opt-in')
         if args.backend=='native':os.environ['RELAY_ENABLE_NATIVE']='1'
         server=make_server(args.data or os.environ.get('RELAY_DATA_DIR','data'),args.port,mode,args.public_url,args.allow_http_local)
     except (ValueError,OSError,ServerAlreadyRunning) as exc:parser.exit(1,clean(exc)+'\n')
-    print(f'Relay: {server.public_url} · {mode} authentication · shared live execution uses organization API workers',flush=True)
+    print(f'Relay: {server.public_url} · {mode} authentication · '+('NATIVE LOCAL: authenticated pinned owner only' if mode=='local-owner' else 'shared live execution uses organization API workers'),flush=True)
     try:server.serve_forever()
     except KeyboardInterrupt:pass
     finally:server.server_close()

@@ -127,9 +127,11 @@ class Workspace:
             try: os.unlink(temporary, dir_fd=directory)
             except FileNotFoundError: pass
 
-    def _walk(self, directory, prefix=(), display=False, strict=False):
+    def _walk(self, directory, prefix=(), display=False, strict=False, excluded_names=()):
         for name in sorted(os.listdir(directory)):
             relative = prefix + (name,)
+            if name in excluded_names:
+                continue
             if relative == ('.git',) or relative[:2] == ('.relay', 'history'):
                 continue
             if display and name in ('__pycache__', '.venv', 'node_modules'):
@@ -140,7 +142,7 @@ class Workspace:
                 continue
             if stat.S_ISDIR(info.st_mode):
                 child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
-                try: yield from self._walk(child, relative, display, strict)
+                try: yield from self._walk(child, relative, display, strict, excluded_names)
                 finally: os.close(child)
             elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
                 yield directory, name, '/'.join(relative)
@@ -282,13 +284,13 @@ class Workspace:
                          'last_sequence':headers[-1]['sequence'] if headers else None}
                 self._atomic_write(history, 'index.json', json.dumps(index, indent=2).encode(), mode=0o444)
 
-    def redact_files(self, project):
+    def redact_files(self, project, excluded_names=()):
         """Sanitize stopped-worker files using no-follow fds before Git sees them."""
         self.path(project)
         secrets = [os.environ[name].encode() for name in ('RELAY_ORG_OPENAI_API_KEY','RELAY_CODEX_PROXY_TOKEN','OPENAI_API_KEY','CODEX_API_KEY') if os.environ.get(name)]
         total = 0; count = 0
         with self._project_directory(project) as directory:
-            for parent, name, relative in self._walk(directory, strict=True):
+            for parent, name, relative in self._walk(directory, strict=True, excluded_names=excluded_names):
                 if clean(relative) != relative:
                     raise ValueError('Secret-containing workspace filename; rename it before checkpointing')
                 with self._file(parent, name, writable=True) as fd:

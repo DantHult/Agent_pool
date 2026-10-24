@@ -2,19 +2,32 @@
 
 Persistent coding conversations with separately owned Codex worker identities, explicit project approval, and durable handoffs. The credential-free demo runs **simulated inference with real Git files and Python tests**. The native macOS adapter runs three official Codex App Servers with isolated local ChatGPT logins. An optional Docker/organization API backend is preserved; hosted cross-user subscription delegation remains disabled.
 
-## Start locally
+## Shared access from multiple computers
+
+Invite-only Relay accounts, project roles, protected event streams, source downloads, pause/resume and three-worker handoffs are implemented. The CLI defaults to invite authentication; demo identity selection requires `--auth demo`.
+
+```sh
+python3 scripts/manage_accounts.py bootstrap --data ./shared-data --email organizer@example.com --name Organizer
+python3 -m relay.server --auth invite --data ./shared-data --public-url http://127.0.0.1:8000 --allow-http-local
+```
+
+This HTTP exception is loopback-only. Real computers connect through HTTPS as described in [MULTI_COMPUTER.md](docs/MULTI_COMPUTER.md), which includes exact deployment configuration, invitations, roles, repository import and the three-device checklist. [MULTI_COMPUTER_STATUS.md](docs/MULTI_COMPUTER_STATUS.md) records the actual test evidence. Five isolated Chrome contexts passed the three-human fallback on one host, including unauthorized-account denial and restart persistence; inference was explicitly simulated. **Physical multi-host access and live shared organization API execution are NOT VERIFIED here.**
+
+Shared mode uses organization-authorized API workers and disables local native subscriptions. Three human accounts, three execution workers and three consumer subscriptions are separate concepts; inviting teammates does not authorize spending another person's subscription. Existing native local-owner proof and data are preserved.
+
+## Start the explicit local demo
 
 Requires Python 3.10+, Git, and macOS/Linux. The local demo has no package installation or API credential requirement.
 
 ```sh
-python3 -m relay.server
+python3 -m relay.server --auth demo
 ```
 
 Open **http://127.0.0.1:8000**. Alex, Sam and Jordan are seeded **local demo identities**, not authenticated production accounts. The server binds to loopback. Do not expose demo login remotely.
 
 ```sh
 # Separate demo instance: change BOTH the data directory and port.
-python3 -m relay.server --data ./data-other --port 8001
+python3 -m relay.server --auth demo --data ./data-other --port 8001
 # Repeatable command-line demo with fresh temporary state:
 python3 scripts/demo.py
 # Or preserve demo state for inspection (do not share with a running server):
@@ -27,7 +40,7 @@ If startup reports an existing server, open the URL shown or press Ctrl+C in its
 
 ## Exact hackathon demo
 
-1. Launch with a fresh directory: `python3 -m relay.server --data ./demo-session --port 8001`; open http://127.0.0.1:8001 as Alex.
+1. Launch with a fresh directory: `python3 -m relay.server --auth demo --data ./demo-session --port 8001`; open http://127.0.0.1:8001 as Alex.
 2. Select **Password toolkit**. Worker A belongs to Alex; B belongs to Sam. Both have explicitly seeded project approval, opt-in, and independently labeled **simulated** capacity.
 3. Submit the prefilled “Add a password-strength validator and tests to this sample project.” prompt on Worker A. A writes the actual `validator.py` and waits at a safe boundary. Inspect its attributed events and files.
 4. Click **Simulate Usage Limit**. A becomes quota-blocked **in the simulation only**. Relay stops writes, creates a Git checkpoint and context, then assigns approved Worker B.
@@ -54,7 +67,14 @@ python3 scripts/live_smoke.py --backend native --run-live --data ./live-proof
 
 Native execution needs no Docker, organization API key, proxy or required model setting. Each App Server owns its profile and private workspaces. Authentication stays with the CLI; never copy auth files or put credentials in Relay. The smoke requests genuine A → B → C coding work, two Git-checkpointed handoffs, new threads per profile, successful test output and restart persistence. It marks success only after all checks pass. **Real native A → B → C execution was verified on 2026-10-24 with three distinct authenticated accounts, two checkpointed handoffs and seven passing generated tests.** Mocked RPC integration and real CLI protocol/sandbox checks are reported separately in [LIVE_CODEX_STATUS.md](docs/LIVE_CODEX_STATUS.md).
 
-Launch the dashboard with `python3 -m relay.server --backend native`. As the configured local owner (`alice` / Alex by default), enroll **Native Codex** workers with profiles A/B/C and approve your project. Choose a native worker explicitly, enter any coding objective and optionally pause after the first phase. Select another native worker and use **Switch Worker** to continue. The same Relay conversation retains files, visible history and pending steps; each account gets a fresh Codex thread. Only the configured owner can initiate their subscriptions. Usage limits do not automatically rotate accounts.
+Launch the native dashboard with a real pinned local-owner account; demo identity switching cannot authorize native execution:
+
+```sh
+python3 scripts/manage_accounts.py bootstrap --local-owner --data ./local-native-data --email owner@example.com --name 'Local Owner'
+python3 -m relay.server --auth local-owner --backend native --data ./local-native-data --public-url http://127.0.0.1:8000
+```
+
+Sign in as that owner and select A/B/C in the **NATIVE LOCAL profiles** panel. [LOCAL_NATIVE_DASHBOARD.md](docs/LOCAL_NATIVE_DASHBOARD.md) has per-profile checks, exact setup, the ownership guard and the genuine browser A → B proof. Native execution is rejected in demo and shared/invite dashboards. Existing profile logins are used without copying credentials or automating Codex login. Choose a native worker explicitly, enter any coding objective and optionally pause after the first phase. Select another native worker and use **Switch Worker** to continue. The same Relay conversation retains files, visible history and pending steps; each account gets a fresh Codex thread. Only the configured owner can initiate their subscriptions. Usage limits do not automatically rotate accounts.
 
 See [deploy/README.md](deploy/README.md) for exact setup, isolation, recovery, optional custom objectives and the preserved **Docker/API** path. The latter uses `--backend docker-api` and still requires authorized organization funding/configuration. Live execution never falls back to simulation.
 
@@ -62,7 +82,7 @@ See [deploy/README.md](deploy/README.md) for exact setup, isolation, recovery, o
 
 ```mermaid
 flowchart LR
-    U[Local demo identity / future SSO] --> API[Relay HTTP API + permission checks]
+    U[Invite-only Relay human / optional local demo] --> API[Relay HTTP API + permission checks]
     UI[Dashboard] --> API
     API --> DB[(SQLite events, grants, capacity, leases)]
     API --> S[Worker scheduler]
@@ -82,7 +102,7 @@ A **Relay user** is a human account; a **worker owner** controls eligibility; a 
 | Area | Files |
 | --- | --- |
 | Data, migrations, permissions and scheduling | `relay/store.py`, `relay/migrations.py` |
-| HTTP and identity boundary | `relay/server.py`, `relay/auth.py` |
+| HTTP, invite accounts and identity boundary | `relay/server.py`, `relay/accounts.py`, `relay/auth.py` |
 | Typed adapters and capability checks | `relay/workers.py`, `relay/native.py`, `relay/app_server.py` |
 | Git, context artifacts, safe files and redaction | `relay/workspace.py`, `relay/security.py` |
 | Dashboard / worker directory / owner settings | `static/index.html`, `app.js`, `style.css` |
@@ -108,11 +128,11 @@ See [AUTH_EXECUTION_COMPATIBILITY.md](docs/AUTH_EXECUTION_COMPATIBILITY.md) for 
 
 ## HTTP API
 
-All data routes require a Relay demo session; mutation bodies are JSON. Worker enrollment/settings never accept raw keys, tokens, cookies, auth directories or credential references.
+Data routes require an authenticated Relay session; mutation bodies are JSON. Shared mode also requires same-origin requests and `X-Relay-CSRF` for authenticated mutations. `/healthz` and `/api/auth/config` reveal only public service status/mode. Worker enrollment/settings never accept raw keys, tokens, cookies, auth directories or credential references.
 
 | Method | Route | Purpose |
 | --- | --- | --- |
-| POST | `/api/login` | `{user_id: alice\|bob\|admin}` selects a local demo identity |
+| POST | `/api/login` | Shared mode uses Relay email/password; explicit demo mode alone accepts seeded `user_id` |
 | GET | `/api/overview` | User/org/project/worker directory, explicit auth/execution modes |
 | GET | `/api/workers?project_id=ID&mine=1` | Authorized directory, project eligibility, ownership/capacity, optional own workers |
 | POST | `/api/workers/enroll` | `display_name`, `owner_type`, `execution_mode`, `project_ids`, `opt_in`, max parallel tasks (1) |
@@ -151,7 +171,7 @@ python3 -m ruff check .
 python3 -m mypy relay/workers.py relay/auth.py relay/codex_events.py relay/native.py relay/app_server.py
 ```
 
-There is no framework build step. UI checking validates HTML IDs and uses Node or macOS JavaScriptCore for syntax. Browser visual QA was unavailable. Tests cover real process restart, migration preservation, project/grant privacy, worker ownership, credential rejection/redaction, unsupported personal mode, real fixture tests, idempotency/concurrent handoffs, async safe stop, shared-capacity provenance, checkpoint failure and unverified-container cleanup. Controlled live-mode fixtures never call a paid provider.
+There is no framework build step. UI checking validates HTML IDs and uses Node or macOS JavaScriptCore for syntax. The shared fallback was tested in real isolated Chrome contexts; this does not verify physical multi-host or live organization execution. Tests cover real process restart, migration preservation, project/grant privacy, worker ownership, credential rejection/redaction, unsupported personal mode, real fixture tests, idempotency/concurrent handoffs, async safe stop, shared-capacity provenance, checkpoint failure and unverified-container cleanup. Controlled live-mode fixtures never call a paid provider.
 
 ## Recovery and security limits
 
@@ -161,4 +181,4 @@ Git and SQLite cannot commit atomically. If a checkpoint fails, files and the er
 
 Simulation executes only trusted fixture code with a bounded test command. Native coding uses the verified macOS permission profile and private Git clones; tools cannot read credential homes or other workers, and uncertain changes are retained privately. The optional Docker/API backend uses a non-root container, limited CPU/memory/processes/deadline, read-only host metadata, no host home/auth/socket, and internal-only networking through the narrow API proxy. The organization key remains outside generated code; a bounded inference capability is available to the coding container. Only trusted operators may control Docker or the data volume. Add filesystem quotas to the volume for deployed workloads.
 
-The app remains a single-organization local demo. Replace seed identity selection with verified SSO/OIDC and secure sessions before hosting remotely; also configure TLS, backups, secret rotation, retention and tenant-scoped infrastructure. Exact configured secrets/common key patterns are filtered, but no detector can identify every arbitrary secret: never paste credentials into prompts or repositories. Event triggers prevent application updates/deletes, not tampering by a database administrator.
+The application supports one trusted organization per invite-only HTTPS deployment. Demo identity selection remains loopback-only. Established SSO/OIDC, MFA, account recovery, backups/retention and external security review remain future work; see the shared deployment guide. Exact configured secrets/common key patterns are filtered, but no detector can identify every arbitrary secret: never paste credentials into prompts or repositories. Event triggers prevent application updates/deletes, not tampering by a database administrator.

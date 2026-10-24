@@ -12,17 +12,19 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action',choices=('init','check'))
     parser.add_argument('--env-file',type=Path)
+    parser.add_argument('--profile',choices=PROFILE_IDS,help='Check one existing profile without changing its Codex login')
     args=parser.parse_args()
     if args.env_file:load_env_file(args.env_file)
     try:
         if args.action=='init':
+            if args.profile:parser.error('--profile is supported for check only')
             initialize_profiles()
             print('Created three private CODEX_HOME/workspace directories. No credentials copied. Authenticate each interactively:')
             for profile in PROFILE_IDS:
                 home,_=profile_paths(profile)
                 print('CODEX_HOME='+shlex.quote(str(home))+' codex -c \'cli_auth_credentials_store="file"\' login --device-auth')
         else:
-            checks,details=native_readiness()
+            checks,details=native_readiness((args.profile,) if args.profile else PROFILE_IDS)
             for label,ok in checks:print(('PASS: ' if ok else 'MISSING: ')+label)
             for detail in details:print(detail)
             if not all(ok for _,ok in checks):raise SystemExit(2)

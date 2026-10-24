@@ -1,0 +1,11 @@
+# Set RELAY_DOMAIN in Caddy's service environment, e.g. relay.example.com.
+# Forward ONLY to the loopback invite-authenticated backend. No file_server.
+{$RELAY_DOMAIN} {
+    request_body {
+        max_size 16KB
+    }
+    reverse_proxy 127.0.0.1:8000 {
+        header_up X-Forwarded-Proto {scheme}
+        flush_interval -1
+    }
+}

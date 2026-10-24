@@ -118,7 +118,10 @@ def server_command(codex):
     # macOS framework/Homebrew Python installs live outside :minimal. Grant
     # this runtime's installation, never the user's home or credential roots.
     runtime_rule=json.dumps(str(runtime))+'="read",' if runtime!=Path(codex) else ''
-    filesystem='{":root"="deny",":minimal"="read",'+executable+'="read",'+runtime_rule+'":tmpdir"="deny",":slash_tmp"="deny",":workspace_roots"={"."="write",".git"="read",".relay"="read","**/*.env"="deny"}}'
+    from .native_environment import toolchain
+    tools=toolchain()
+    tools_rule=json.dumps(str(tools))+'="read",' if tools else ''
+    filesystem='{":root"="deny",":minimal"="read",'+executable+'="read",'+runtime_rule+tools_rule+'":tmpdir"="deny",":slash_tmp"="deny",":workspace_roots"={"."="write",".git"="read",".relay"="read","**/*.env"="deny"}}'
     return [codex,'-c','cli_auth_credentials_store="file"','-c','approval_policy="never"','-c','default_permissions="relay-native"',
             '-c','mcp_servers={}','-c','shell_environment_policy.inherit="none"',
             '-c','permissions.relay-native.extends=":workspace"',

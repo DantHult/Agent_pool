@@ -16,6 +16,7 @@ def main():
     parser.add_argument('action',choices=('bootstrap','revoke-sessions'))
     parser.add_argument('--data',default='shared-data');parser.add_argument('--email',required=True)
     parser.add_argument('--name',default='Organization administrator');parser.add_argument('--env-file',type=Path)
+    parser.add_argument('--local-owner',action='store_true',help='Pin the new sole Relay account to this OS user for local-native dashboard mode')
     args=parser.parse_args()
     if args.env_file:load_env_file(args.env_file)
     password=None
@@ -26,7 +27,9 @@ def main():
         relay=Relay(args.data,demo=False)
         try:
             identity=InviteIdentityProvider(relay)
-            if args.action=='bootstrap':identity.bootstrap(args.email,args.name,password);print('Administrator created. Start Relay with invite authentication.')
+            if args.action=='bootstrap':
+                identity.bootstrap(args.email,args.name,password,local_owner=args.local_owner)
+                print('Local owner pinned. Start with --auth local-owner --backend native.' if args.local_owner else 'Administrator created. Start Relay with invite authentication.')
             else:
                 account=relay.one('SELECT user_id FROM accounts WHERE email=?',(args.email.strip().lower(),))
                 relay.db.execute('DELETE FROM sessions WHERE user_id=?',(account['user_id'],))

@@ -5,3 +5,5 @@
 .workspace-main{display:flex;flex-direction:column;gap:20px;min-width:0}.workspace-main>.artifacts{width:100%}
 
 [hidden]{display:none!important}.signed-out>.sidebar,.signed-out>main{display:none}.account-panel{max-width:450px;margin:8vh auto;padding:32px;background:white;border:1px solid var(--border);border-radius:12px}.account-panel form{display:grid;gap:12px}.account-panel h1{font-size:27px}.account-panel p{line-height:1.6;color:#596b5b}input:not([type=checkbox]){width:100%;padding:10px;border:1px solid var(--border);border-radius:5px;font:inherit}#accountError,#inviteError,#membersError{color:#9b3030}#signedInName{display:block;font-size:12px}#inviteDialog form,#membersDialog form{display:grid;gap:12px}#inviteLink{min-height:80px;overflow-wrap:anywhere}.org strong{overflow-wrap:anywhere}#handoffPhases{margin-bottom:12px}#logout{display:block}
+
+.native-owner{padding:0 16px;font-size:11px;line-height:1.6;color:var(--muted)}.native-profile{padding:14px 16px;border-top:1px solid var(--border)}.native-profile .pill{float:right}.native-profile p{font-size:11px;line-height:1.6;overflow-wrap:anywhere}.native-profile button{font-size:11px;width:100%}

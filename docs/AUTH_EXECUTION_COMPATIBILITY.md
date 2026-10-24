@@ -31,3 +31,13 @@ Relay endpoints reject raw keys, tokens, cookies and authentication directories.
 ## What has been verified
 
 Automated tests cover native stdio RPC handling against a test-only subprocess, isolated workspaces/environment, three-phase handoff, actual temporary code/tests, cancellation, conflict rejection, owner restrictions and quota behavior. This is mocked inference, explicitly separate from real provider execution. Real installed CLI initialization, permission-profile support and OS sandbox isolation probes passed for all three local profiles. **The exact native live command subsequently passed after independent interactive logins on three distinct ChatGPT accounts.** Three real model turns contributed code/tests/docs, two checkpointed handoffs continued the same conversation, C ran seven passing tests, and restart persistence passed. The Docker/API live route remains unverified. See [LIVE_CODEX_STATUS.md](LIVE_CODEX_STATUS.md).
+
+
+## Shared multi-computer milestone
+
+Invite-only Relay accounts now provide the shared human identity boundary with scrypt hashes, revocable/expiring server sessions, CSRF/origin checks, rates and HTTPS-only deployment. The CLI defaults to invite mode and no production users are seeded. Shared mode disables native consumer profiles; organization API workers retain their separate ownership/project/provider authorization. Remote worker enrollment and cross-person subscription execution remain deferred/disabled. [MULTI_COMPUTER.md](MULTI_COMPUTER.md) and [MULTI_COMPUTER_STATUS.md](MULTI_COMPUTER_STATUS.md) distinguish real browser sessions with simulated inference, mocked API routing, prior local native inference and unverified physical multi-host/live organization execution.
+
+
+## Pinned local-owner dashboard
+
+The safe local native web flow now uses `--auth local-owner --backend native`, with offline-pinned Relay account/OS ownership, password sessions and CSRF, fixed loopback binding/origin, rejected forwarded requests and disabled invitations. Demo identity switching can no longer authorize native HTTP execution, even with an enable environment variable. Shared/invite restrictions remain intact. The existing native App Server runner and local profile auth are reused without login automation or copying. **A real Chrome A → B owner-initiated native handoff passed** with five generated tests and browser/backend restart persistence; see [LOCAL_NATIVE_DASHBOARD.md](LOCAL_NATIVE_DASHBOARD.md). This remains separate from unverified live shared organization execution.

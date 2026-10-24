@@ -106,6 +106,7 @@ class SharedServerTests(unittest.TestCase):
         artifact=self.server.relay.rows("SELECT json_extract(metadata,'$.artifact_id') AS id FROM events WHERE json_extract(metadata,'$.artifact_id') IS NOT NULL")[0]['id']
         self.assertEqual(viewer.request('/api/prompt',{'conversation_id':self.conversation,'prompt':PROMPT,'worker_id':worker})[0],403)
         self.assertEqual(viewer.request('/api/pause',{'task_id':task['id'],'generation':task['generation']})[0],403)
+        self.assertEqual(viewer.request('/api/workers/enroll',{'display_name':'Read-only project grant','owner_type':'user','execution_mode':'simulation','project_ids':[self.project]})[0],403)
         for path in ('projects/'+self.project,'projects/'+self.project+'/diff','projects/'+self.project+'/download?file=validator.py','conversations/'+self.conversation+'/events','conversations/'+self.conversation+'/stream','artifacts/'+artifact,'tasks/'+task['id']+'/result'):
             self.assertEqual(outsider.request('/api/'+path)[0],403,path)
         self.assertEqual(viewer.request('/api/projects/'+self.project+'/download?file=validator.py')[0],200)
@@ -181,6 +182,34 @@ class SharedServerTests(unittest.TestCase):
         self.assertFalse(self.server.relay.rows("SELECT * FROM users WHERE id IN ('alice','bob','admin')"))
         self.assertEqual(self.admin.request('/api/workers/enroll',{'display_name':'Native','owner_type':'user','execution_mode':'native','native_profile':'a'})[0],400)
         self.assertEqual(Client(self.server).request('/api/overview')[0],401)
+    def test_idle_expiry_logout_all_and_bootstrap_is_sealed(self):
+        alex,user,_=self.member('alex');other=Client(self.server);other.login('alex@relay.invalid')
+        alex.post('auth/logout-all',{})
+        self.assertEqual(other.request('/api/overview')[0],401)
+        alex.login('alex@relay.invalid')
+        with self.server.relay.lock:self.server.relay.db.execute('UPDATE sessions SET last_seen=0 WHERE user_id=?',(user,))
+        self.assertEqual(alex.request('/api/overview')[0],401)
+        with self.assertRaises(ValueError):self.server.identity_provider.bootstrap('second@relay.invalid','Second',PASSWORD)
+    def test_secure_cookie_https_proxy_headers_and_missing_origin(self):
+        self.server.secure=True;self.server.public_url='https://relay.example.com';self.server.cookie_name='__Host-relay_session'
+        client=Client(self.server);headers={'Host':'relay.example.com','X-Forwarded-Proto':'https'}
+        status,_,cookie=client.request('/api/login',{'email':'admin@relay.invalid','password':PASSWORD},headers)
+        self.assertEqual(status,200)
+        for attribute in ('__Host-relay_session=','HttpOnly','SameSite=Strict','Path=/','Secure'):self.assertIn(attribute,cookie)
+        self.assertEqual(client.request('/api/overview',headers={'Host':'relay.example.com'})[0],403)
+        self.assertEqual(client.request('/api/projects',{'name':'Missing origin'},{**headers,'Origin':''})[0],403)
+    def test_websocket_upgrade_does_not_bypass_project_access(self):
+        outsider,_,_=self.member('outside',project=False)
+        path='/api/conversations/'+self.conversation+'/stream'
+        self.assertEqual(outsider.request(path,headers={'Upgrade':'websocket','Connection':'Upgrade'})[0],403)
+        self.assertEqual(self.admin.request(path,headers={'Upgrade':'websocket','Connection':'Upgrade'})[0],400)
+    def test_existing_account_can_accept_project_invite_without_role_escalation(self):
+        member,user,_=self.member('existing',project=False)
+        invite=self.admin.post('invitations',{'email':'existing@relay.invalid','project_id':self.project,'org_role':'admin'})
+        token=urlparse(invite['invitation_url']).fragment.removeprefix('invite=')
+        member.post('invitations/accept',{'email':'existing@relay.invalid','invitation_token':token})
+        self.assertEqual(member.get('projects/'+self.project)['conversation']['id'],self.conversation)
+        self.assertFalse(self.server.relay.is_admin(user))
     def test_password_hash_and_origin_guards(self):
         encoded=hash_password(PASSWORD);self.assertTrue(verify_password(PASSWORD,encoded));self.assertFalse(verify_password('incorrect password value',encoded));self.assertNotIn(PASSWORD,encoded)
         for value in ('http://192.168.1.10:8000','https://user:password@example.com','https://example.com/path'):

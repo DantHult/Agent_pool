@@ -1,0 +1,23 @@
+[Unit]
+Description=Relay invite-only shared coding server
+After=network.target docker.service
+
+[Service]
+Type=simple
+User=relay
+Group=relay
+WorkingDirectory=/opt/relay
+EnvironmentFile=/etc/relay/shared.env
+ExecStart=/usr/bin/python3 -m relay.server --auth invite
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/relay
+PrivateTmp=true
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+# Trusted LAN HTTPS test; configure DNS/hosts and trust Caddy's PUBLIC root CA
+# on every test device. Never distribute the CA private key.
+{$RELAY_LAN_HOST:relay.local} {
+    tls internal
+    request_body {
+        max_size 16KB
+    }
+    reverse_proxy 127.0.0.1:8000 {
+        header_up X-Forwarded-Proto {scheme}
+        flush_interval -1
+    }
+}

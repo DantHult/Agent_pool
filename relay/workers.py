@@ -428,8 +428,9 @@ class OrganizationApiCodexAdapter:
                  {'execution_mode':'organization_api','quota_scope':'shared_organization_api','container':name})
             process=subprocess.Popen(command,stdin=subprocess.PIPE,stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE,env=env,start_new_session=True)
-            phase=('PHASE 1 / HANDOFF BOUNDARY: Complete a useful first part only. Leave substantive implementation or tests unfinished for the next worker. Return the actual completed_work, pending_steps and test_results; do not claim the full objective is complete. '
-                   if task.get('pause_after_turn') and not task.get('execution_phase') else
+            phases=int(task.get('native_phases',2));index=int(task.get('execution_phase',0))
+            phase=(f'PHASE {index+1} / HANDOFF BOUNDARY ({phases} planned phases): Complete a useful part only. Leave substantive implementation or tests unfinished for the next worker. Return the actual completed_work, pending_steps and test_results; do not claim the full objective is complete. '
+                   if task.get('pause_after_turn') and index<phases-1 else
                    'Complete the remaining objective. Inspect the preserved code and handoff before editing. ')
             prompt=('Work only inside /workspace. Preserve existing work. Do not modify .git or .relay. '
                     'Read /workspace/.relay/HANDOFF.md and referenced .relay/history files when relevant. '
