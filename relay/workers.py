@@ -18,6 +18,7 @@ import time
 import uuid
 from typing import Callable, Protocol
 
+from .fs_lock import current_gid, current_uid, host_path
 from .workspace import IMPLEMENTATION, TESTS
 from .codex_events import provider_error, progress_from_message
 
@@ -138,7 +139,7 @@ class SimulationWorkerAdapter:
             command = [sys.executable, '-I', '-c',
                        "import sys,unittest; sys.path.insert(0,'.'); r=unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.discover('.',pattern='test_validator.py')); sys.exit(not r.wasSuccessful())"]
             process = subprocess.Popen(command, cwd=workspace, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                       text=True, env={'PATH': '/usr/bin:/bin'}, start_new_session=True)
+                                       text=True, env={'PATH': host_path()}, start_new_session=True)
             deadline = time.monotonic() + 10
             while True:
                 if cancel.is_set() or time.monotonic() > deadline:
@@ -225,7 +226,10 @@ class OrganizationApiCodexAdapter:
             return self._unavailable('A restricted internal Docker network is required')
         if not config['model']:
             return self._unavailable('Set RELAY_CODEX_MODEL to a Codex model available to the organization')
-        if os.getuid()==0:
+        uid = current_uid()
+        if uid is None:
+            return self._unavailable('Organization API containers require a Unix host for non-root user mapping')
+        if uid == 0:
             return self._unavailable('Run Relay as a non-root OS user so coding containers cannot run as root')
         if shutil.which('docker') is None:
             return self._unavailable('Docker is unavailable; there is no host execution fallback')
@@ -291,7 +295,7 @@ class OrganizationApiCodexAdapter:
         command = ['docker', 'run', '--rm', '--pull=never', '-i', '--name', name,
                    '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges',
                    '--pids-limit=128', '--memory=768m', '--cpus=1',
-                   '--network', config['network'], '--dns', '127.0.0.1', '--user', f'{os.getuid()}:{os.getgid()}',
+                   '--network', config['network'], '--dns', '127.0.0.1', '--user', f'{current_uid()}:{current_gid()}',
                    '--tmpfs', '/tmp:rw,nosuid,nodev,size=128m,mode=1777',
                    '--tmpfs', '/home/relay:rw,nosuid,nodev,size=64m,mode=1777',
                    '--mount', f'type=bind,src={path},dst=/workspace',

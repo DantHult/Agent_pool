@@ -27,23 +27,30 @@ class Relay:
         self.local_owner_id=local_owner_id
         self.root=Path(root); self.root.mkdir(parents=True,exist_ok=True)
         if not demo:
-            if self.root.is_symlink() or self.root.stat().st_uid!=os.getuid():raise ValueError('Shared data directory must be owned by this OS user and cannot be a symlink')
+            uid=getattr(os,'getuid',lambda:None)()
+            if self.root.is_symlink() or (uid is not None and self.root.stat().st_uid!=uid):raise ValueError('Shared data directory must be owned by this OS user and cannot be a symlink')
             self.root.chmod(0o700)
         self.lock=threading.RLock()
         self.db=sqlite3.connect(self.root/'relay.sqlite',check_same_thread=False,isolation_level=None,timeout=15)
         self.db.row_factory=sqlite3.Row
-        migrate(self.db)
-        if not demo:
-            for name in ('relay.sqlite','relay.sqlite-wal','relay.sqlite-shm'):
-                path=self.root/name
-                if path.exists():path.chmod(0o600)
-        self.ws=Workspace(self.root/'workspaces')
         self.jobs={}
         self.unsafe_tasks=set()
         self.closing=False
-        if demo:self._seed()
-        else:self.db.execute("UPDATE organizations SET is_demo=0,name=CASE WHEN name='Relay Labs (demo)' THEN 'Relay organization' ELSE name END WHERE id='orgdemo'")
-        self._recover()
+        try:
+            migrate(self.db)
+            if not demo:
+                for name in ('relay.sqlite','relay.sqlite-wal','relay.sqlite-shm'):
+                    path=self.root/name
+                    if path.exists():path.chmod(0o600)
+            self.ws=Workspace(self.root/'workspaces')
+            if demo:self._seed()
+            else:self.db.execute("UPDATE organizations SET is_demo=0,name=CASE WHEN name='Relay Labs (demo)' THEN 'Relay organization' ELSE name END WHERE id='orgdemo'")
+            self._recover()
+        except Exception:
+            # Windows cannot delete a TemporaryDirectory while SQLite still holds the file.
+            try:self.db.close()
+            except sqlite3.Error:pass
+            raise
 
     def rows(self,sql,args=()): return [dict(r) for r in self.db.execute(sql,args).fetchall()]
     def one(self,sql,args=()):

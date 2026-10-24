@@ -6,7 +6,22 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from relay.workspace import IMPLEMENTATION, Workspace
+from relay.workspace import IMPLEMENTATION, Workspace, _USE_DIR_FD
+
+def _can_symlink():
+    with tempfile.TemporaryDirectory() as directory:
+        target = Path(directory) / 'target'
+        link = Path(directory) / 'link'
+        target.write_text('x')
+        try:
+            link.symlink_to(target)
+            return True
+        except (OSError, NotImplementedError):
+            return False
+
+
+CAN_SYMLINK = _can_symlink()
+
 
 class WorkspaceSecurityTests(unittest.TestCase):
     def setUp(self):
@@ -17,6 +32,7 @@ class WorkspaceSecurityTests(unittest.TestCase):
         self.outside = Path(self.tmp.name) / 'outside'; self.outside.mkdir()
         self.external = self.outside / 'private.txt'; self.external.write_text('outside-private-value')
 
+    @unittest.skipUnless(CAN_SYMLINK, 'Symlink creation requires privileges or Developer Mode on Windows')
     def test_static_symlinks_are_never_read_or_checkpointed(self):
         (self.project / 'leak.txt').symlink_to(self.external)
         (self.project / 'external').symlink_to(self.outside, target_is_directory=True)
@@ -26,6 +42,7 @@ class WorkspaceSecurityTests(unittest.TestCase):
         with self.assertRaises(ValueError): self.workspace.checkpoint('demo', 'Refuse unsafe tree')
         self.assertEqual(self.external.read_text(), 'outside-private-value')
 
+    @unittest.skipUnless(_USE_DIR_FD and CAN_SYMLINK, 'POSIX dir_fd TOCTOU defenses')
     def test_leaf_swap_after_stat_does_not_follow_symlink(self):
         target = self.project / 'generated.py'; target.write_text('safe source')
         original_open = os.open
@@ -41,6 +58,7 @@ class WorkspaceSecurityTests(unittest.TestCase):
         self.assertNotIn('generated.py', view['files'])
         self.assertNotIn('outside-private-value', str(view))
 
+    @unittest.skipUnless(_USE_DIR_FD and CAN_SYMLINK, 'POSIX dir_fd TOCTOU defenses')
     def test_directory_swap_after_stat_cannot_redirect_traversal(self):
         nested = self.project / 'nested'; nested.mkdir(); (nested / 'safe.py').write_text('safe')
         original_open = os.open
@@ -55,6 +73,7 @@ class WorkspaceSecurityTests(unittest.TestCase):
         self.assertTrue(swapped)
         self.assertEqual(self.external.read_text(), 'outside-private-value')
 
+    @unittest.skipUnless(_USE_DIR_FD and CAN_SYMLINK, 'POSIX dir_fd TOCTOU defenses')
     def test_redaction_race_cannot_write_through_symlink(self):
         target = self.project / 'generated.txt'; target.write_text('organization-secret')
         original_open = os.open
@@ -69,10 +88,15 @@ class WorkspaceSecurityTests(unittest.TestCase):
         self.assertEqual(self.external.read_text(), 'outside-private-value')
 
     def test_hard_links_and_git_metadata_links_fail_closed(self):
-        os.link(self.external, self.project / 'hardlink.txt')
+        try:
+            os.link(self.external, self.project / 'hardlink.txt')
+        except OSError as exc:
+            raise unittest.SkipTest(f'Hard links unavailable: {exc}') from exc
         self.assertNotIn('hardlink.txt', self.workspace.inspect('demo')['files'])
         with self.assertRaises(ValueError): self.workspace.redact_files('demo')
         (self.project / 'hardlink.txt').unlink()
+        if not CAN_SYMLINK:
+            return
         config = self.project / '.git/config'; config.unlink(); config.symlink_to(self.external)
         with self.assertRaises(OSError): self.workspace.inspect('demo')
         self.assertEqual(self.external.read_text(), 'outside-private-value')
@@ -110,7 +134,8 @@ class WorkspaceSecurityTests(unittest.TestCase):
         self.assertEqual(len(index['recent_events']), 100)
         self.assertEqual(index['recent_events'][0]['sequence'], 21)
         self.assertEqual(json.loads((history / '000000000001.json').read_text())['content'], 'Event 1 [REDACTED]')
-        self.assertEqual((history / '000000000001.json').stat().st_mode & 0o222, 0)
+        if os.name != 'nt':
+            self.assertEqual((history / '000000000001.json').stat().st_mode & 0o222, 0)
         tracked = self.workspace.git(self.project, 'ls-tree', '-r', '--name-only', 'HEAD')
         self.assertIn('.relay/HANDOFF.md', tracked)
         self.assertNotIn('.relay/history', tracked)
@@ -118,6 +143,7 @@ class WorkspaceSecurityTests(unittest.TestCase):
         self.assertIn('[REDACTED]', reopened.inspect('demo')['files']['.relay/HANDOFF.md'])
         self.assertTrue((history / '000000000001.json').exists())
 
+    @unittest.skipUnless(CAN_SYMLINK, 'Symlink creation requires privileges or Developer Mode on Windows')
     def test_metadata_directory_symlink_cannot_write_outside(self):
         (self.project / '.relay').symlink_to(self.outside, target_is_directory=True)
         with self.assertRaises(OSError): self.workspace.write_handoff('demo', {'objective':'test'})

@@ -23,3 +23,5 @@ multi-proof/
 # Local-owner account data and disposable native dashboard proof.
 local-native-data/
 native-dashboard-proof/
+# Accidental Portable Git extract from a Windows installer misfire.
+-y*/

@@ -39,7 +39,13 @@ class WorkerAdapterTests(unittest.TestCase):
         result = get_adapter(self.worker).resume(self.task, self.path, {}, self.emit, threading.Event())
         self.assertEqual(result.state, 'failed')
         self.assertFalse((self.path / 'test_validator.py').exists())
-        (self.path / 'validator.py').unlink(); (self.path / 'validator.py').symlink_to('/tmp/outside-relay-test')
+        outside = Path(self.tmp.name) / 'outside-relay-test'
+        outside.write_text('outside')
+        (self.path / 'validator.py').unlink()
+        try:
+            (self.path / 'validator.py').symlink_to(outside)
+        except (OSError, NotImplementedError):
+            self.skipTest('Symlink creation requires privileges or Developer Mode on Windows')
         with self.assertRaises(ValueError):
             get_adapter(self.worker).start(self.task, self.path, {}, self.emit, threading.Event())
     def test_cancellation_prevents_writes(self):
@@ -81,7 +87,7 @@ class WorkerAdapterTests(unittest.TestCase):
         config = {'RELAY_ENABLE_ORG_API': '1', 'RELAY_ORG_OPENAI_API_KEY': 'secret-key', 'RELAY_CODEX_PROXY_TOKEN': 'proxy-secret',
                   'RELAY_CODEX_MODEL': 'example-model', 'RELAY_CODEX_NETWORK': 'not-internal'}
         response = subprocess.CompletedProcess([], 0, json.dumps([{'Internal': False}]), '')
-        with patch.dict(os.environ, config, clear=True), patch('relay.workers.os.getuid',return_value=1000), patch('relay.workers.shutil.which', return_value='/bin/docker'), patch('relay.workers.subprocess.run', return_value=response):
+        with patch.dict(os.environ, config, clear=True), patch('relay.workers.current_uid',return_value=1000), patch('relay.workers.current_gid',return_value=1000), patch('relay.workers.shutil.which', return_value='/bin/docker'), patch('relay.workers.subprocess.run', return_value=response):
             health = adapter.health()
         self.assertFalse(health['available']); self.assertIn('internal', health['reason'])
     def test_recovery_only_targets_task_labeled_containers(self):

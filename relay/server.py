@@ -1,6 +1,5 @@
 """Relay HTTP boundary: invite-only behind HTTPS; explicit loopback demo mode."""
 import argparse
-import fcntl
 import ipaddress
 import json
 import os
@@ -16,6 +15,7 @@ from .store import Relay
 from .auth import LocalDemoIdentityProvider
 from .accounts import InviteIdentityProvider,LoginRequired,csrf_token
 from .config import load_env_file
+from .fs_lock import current_uid, try_exclusive_lock
 from .security import reject_credentials,clean
 
 STATIC=Path(__file__).resolve().parent.parent/'static'
@@ -210,6 +210,24 @@ class ServerAlreadyRunning(RuntimeError):
         url=metadata.get('url');address=f'Open {url}.' if url else 'Check the running Relay terminal for its URL (default: http://127.0.0.1:8000).'
         super().__init__(f'Relay is already running for {Path(root).resolve()}. {address}\nTo restart, stop the existing server with Ctrl+C in its terminal, then run this command again. For a separate demo, use both --data <new-directory> and --port <unused-port>. Do not delete server.lock while a server is running.')
 
+def _read_server_status(root):
+    """Read live-server metadata without touching the exclusive lock file.
+
+    Windows msvcrt locks are mandatory: other handles cannot read server.lock while
+    it is held, so URL/pid live in server.status.json (also written on Unix).
+    """
+    for name in ('server.status.json','server.lock'):
+        path=Path(root)/name
+        try:
+            metadata=json.loads(path.read_text(encoding='utf-8'))
+            if isinstance(metadata,dict):return metadata
+        except (ValueError,OSError):pass
+    return {}
+
+def _write_server_status(root,metadata):
+    path=Path(root)/'server.status.json'
+    path.write_text(json.dumps(metadata),encoding='utf-8')
+
 def make_server(root,port=8000,auth_mode=None,origin=None,allow_http=False):
     # Legacy programmatic construction remains loopback demo for existing callers.
     # The deployable CLI explicitly selects invite authentication by default.
@@ -217,13 +235,10 @@ def make_server(root,port=8000,auth_mode=None,origin=None,allow_http=False):
     if mode not in ('demo','invite','local-owner'):raise ValueError('Unknown authentication mode; use invite, local-owner or explicit local demo')
     Path(root).mkdir(parents=True,exist_ok=True);lock=open(Path(root)/'server.lock','a+');server=None
     try:
-        try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        try:try_exclusive_lock(lock)
         except BlockingIOError:
-            lock.seek(0)
-            try:metadata=json.load(lock);metadata=metadata if isinstance(metadata,dict) else {}
-            except (ValueError,OSError):metadata={}
-            raise ServerAlreadyRunning(root,metadata) from None
-        if mode!='demo' and os.getuid()==0:raise ValueError('Run the shared Relay server as a non-root OS user')
+            raise ServerAlreadyRunning(root,_read_server_status(root)) from None
+        if mode!='demo' and current_uid()==0:raise ValueError('Run the shared Relay server as a non-root OS user')
         configured=public_origin(origin or os.environ.get('RELAY_PUBLIC_URL',''),allow_http) if mode=='invite' else None
         if mode=='local-owner':
             selected=origin or os.environ.get('RELAY_PUBLIC_URL') or f'http://127.0.0.1:{port}'
@@ -240,7 +255,7 @@ def make_server(root,port=8000,auth_mode=None,origin=None,allow_http=False):
         owner_id=None
         if mode=='local-owner':
             bindings=server.relay.rows('SELECT * FROM local_owner_binding WHERE singleton=1')
-            if not bindings or bindings[0]['os_uid']!=os.getuid():raise ValueError('No matching local-owner pin. Bootstrap a dedicated directory with scripts/manage_accounts.py bootstrap --local-owner')
+            if not bindings or bindings[0]['os_uid']!=current_uid():raise ValueError('No matching local-owner pin. Bootstrap a dedicated directory with scripts/manage_accounts.py bootstrap --local-owner')
             owner_id=bindings[0]['user_id']
             accounts=server.relay.rows('SELECT user_id FROM accounts WHERE disabled=0')
             if len(accounts)!=1 or accounts[0]['user_id']!=owner_id:raise ValueError('Local-owner mode requires its one pinned account; use a dedicated data directory')
@@ -249,7 +264,10 @@ def make_server(root,port=8000,auth_mode=None,origin=None,allow_http=False):
         if not 600<=ttl<=86400 or not 60<=idle<=ttl:raise ValueError('Session TTL must be 600–86400 seconds and idle limit 60 seconds up to TTL')
         server.identity_provider=InviteIdentityProvider(server.relay,ttl,idle,owner_id=owner_id) if mode!='demo' else LocalDemoIdentityProvider(server.relay.user)
         if mode=='demo':server.sessions=server.identity_provider.sessions
-        lock.seek(0);lock.truncate();json.dump({'pid':os.getpid(),'url':server.public_url},lock);lock.flush()
+        metadata={'pid':os.getpid(),'url':server.public_url}
+        # Keep legacy lock-file JSON for older readers; status JSON is the Windows-safe source.
+        lock.seek(0);lock.truncate();json.dump(metadata,lock);lock.flush()
+        _write_server_status(root,metadata)
         return server
     except Exception:
         if server is not None:server.server_close()
@@ -259,7 +277,9 @@ def main():
     parser=argparse.ArgumentParser();parser.add_argument('--backend',choices=('native','docker-api'));parser.add_argument('--auth',choices=('invite','demo','local-owner'));parser.add_argument('--port',type=int,default=8000);parser.add_argument('--data',default=None);parser.add_argument('--env-file',type=Path);parser.add_argument('--public-url');parser.add_argument('--allow-http-local',action='store_true');args=parser.parse_args()
     try:
         if args.env_file:load_env_file(args.env_file)
-        mode=args.auth or os.environ.get('RELAY_AUTH_MODE','invite')
+        # Windows local demos default to seed identities; shared invite servers stay Unix/HTTPS.
+        default_mode='demo' if os.name=='nt' else 'invite'
+        mode=args.auth or os.environ.get('RELAY_AUTH_MODE',default_mode)
         if args.backend=='native' and mode!='local-owner':raise ValueError('Native dashboard execution requires --auth local-owner; demo/shared identities cannot authorize it')
         if mode=='local-owner' and args.backend!='native':raise ValueError('Local-owner mode requires the explicit --backend native opt-in')
         if args.backend=='native':os.environ['RELAY_ENABLE_NATIVE']='1'

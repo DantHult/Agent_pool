@@ -17,11 +17,24 @@ Shared mode uses organization-authorized API workers and disables local native s
 
 ## Start the explicit local demo
 
-Requires Python 3.10+, Git, and macOS/Linux. The local demo has no package installation or API credential requirement.
+Requires Python 3.10+, Git, and Windows, macOS, or Linux. The local demo has no package installation or API credential requirement. Native ChatGPT App Server workers remain **macOS-only**. Organization API containers require a Unix-capable Docker host.
+
+**Windows:** Install [Git for Windows](https://git-scm.com/download/win) so `git.exe` is on `PATH` (Relay also probes the usual `Program Files\Git` locations). The simulated demo and unit tests need Git. If your system drive is full, point temp space at an SSD before running tests or the demo:
+
+```powershell
+New-Item -ItemType Directory -Force -Path D:\temp-relay | Out-Null
+$env:TEMP = 'D:\temp-relay'
+$env:TMP = 'D:\temp-relay'
+python -m relay.server --auth demo
+python scripts/demo.py
+python -m unittest discover -s tests -v
+```
 
 ```sh
 python3 -m relay.server --auth demo
 ```
+
+On Windows the CLI defaults to **demo** authentication. On macOS/Linux the CLI defaults to invite mode for shared servers; use `--auth demo` for the local hackathon seed identities.
 
 Open **http://127.0.0.1:8000**. Alex, Sam and Jordan are seeded **local demo identities**, not authenticated production accounts. The server binds to loopback. Do not expose demo login remotely.
 

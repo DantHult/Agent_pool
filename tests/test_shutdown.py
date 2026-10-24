@@ -1,11 +1,11 @@
 """The server must retain its filesystem lock through writer shutdown."""
-import fcntl
 from pathlib import Path
 import tempfile
 import threading
 import unittest
 from unittest.mock import patch
 
+from relay.fs_lock import try_exclusive_lock
 from relay.server import make_server
 
 
@@ -39,14 +39,14 @@ class ShutdownLockTests(unittest.TestCase):
                     # process must not recover/reassign this data directory yet.
                     with (Path(directory) / 'server.lock').open('a+') as contender:
                         with self.assertRaises(BlockingIOError):
-                            fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            try_exclusive_lock(contender)
                 finally:
                     finish_close.set()
                     thread.join(timeout=5)
             self.assertFalse(thread.is_alive())
             self.assertEqual(close_errors, [])
             with (Path(directory) / 'server.lock').open('a+') as contender:
-                fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                try_exclusive_lock(contender)
 
 
 if __name__ == '__main__':

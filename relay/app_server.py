@@ -133,5 +133,6 @@ def server_environment(home):
     # No organization API credential, cookie, access token, AWS credential or
     # inherited CODEX_HOME can affect this locally authenticated profile.
     env={name:os.environ[name] for name in ('PATH','HOME','LANG','LC_CTYPE') if name in os.environ}
-    env['CODEX_HOME']=str(Path(home).resolve());env.setdefault('PATH','/usr/bin:/bin')
+    from .fs_lock import host_path
+    env['CODEX_HOME']=str(Path(home).resolve());env.setdefault('PATH',host_path())
     return env

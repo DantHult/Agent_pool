@@ -5,7 +5,6 @@ storage or cross-user subscription delegation in this backend.
 """
 import atexit
 import hashlib
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -21,6 +20,7 @@ import uuid
 
 from .app_server import AppServerClient,AppServerError,PERMISSION_NAME,server_command,server_environment
 from .codex_events import progress_from_message
+from .fs_lock import current_uid, host_path, null_device, try_exclusive_lock
 from .security import clean,scrub
 from .workspace import Workspace
 from .native_environment import RUNTIME_NAMES,hydrate,toolchain_signature,workspace_environment
@@ -54,7 +54,8 @@ class NativeSession:
         if not home.is_dir() or home.is_symlink() or not workspaces.is_dir() or workspaces.is_symlink():
             raise AppServerError('Native profile directories are missing; run scripts/native_profiles.py init')
         for path in (home,workspaces):
-            if (path.stat().st_mode&0o077) or path.stat().st_uid!=os.getuid():raise AppServerError('Native profile and workspace directories must be owned by the current OS user with mode 0700')
+            uid=current_uid()
+            if uid is None or (path.stat().st_mode&0o077) or path.stat().st_uid!=uid:raise AppServerError('Native profile and workspace directories must be owned by the current OS user with mode 0700')
         codex=shutil.which(os.environ.get('RELAY_CODEX_BIN','codex'))
         if not codex:raise AppServerError('Codex CLI is not installed or not on PATH')
         signature=toolchain_signature()
@@ -62,7 +63,7 @@ class NativeSession:
         if self.client:self.client.close();self.client=None;self.probed=False;self.account_hash=None
         if self.profile_lock is None:
             self.profile_lock=open(home/'relay.lock','a+')
-            try:fcntl.flock(self.profile_lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            try:try_exclusive_lock(self.profile_lock)
             except BlockingIOError:
                 self.profile_lock.close();self.profile_lock=None
                 raise AppServerError('Native profile is owned by another Relay process') from None
@@ -180,8 +181,9 @@ class NativeCodexAdapter:
     def _prepare(self,canonical):
         source=canonical.resolve();_,root=profile_paths(self.profile);identity=uuid.uuid4().hex;target=root/identity
         expected=Workspace(source.parent).git(source,'rev-parse','HEAD')
-        env={'PATH':os.environ.get('PATH','/usr/bin:/bin'),'GIT_CONFIG_GLOBAL':'/dev/null','GIT_CONFIG_NOSYSTEM':'1'}
-        subprocess.run(['git','-c','core.hooksPath=/dev/null','clone','--quiet','--no-hardlinks','--no-local',str(source),str(target)],env=env,check=True,capture_output=True,timeout=15)
+        null=null_device()
+        env={'PATH':host_path(),'GIT_CONFIG_GLOBAL':null,'GIT_CONFIG_NOSYSTEM':'1'}
+        subprocess.run(['git','-c',f'core.hooksPath={null}','clone','--quiet','--no-hardlinks','--no-local',str(source),str(target)],env=env,check=True,capture_output=True,timeout=15)
         metadata=source/'.relay'
         if metadata.is_dir() and not metadata.is_symlink():shutil.copytree(metadata,target/'.relay',symlinks=False,dirs_exist_ok=True)
         environment=hydrate(target)

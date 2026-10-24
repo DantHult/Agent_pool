@@ -35,7 +35,7 @@ def readiness():
         ('Inference proxy token configured (RELAY_CODEX_PROXY_TOKEN)',bool(os.environ.get('RELAY_CODEX_PROXY_TOKEN'))),
         ('Approved model configured (RELAY_CODEX_MODEL)',bool(os.environ.get('RELAY_CODEX_MODEL'))),
         ('Internal Docker network configured (RELAY_CODEX_NETWORK)',bool(os.environ.get('RELAY_CODEX_NETWORK'))),
-        ('Non-root execution user',os.getuid()!=0),
+        ('Non-root execution user',(getattr(os,'getuid',lambda:1)()!=0)),
         ('Docker CLI installed',shutil.which('docker') is not None),
     ]
     if checks[-1][1]:

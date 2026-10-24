@@ -5,12 +5,12 @@ Without --data the demonstration uses a temporary workspace and cleans it up.
 """
 import argparse
 from contextlib import contextmanager
-import fcntl
 from pathlib import Path
 import sys
 import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from relay.fs_lock import try_exclusive_lock  # noqa: E402
 from relay.store import Relay  # noqa: E402
 
 PROMPT = 'Add a password-strength validator and tests to this sample project.'
@@ -23,7 +23,7 @@ def exclusive_demo_directory(data):
     lock = open(directory / 'server.lock', 'a+')
     try:
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try_exclusive_lock(lock)
         except BlockingIOError:
             raise SystemExit(
                 'This Relay data directory is in use. Stop the existing server/demo, '
