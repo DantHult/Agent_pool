@@ -1,8 +1,98 @@
-# Optional organization API sandbox
+# Native Codex on macOS
+
+Relay can run three local `codex app-server --stdio` processes. Each process has its own private `CODEX_HOME`, independent ChatGPT login and private Git clones. The native backend needs Python, Git, macOS and the official Codex CLI. **Docker, `RELAY_ORG_OPENAI_API_KEY`, `RELAY_CODEX_MODEL`, the inference proxy and separate API billing are not required.** The default model comes from Codex; `RELAY_NATIVE_MODEL` is optional.
+
+This is a local client for the person controlling the signed-in accounts. The configured Relay owner (default `alice`, displayed as Alex) must initiate tasks and explicitly select handoff targets. A different Relay user, including an administrator, cannot spend these subscriptions. This does not enable hosted cross-user subscription pooling or automatic account rotation when usage limits are reached.
+
+## Authenticate three independent profiles
+
+From the repository root, with `codex` on PATH:
+
+```sh
+codex --version
+python3 scripts/native_profiles.py init
+CODEX_HOME="$PWD/.relay-native/profiles/a" codex -c 'cli_auth_credentials_store="file"' login --device-auth
+CODEX_HOME="$PWD/.relay-native/profiles/b" codex -c 'cli_auth_credentials_store="file"' login --device-auth
+CODEX_HOME="$PWD/.relay-native/profiles/c" codex -c 'cli_auth_credentials_store="file"' login --device-auth
+```
+
+Complete each interactive login with a different ChatGPT Codex account you control. Check the browser account for each login; an existing browser session can otherwise sign you into the same account repeatedly. If device authorization is unavailable for your account, omit `--device-auth` and complete the normal browser flow with the same `CODEX_HOME` and file-store setting. Never paste codes, tokens, auth files or cookies into Relay/chat/Git. Never copy `~/.codex/auth.json` or credentials between profiles. The helper prints commands using the configured absolute paths if you set `RELAY_NATIVE_ROOT`.
+
+The explicit `file` credential store keeps each login in its own owner-only profile instead of allowing the OS keychain to share login state. `.relay-native/` is Git-ignored; the helper creates each profile/workspace directory with mode 0700. Relay does not read, export or import the credentials. The CLI manages them. Relay uses `account/read` to check ChatGPT auth and retains only an in-memory account-identity digest to reject duplicate accounts; identity values are never displayed or persisted.
+
+Check readiness without a model turn:
+
+```sh
+python3 scripts/live_smoke.py --backend native --check
+# Equivalent profile-specific diagnostic:
+python3 scripts/native_profiles.py check
+```
+
+Preflight starts three local App Servers, performs initialization, checks the named permission profile and Python test runtime, checks each workspace with a real OS sandbox probe, creates an ephemeral thread with the same native parameters used for coding, and verifies distinct ChatGPT logins. It does not call `turn/start` or establish model availability, subscription capacity, or successful coding. Missing login, inaccessible workspace or unsupported sandbox/protocol fails closed. Codex CLI **0.163.0** was used for protocol/schema and sandbox checks; the required named permissions currently use its experimental App Server capability. Upgrade/review the installed CLI if these checks fail; Relay does not fall back to unsandboxed host execution.
+
+## Real A → B → C acceptance command
+
+After all three profiles pass readiness:
+
+```sh
+python3 scripts/live_smoke.py --backend native --run-live --data ./live-proof
+# Optional custom objective with enough code/test work across three phases:
+python3 scripts/live_smoke.py --backend native --run-live --data ./live-proof-custom --prompt-file ./request.txt
+```
+
+This explicitly authorizes consumption of the signed-in accounts' Codex allowance. Use a fresh dedicated data directory, separate from a running web server. The script enrolls A/B/C, requests useful unfinished work from A and B, checkpoints each boundary, and explicitly continues the same Relay conversation on the next profile in a **new native thread**. It requires actual project changes from every worker, two checkpointed handoffs, three completed native turns, successful C test-command output, and persistence after reopening the database. A model that prematurely finishes all work causes the smoke to fail rather than claiming unfinished-work continuation.
+
+Only a fully verified run writes `"live_verified": true` to `live-proof/native-smoke-report.json`. Failed execution keeps events, checkpoints and private work for inspection. No failure substitutes simulation or Docker/API execution. Existing incomplete tasks are not automatically replayed.
+
+For the dashboard:
+
+```sh
+python3 -m relay.server --backend native --data ./native-dashboard --port 8000
+```
+
+Use Alex (`alice`) unless `RELAY_NATIVE_OWNER` names another configured local owner. Enroll three **Native Codex** workers with profiles A, B and C and approve the selected project. Choose a native worker explicitly in the composer; automatic demo selection still supports the simulation. Select the pause-after-turn option for a planned handoff, then explicitly choose another native worker and press **Switch Worker**. The UI uses two phases by default; the smoke requests three. For custom configuration, both scripts and server accept `--env-file .env`; only load a local file that you have configured. No `.env` is needed for the native commands above.
+
+## Native execution boundaries and recovery
+
+The trusted App Server process needs its own credentials to contact Codex. Coding tools get a separate private Git clone, minimal runtime reads, no other profile, no credential home, no canonical Relay project path, no MCP servers, and no tool network access. Filesystem rules make `.git` and Relay handoff/history metadata read-only. An isolation probe must prove that tools can write their own workspace and cannot read nonsecret canaries in the profile home or another worker’s workspace. The Codex executable itself is readable so its sandboxed filesystem helper can run; no credential-directory read grant is added. The server’s Python installation is also allowed as a runtime read and tested in preflight, so macOS framework/Homebrew Python can execute tests. Broad home/root runtime prefixes are refused. Server-side approval requests are declined; external auth-token requests are rejected. Native execution does not impose the optional Docker backend's CPU/memory/container limits. Dependencies needed for a task must already be available within the allowed runtime/workspace.
+
+Visible agent messages, command/output events, file changes, errors and native thread IDs feed the existing durable event stream. Reasoning and auth notifications are discarded. The child environment contains its own `CODEX_HOME` and a small OS allowlist; inherited API keys and proxy secrets are excluded. Handoff transfers committed project changes, visible history, objective, tests and pending steps, never authentication state or hidden reasoning.
+
+Interruption uses `turn/interrupt` and waits for `turn/completed`. Only verified completion/interruption allows validated private changes to be applied to the canonical project and checkpointed by the scheduler. If interruption cannot be confirmed or the process disconnects, the private clone is retained without publishing uncertain changes. A process crash cannot leave a native tool writing to the canonical worktree. Restart marks interrupted runs for explicit review; it never replays tools or automatically starts a replacement account. Usage-limit failures block the affected profile and do not trigger account rotation.
+
+The local demo identity selector is not production authentication. Keep this service on loopback. For exact current verification evidence, see [LIVE_CODEX_STATUS.md](../docs/LIVE_CODEX_STATUS.md). **Real native inference and A → B → C continuation passed on 2026-10-24**, using three distinct ChatGPT profiles, two checkpointed handoffs and seven generated tests. Each installation still needs its own interactive logins and passing acceptance command.
+
+The optional organization-funded Docker backend is preserved below.
+
+# Optional Docker / organization API backend
 
 The credential-free simulation needs none of this setup. This optional runner uses the documented official `codex exec --json` interface, pinned to the installed CLI version checked during implementation. It has **not been live-tested here**: Docker and an authorized organization API credential were unavailable. Adapter protocol, streaming completion checks, cancellation, redaction, network guards, and proxy forwarding are covered by deterministic tests.
 
 This setup is for one trusted organization per proxy stack. The server's organization credential reference is fixed to `env:RELAY_ORG_OPENAI_API_KEY`. Do not use local `~/.codex` state, employee subscription credentials, browser cookies, or personal tokens.
+
+## Local setup and readiness checks
+
+The smoke script does not load `.env` unless `--env-file` is supplied. A bare `--run-live` command cannot see settings that exist only in that file. Existing exported shell variables take precedence. Environment files accept only supported Relay settings, are parsed without executing shell code, and never print their values.
+
+1. Install and launch Docker Desktop using the [official Mac instructions](https://docs.docker.com/desktop/setup/install/mac-install/). Confirm `docker info` succeeds.
+2. If `.env` does not exist, copy `.env.example` to `.env` locally and restrict permissions to the owner (`chmod 600 .env`). Set `RELAY_ENABLE_ORG_API=1`, the explicitly authorized `RELAY_ORG_OPENAI_API_KEY`, and `RELAY_CODEX_MODEL` available to that API project. Set a private random `RELAY_CODEX_PROXY_TOKEN`; the proxy and backend must use the same value. Keep the image/network/URL defaults from the example. Never paste a key into chat or commit `.env`.
+3. Build the image and provision the proxy using that same file:
+
+```sh
+docker build -f deploy/Dockerfile.codex -t relay-codex:local .
+docker compose --env-file .env -f deploy/compose.yaml up -d --build
+python3 scripts/live_smoke.py --backend docker-api --env-file .env --check
+```
+
+`--check` reports prerequisites without printing secrets, invoking Codex or making an OpenAI request. Missing setup exits with status 2. Once it passes, explicitly run:
+
+```sh
+python3 scripts/live_smoke.py --backend docker-api --env-file .env --run-live --data ./live-proof
+# To use the same configuration in the web app:
+python3 -m relay.server --env-file .env
+```
+
+A passing readiness check establishes local configuration/image/network availability, not successful API authorization, model access or a genuine completed coding task. The opt-in smoke remains the live proof.
 
 ## Provision
 
@@ -54,9 +144,9 @@ For one real worker, enroll an organization API worker as Jordan, approve the ch
 For a reproducible two-worker proof after provisioning:
 
 ```sh
-python3 scripts/live_smoke.py --run-live --data ./live-proof
+python3 scripts/live_smoke.py --backend docker-api --run-live --data ./live-proof
 # Optional unseen request. The text file is a task objective, not a shell command.
-python3 scripts/live_smoke.py --run-live --data ./live-proof-custom --prompt-file ./request.txt
+python3 scripts/live_smoke.py --backend docker-api --run-live --data ./live-proof-custom --prompt-file ./request.txt
 ```
 
 The script uses the actual adapter/Docker/proxy/OpenAI route, requires unfinished phase-one work and actual phase-two test execution, then checks restart persistence. A complete passing report is stored at `live-proof/live-smoke-report.json`; task files stay in its server-side workspaces directory. A failure leaves evidence for inspection and never substitutes simulated output. Use a fresh/dedicated directory, not one held by the web server.

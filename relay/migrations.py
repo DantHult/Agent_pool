@@ -80,7 +80,8 @@ def migrate(db):
 
 
 def migrate_live(db):
-    if db.execute('SELECT 1 FROM schema_migrations WHERE version=3').fetchone(): return
+    if db.execute('SELECT 1 FROM schema_migrations WHERE version=3').fetchone():
+        migrate_native(db); return
     db.execute('BEGIN IMMEDIATE')
     try:
         columns={r[1] for r in db.execute('PRAGMA table_info(tasks)')}
@@ -94,3 +95,37 @@ def migrate_live(db):
         db.execute('COMMIT')
     except Exception:
         db.execute('ROLLBACK'); raise
+    migrate_native(db)
+
+
+def migrate_native(db):
+    if db.execute('SELECT 1 FROM schema_migrations WHERE version=4').fetchone():
+        migrate_accounts(db);return
+    db.execute('BEGIN IMMEDIATE')
+    try:
+        db.execute('ALTER TABLE workers ADD COLUMN native_profile TEXT')
+        db.execute('ALTER TABLE tasks ADD COLUMN native_phases INTEGER NOT NULL DEFAULT 2')
+        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_native_profile ON workers(native_profile) WHERE execution_mode='native'")
+        db.execute('INSERT INTO schema_migrations VALUES(4,?)',(datetime.now(timezone.utc).isoformat(),))
+        db.execute('COMMIT')
+    except Exception:
+        db.execute('ROLLBACK');raise
+    migrate_accounts(db)
+
+
+def migrate_accounts(db):
+    if db.execute('SELECT 1 FROM schema_migrations WHERE version=5').fetchone():return
+    db.execute('BEGIN IMMEDIATE')
+    try:
+        statements=[
+            'CREATE TABLE accounts(user_id TEXT PRIMARY KEY,email TEXT UNIQUE NOT NULL,password_hash TEXT NOT NULL,disabled INTEGER NOT NULL DEFAULT 0,created_at REAL NOT NULL)',
+            'CREATE TABLE sessions(digest TEXT PRIMARY KEY,user_id TEXT NOT NULL,created_at REAL NOT NULL,expires_at REAL NOT NULL,last_seen REAL NOT NULL)',
+            'CREATE INDEX sessions_user ON sessions(user_id)',
+            'CREATE TABLE invitations(id TEXT PRIMARY KEY,digest TEXT UNIQUE NOT NULL,email TEXT NOT NULL,org_role TEXT NOT NULL,project_id TEXT,project_role TEXT NOT NULL,created_by TEXT NOT NULL,expires_at REAL NOT NULL,accepted_at REAL,revoked_at REAL)',
+            'CREATE TABLE auth_limits(bucket TEXT PRIMARY KEY,started_at REAL NOT NULL,attempts INTEGER NOT NULL)',
+        ]
+        for statement in statements:db.execute(statement)
+        db.execute('INSERT INTO schema_migrations VALUES(5,?)',(datetime.now(timezone.utc).isoformat(),))
+        db.execute('COMMIT')
+    except Exception:
+        db.execute('ROLLBACK');raise

@@ -22,7 +22,7 @@ def scrub(value):
 def reject_credentials(data):
     if isinstance(data,dict):
         for key,value in data.items():
-            if key.lower() in FORBIDDEN_FIELDS: raise ValueError('Credential fields are not accepted. Configure organization execution secrets on the server; personal credentials are unsupported.')
+            if key.lower() in FORBIDDEN_FIELDS: raise ValueError('Credential fields are not accepted. Authenticate native profiles locally with Codex login or configure optional organization execution secrets on the server.')
             reject_credentials(value)
     elif isinstance(data,list):
         for value in data: reject_credentials(value)

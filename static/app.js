@@ -4,6 +4,7 @@ const $ = id => document.getElementById(id);
 const terminalStates = new Set(['completed', 'failed', 'cancelled']);
 const executionModes = {
   simulation: 'Demo / simulated',
+  native: 'Native Codex · ChatGPT',
   organization_api: 'Organization API',
   personal_supported: 'Personal subscription · unsupported'
 };
@@ -23,6 +24,11 @@ let loading = false;
 let viewVersion = 0;
 let lastConversation = null;
 let refreshSerial = 0;
+let authMode = 'invite';
+let csrfToken = '';
+let registration = false;
+let liveSource = null;
+let liveTimer = null;
 
 const esc = value => String(value ?? '').replace(/[&<>"']/g, character => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
@@ -32,7 +38,7 @@ const displayDate = value => value ? new Date(value).toLocaleString() : 'Not rep
 async function api(path, body) {
   const response = await fetch('/api/' + path, {
     method: body ? 'POST' : 'GET',
-    headers: body ? {'Content-Type': 'application/json'} : {},
+    headers: body ? {'Content-Type': 'application/json', ...(csrfToken ? {'X-Relay-CSRF': csrfToken} : {})} : {},
     body: body ? JSON.stringify(body) : undefined
   });
   const data = await response.json();
@@ -40,6 +46,7 @@ async function api(path, body) {
     const failure = new Error(data.error || 'Request failed');
     failure.status = response.status;
     failure.code = data.code;
+    if (response.status === 401 && authMode === 'invite') showSignIn();
     throw failure;
   }
   return data;
@@ -75,7 +82,7 @@ function ownerName(worker) {
 }
 
 function canManage(worker) {
-  return worker.can_manage === true;
+  return worker.can_manage === true && currentCanWrite();
 }
 
 function eligible(worker) {
@@ -91,6 +98,10 @@ function clearHistory() {
 }
 
 function invalidateView() {
+  if (liveSource) liveSource.close();
+  liveSource = null;
+  if (liveTimer) clearTimeout(liveTimer);
+  liveTimer = null;
   viewVersion += 1;
   refreshSerial += 1;
   lastConversation = null;
@@ -108,7 +119,7 @@ function invalidateView() {
 function setControlsDisabled(disabled) {
   $('user').disabled = disabled;
   $('project').disabled = disabled;
-  $('newProject').disabled = disabled;
+  $('newProject').disabled = disabled || overview?.user.role === 'viewer';
   $('enroll').disabled = disabled;
 }
 
@@ -140,6 +151,7 @@ async function load(force = false) {
   loading = true;
   try {
     const nextOverview = await api('overview');
+    showWorkspaceIdentity(nextOverview);
     if (version !== viewVersion || serial !== refreshSerial) return;
     const nextProject = nextOverview.projects.some(item => item.id === project)
       ? project : nextOverview.projects[0]?.id;
@@ -173,6 +185,7 @@ async function load(force = false) {
     project = nextProject;
     events = nextEvents;
     lastConversation = conversation;
+    subscribe(conversation, nextEvents.length ? nextEvents[nextEvents.length - 1].sequence : 0);
     $('project').innerHTML = overview.projects.map(item =>
       `<option value="${esc(item.id)}">${esc(item.name)}</option>`).join('');
     $('project').value = project;
@@ -194,25 +207,27 @@ function renderWorker(worker, task) {
   const projects = worker.permitted_project_ids || [];
   const modeLabel = executionModes[mode] || mode;
   const scope = mode === 'organization_api' ? 'Shared organization API quota' :
+    mode === 'native' ? 'Local ChatGPT profile · owner initiated' :
     mode === 'personal_supported' ? 'Unsupported · no execution' : 'Independent simulated capacity';
   const reason = worker.eligibility_reason || (eligible(worker) ? 'Approved and available for this project' : 'Not eligible for this project');
   const availabilityControl = mode === 'personal_supported'
     ? '<select name="state" disabled><option value="unsupported">Unsupported</option></select>'
     : `<select name="state">${['available', 'paused', 'offline', 'quota_blocked'].map(value => `<option value="${value}" ${status === value || capacity.availability === value ? 'selected' : ''}>${value.replace('_', ' ')}</option>`).join('')}</select>`;
   const settings = canManage(worker) ? `<details class="worker-settings" data-settings="${esc(worker.id)}"><summary>Owner settings</summary><form data-worker-form="${esc(worker.id)}"><label>Availability${availabilityControl}</label><label class="checkbox-row"><input type="checkbox" name="opt_in" ${worker.opt_in ? 'checked' : ''}> Opt in to eligible assignments</label><fieldset><legend>Explicit project approvals</legend>${overview.projects.map(item => `<label class="checkbox-row"><input type="checkbox" name="project_ids" value="${esc(item.id)}" ${projects.includes(item.id) ? 'checked' : ''}> ${esc(item.name)}</label>`).join('')}</fieldset><div class="settings-actions"><button class="outline" type="submit">Save settings</button><button class="quiet danger" type="button" data-revoke="${esc(worker.id)}">Opt out & stop safely</button></div></form></details>` : '<div class="permission-note">Settings controlled by the worker owner or administrator</div>';
-  return `<article class="worker-entry ${active ? 'active' : ''}"><div class="worker"><span class="worker-icon">⌘</span><div><strong>${esc(worker.display_name || worker.name)}</strong><small>${esc(ownerName(worker))} · ${worker.owner_type === 'org' ? 'Organization owned' : 'User owned'}</small></div><span class="state">${esc(active ? 'active session' : status.replace('_', ' '))}</span></div><div class="worker-facts"><span class="pill ${mode === 'simulation' ? 'simulated' : mode === 'personal_supported' ? 'blocked' : 'api-mode'}">${esc(modeLabel)}</span><span class="eligibility ${eligible(worker) ? 'eligible' : ''}">${eligible(worker) ? '✓ Eligible' : '○ Not eligible'}</span><p>${esc(reason)}</p><dl><dt>Consent</dt><dd>${worker.opt_in ? 'Opted in' : 'Opted out'}</dd><dt>Capacity</dt><dd>${esc(scope)}</dd><dt>Observation</dt><dd>${esc(capacity.source || 'manual')} · ${esc(capacity.availability || status)}</dd><dt>Quota scope</dt><dd>${esc(capacity.quota_scope || 'Not reported')}</dd><dt>Parallel tasks</dt><dd>${esc(worker.max_parallel_tasks || 1)}</dd>${capacity.reset_at ? `<dt>Reset reported</dt><dd>${esc(displayDate(capacity.reset_at))}</dd>` : ''}</dl>${worker.health?.reason ? `<p class="health-note">${esc(worker.health.reason)}</p>` : ''}</div>${settings}</article>`;
+  return `<article class="worker-entry ${active ? 'active' : ''}"><div class="worker"><span class="worker-icon">⌘</span><div><strong>${esc(worker.display_name || worker.name)}</strong><small>${esc(ownerName(worker))} · ${worker.owner_type === 'org' ? 'Organization owned' : 'User owned'}</small></div><span class="state">${esc(active ? 'active session' : status.replace('_', ' '))}</span></div><div class="worker-facts"><span class="pill ${mode === 'simulation' ? 'simulated' : mode === 'personal_supported' ? 'blocked' : 'api-mode'}">${esc(modeLabel)}</span><span class="eligibility ${eligible(worker) ? 'eligible' : ''}">${eligible(worker) ? '✓ Eligible' : '○ Not eligible'}</span><p>${esc(reason)}</p><dl><dt>Consent</dt><dd>${worker.opt_in ? 'Opted in' : 'Opted out'}</dd><dt>Capacity</dt><dd>${esc(scope)}</dd><dt>Observation</dt><dd>${esc(capacity.source || 'manual')} · ${esc(capacity.availability || status)}</dd><dt>Quota scope</dt><dd>${esc(capacity.quota_scope || 'Not reported')}</dd><dt>Last seen</dt><dd>${esc(displayDate(worker.last_seen_at))}</dd><dt>Capabilities</dt><dd>${esc(Object.keys(worker.health?.capabilities || {}).filter(key => worker.health.capabilities[key] === true).join(', ') || 'Not reported')}</dd><dt>Parallel tasks</dt><dd>${esc(worker.max_parallel_tasks || 1)}</dd>${capacity.reset_at ? `<dt>Reset reported</dt><dd>${esc(displayDate(capacity.reset_at))}</dd>` : ''}</dl>${worker.health?.reason ? `<p class="health-note">${esc(worker.health.reason)}</p>` : ''}</div>${settings}</article>`;
 }
 
 function renderWorkerSelectors(workers, task) {
   const startOptions = workers.filter(worker => worker.execution_mode !== 'personal_supported' &&
-    (eligible(worker) || (worker.execution_mode === 'organization_api' && worker.authorized === true)));
+    (eligible(worker) || (['organization_api', 'native'].includes(worker.execution_mode) && worker.authorized === true)));
   if (!startOptions.some(worker => worker.id === selectedStartWorker)) selectedStartWorker = '';
   $('startWorker').innerHTML = '<option value="">Choose an eligible worker automatically</option>' + startOptions.map(worker =>
     `<option value="${esc(worker.id)}">${esc(worker.display_name || worker.name)} · ${esc(executionModes[worker.execution_mode] || worker.execution_mode)}${eligible(worker) ? '' : ' · queued until runtime ready'}</option>`).join('');
   $('startWorker').value = selectedStartWorker;
   const targetOptions = workers.filter(worker => eligible(worker) && worker.id !== task?.worker_id && (!task || worker.execution_mode === task.execution_mode));
   if (!targetOptions.some(worker => worker.id === selectedTarget)) selectedTarget = '';
-  $('switchTarget').innerHTML = '<option value="">Choose approved alternate automatically</option>' + targetOptions.map(worker =>
+  const targetPlaceholder = task?.execution_mode === 'native' ? 'Choose the next local profile explicitly' : 'Choose approved alternate automatically';
+  $('switchTarget').innerHTML = `<option value="">${targetPlaceholder}</option>` + targetOptions.map(worker =>
     `<option value="${esc(worker.id)}">${esc(worker.display_name || worker.name)}</option>`).join('');
   $('switchTarget').value = selectedTarget;
   $('switchReason').value = selectedReason;
@@ -227,7 +242,7 @@ function eventOrigin(event) {
   if (metadata.origin === 'codex') return 'LIVE CODEX';
   if (metadata.origin === 'simulation') return 'SIMULATED';
   if (metadata.origin === 'human' || event.role === 'user') return 'HUMAN';
-  return metadata.execution_mode === 'organization_api' ? 'RELAY / API TASK' : 'RELAY';
+  return metadata.execution_mode === 'native' ? 'RELAY / NATIVE TASK' : metadata.execution_mode === 'organization_api' ? 'RELAY / API TASK' : 'RELAY';
 }
 
 function eventFacts(event) {
@@ -255,22 +270,26 @@ function render() {
   $('pauseAfterTurn').disabled = busy || !!task;
   $('timeline').innerHTML = events.length ? events.map(event => `<article class="event ${esc(event.event_type)} ${esc(event.role)}"><div class="event-head"><span>${esc(event.worker_id ? workerName(event.worker_id) : event.role === 'user' ? 'YOU' : 'RELAY')} · ${esc(event.event_type)} · ${esc(eventOrigin(event))}</span><time datetime="${esc(event.timestamp)}">${esc(displayDate(event.timestamp))}</time></div>${esc(event.content)}${eventFacts(event)}</article>`).join('') : '<div class="welcome"><div class="welcome-icon">⇄</div><h2>A fresh start. A continuous thread.</h2><p>Choose an approved worker and give it a task. Code, tests, and visible history stay with this project.</p><div class="steps"><span>01 Start a task</span><span>02 Save a checkpoint</span><span>03 Pass the context</span></div></div>';
   $('workers').innerHTML = workers.length ? workers.map(worker => renderWorker(worker, task)).join('') : '<div class="empty">No workers are visible for this project. Enroll your own worker or ask an owner to approve this project.</div>';
+  const liveNative = workers.filter(worker => worker.execution_mode === 'native' && worker.health?.available).length;
   const liveApi = workers.some(worker => worker.execution_mode === 'organization_api' && worker.health?.available);
   const simulationCount = workers.filter(worker => worker.execution_mode === 'simulation').length;
-  $('connectionTitle').textContent = liveApi ? 'Organization API runtime configured' : `${simulationCount} simulated worker${simulationCount === 1 ? '' : 's'}`;
-  $('connectionDetail').textContent = liveApi ? 'Backend health only; each execution reports its own result' : 'Live API execution is not connected';
-  $('connectionDot').classList.toggle('api-connected', liveApi);
+  $('connectionTitle').textContent = liveNative ? `${liveNative} native ChatGPT profile${liveNative === 1 ? '' : 's'} ready` : liveApi ? 'Organization API runtime configured' : `${simulationCount} simulated worker${simulationCount === 1 ? '' : 's'}`;
+  $('connectionDetail').textContent = liveNative ? 'Local App Servers · owner initiated · execution results recorded per task' : liveApi ? 'Backend health only; each execution reports its own result' : 'Select a configured native or API worker for live execution';
+  $('connectionDot').classList.toggle('api-connected', !!liveNative || liveApi);
   const unsupported = overview.personal_subscription || detail.personal_subscription;
   if (unsupported?.reason) $('personalReason').textContent = unsupported.reason;
   $('handoffs').innerHTML = detail.handoffs?.length ? detail.handoffs.map(handoff => `<div class="handoff-item"><strong>${esc(workerName(handoff.source))} → ${esc(handoff.target ? workerName(handoff.target) : 'Waiting for an eligible worker')}</strong>${esc(handoff.reason || handoff.reason_code)}<small>Authorized by ${esc(overview.users.find(user => user.id === handoff.authorized_by)?.name || handoff.authorized_by || 'Recorded system action')}<br>Checkpoint ${esc(handoff.checkpoint?.slice(0, 12) || 'Pending')} · Context v${esc(handoff.context_version || 'pending')}<br>${esc(handoff.result || handoff.status)} · ${esc(displayDate(handoff.timestamp))}</small></div>`).join('') : '<div class="empty">No handoffs yet.<br>Use the demo to carry a saved objective from Worker A to Worker B.</div>';
   ['switch', 'cancel'].forEach(id => $(id).disabled = busy || !task);
   $('limit').disabled = busy || !task || workers.find(worker => worker.id === task.worker_id)?.execution_mode !== 'simulation';
-  $('continue').disabled = busy || task?.state !== 'running' || task?.execution_mode === 'organization_api';
+  $('continue').disabled = busy || task?.state !== 'running' || ['organization_api', 'native'].includes(task?.execution_mode);
   $('demo').disabled = busy || !!task;
   document.querySelector('.send').disabled = busy || !!task;
   renderWorkerSelectors(workers, task);
+  if (task?.execution_mode === 'native') $('switch').disabled = busy || !selectedTarget;
   const selectedMode = workers.find(worker => worker.id === selectedStartWorker)?.execution_mode;
-  $('composerNote').textContent = selectedMode === 'organization_api'
+  $('composerNote').textContent = selectedMode === 'native'
+    ? 'NATIVE CODEX · Your local ChatGPT profile · Choose handoff targets explicitly'
+    : selectedMode === 'organization_api'
     ? 'ORGANIZATION API · Shared organization quota · Unavailable work queues until runtime is ready'
     : selectedMode === 'simulation'
       ? 'SIMULATION · Predefined validator demo · No API credentials required'
@@ -278,6 +297,15 @@ function render() {
   renderArtifact();
   bindWorkerSettings();
   setControlsDisabled(busy);
+  const writable = currentCanWrite();
+  $('pause').disabled = busy || !task || !writable || !['running', 'queued'].includes(task.state);
+  $('resume').disabled = busy || !task || !writable || task.state !== 'handoff_pending';
+  $('handoffPhases').disabled = busy || !!task || !writable;
+  $('demo').hidden = authMode !== 'demo';
+  if (!writable) {
+    ['switch', 'cancel', 'limit', 'continue'].forEach(id => $(id).disabled = true);
+    document.querySelector('.send').disabled = true;
+  }
 }
 
 function bindWorkerSettings() {
@@ -353,11 +381,12 @@ $('composer').onsubmit = event => {
     conversation_id: detail.conversation.id,
     prompt: $('prompt').value,
     pause_after_turn: $('pauseAfterTurn').checked,
+    native_phases: Number($('handoffPhases').value),
     ...(selectedStartWorker ? {worker_id: selectedStartWorker} : {})
   });
 };
 $('startWorker').onchange = () => { selectedStartWorker = $('startWorker').value; render(); };
-$('switchTarget').onchange = () => { selectedTarget = $('switchTarget').value; };
+$('switchTarget').onchange = () => { selectedTarget = $('switchTarget').value; render(); };
 $('switchReason').onchange = () => { selectedReason = $('switchReason').value; };
 $('switch').onclick = () => {
   const task = activeTask();
@@ -365,7 +394,7 @@ $('switch').onclick = () => {
   action('switch', {task_id: task.id, generation: task.generation, reason_code: selectedReason,
     ...(selectedTarget ? {target_worker_id: selectedTarget} : {})});
 };
-['limit', 'continue', 'cancel'].forEach(method => $(method).onclick = () => {
+['limit', 'continue', 'cancel', 'pause', 'resume'].forEach(method => $(method).onclick = () => {
   const task = activeTask();
   if (task) action(method, {task_id: task.id, generation: task.generation});
 });
@@ -428,8 +457,14 @@ function renderEnrollmentMode() {
   const mode = $('workerMode').value;
   const organizationOption = $('workerOwner').querySelector('option[value="org"]');
   organizationOption.disabled = overview?.user.role !== 'admin';
-  $('workerOwner').disabled = mode === 'organization_api';
-  if (mode === 'organization_api') {
+  $('workerOwner').disabled = ['organization_api', 'native'].includes(mode);
+  $('nativeProfileLabel').hidden = mode !== 'native';
+  $('nativeProfile').hidden = mode !== 'native';
+  $('nativeProfile').disabled = mode !== 'native';
+  if (mode === 'native') {
+    $('workerOwner').value = 'user';
+    $('enrollmentModeNote').textContent = 'Uses one independently authenticated local CODEX_HOME. Authenticate with scripts/native_profiles.py; only the configured local owner can initiate this profile. No Docker or API key required.';
+  } else if (mode === 'organization_api') {
     $('workerOwner').value = 'org';
     $('enrollmentModeNote').textContent = 'Organization API workers require an administrator and server-side credential/runtime configuration. All workers under that organization share API quota.';
   } else {
@@ -452,6 +487,7 @@ $('enrollmentForm').onsubmit = async event => {
   const body = {
     display_name: $('workerName').value,
     execution_mode: $('workerMode').value,
+    ...($('workerMode').value === 'native' ? {native_profile: $('nativeProfile').value} : {}),
     owner_type: $('workerOwner').value,
     project_ids: $('enrollProject').checked && project ? [project] : [],
     opt_in: $('enrollOptIn').checked,
@@ -462,18 +498,138 @@ $('enrollmentForm').onsubmit = async event => {
     ? 'Worker registered as unsupported. Personal subscription execution remains disabled.' : 'Worker enrolled. Eligibility is evaluated against project approval, owner opt-in, capacity, and runtime health.');
 };
 
-async function init() {
+function currentCanWrite() {
+  return overview?.projects?.find(item => item.id === project)?.can_write !== false;
+}
+
+function showWorkspaceIdentity(value) {
+  document.body.classList.remove('signed-out');
+  $('accountPanel').hidden = true;
+  const demo = value.auth?.mode === 'local_demo';
+  $('user').hidden = !demo;
+  $('identityLabel').hidden = !demo;
+  $('signedInName').hidden = demo;
+  $('signedInName').textContent = value.user.name;
+  $('logout').hidden = demo;
+  $('organizationName').textContent = value.organizations[0]?.name || 'Relay';
+  $('organizationMode').textContent = demo ? 'Local demo organization' : 'Invite-only organization';
+  $('inviteMember').hidden = demo || value.user.role !== 'admin';
+  $('manageMembers').hidden = demo || value.user.role !== 'admin';
+  $('workerMode').querySelectorAll('option').forEach(option => {
+    option.disabled = !demo && ['native', 'personal_supported'].includes(option.value);
+  });
+}
+
+function showSignIn() {
+  invalidateView();
+  overview = null;
+  csrfToken = '';
+  document.body.classList.add('signed-out');
+  $('accountPanel').hidden = false;
+  $('accountPassword').value = '';
+}
+
+function renderRegistration() {
+  document.querySelectorAll('.registration-field').forEach(item => item.hidden = !registration);
+  $('accountName').required = registration;
+  $('invitationToken').required = registration;
+  $('accountTitle').textContent = registration ? 'Join Relay by invitation' : 'Sign in to Relay';
+  $('accountForm').querySelector('button[type="submit"]').textContent = registration ? 'Create Relay account' : 'Sign in';
+  $('accountPassword').autocomplete = registration ? 'new-password' : 'current-password';
+  $('toggleRegistration').textContent = registration ? 'Use an existing Relay account' : 'Accept a Relay invitation';
+}
+
+function subscribe(conversation, after) {
+  if (liveSource?.conversation === conversation || typeof EventSource === 'undefined') return;
+  if (liveSource) liveSource.close();
+  const source = new EventSource(`/api/conversations/${encodeURIComponent(conversation)}/stream?after=${after}`);
+  source.conversation = conversation;
+  liveSource = source;
+  source.onmessage = () => {
+    if (liveTimer) return;
+    liveTimer = setTimeout(() => {
+      liveTimer = null;
+      if (!busy && !loading && lastConversation === conversation) load().catch(showError);
+    }, 500);
+  };
+  // EventSource reconnects with Last-Event-ID. Polling remains the fallback.
+}
+
+$('toggleRegistration').onclick = () => { registration = !registration; renderRegistration(); };
+$('accountForm').onsubmit = async event => {
+  event.preventDefault();
+  const button = $('accountForm').querySelector('button[type="submit"]');
+  button.disabled = true;
+  $('accountError').textContent = '';
+  const email = $('accountEmail').value;
+  const password = $('accountPassword').value;
   try {
-    await load();
-  } catch (failure) {
-    if (failure.status === 403) await login();
-    else showError(failure);
+    if (registration) await api('auth/register', {email, password, name: $('accountName').value, invitation_token: $('invitationToken').value});
+    const signedIn = await api('login', {email, password});
+    csrfToken = signedIn.csrf_token;
+    $('accountPassword').value = '';
+    $('invitationToken').value = '';
+    project = null;
+    await load(true);
+  } catch (failure) { $('accountError').textContent = failure.message; }
+  finally { button.disabled = false; }
+};
+$('logout').onclick = async () => {
+  try { await api('logout', {}); showSignIn(); }
+  catch (failure) { showError(failure); }
+};
+$('inviteMember').onclick = () => {
+  $('inviteLink').value = '';
+  $('inviteError').textContent = '';
+  $('inviteDialog').showModal();
+};
+$('closeInvite').onclick = () => { $('inviteLink').value = ''; $('inviteDialog').close(); };
+$('inviteForm').onsubmit = async event => {
+  event.preventDefault();
+  try {
+    const invitation = await api('invitations', {email: $('inviteEmail').value, project_id: project, project_role: $('inviteRole').value});
+    $('inviteLink').value = invitation.invitation_url;
+  } catch (failure) { $('inviteError').textContent = failure.message; }
+};
+$('manageMembers').onclick = async () => {
+  try {
+    const data = await api('organization/members');
+    $('memberUser').innerHTML = data.members.map(member => `<option value="${esc(member.id)}">${esc(member.name)} · ${esc(member.email)}</option>`).join('');
+    $('membersError').textContent = '';
+    $('membersDialog').showModal();
+  } catch (failure) { showError(failure); }
+};
+$('closeMembers').onclick = () => $('membersDialog').close();
+$('membersForm').onsubmit = async event => {
+  event.preventDefault();
+  try {
+    await api('membership', {project_id: project, user_id: $('memberUser').value, role: $('memberRole').value});
+    $('membersDialog').close();
+    await load(true);
+  } catch (failure) { $('membersError').textContent = failure.message; }
+};
+
+async function init() {
+  const config = await api('auth/config');
+  authMode = config.mode;
+  if (authMode === 'invite') {
+    $('prompt').value = '';
+    const fragment = new URLSearchParams(location.hash.slice(1));
+    if (fragment.has('invite')) {
+      registration = true;
+      $('invitationToken').value = fragment.get('invite');
+      history.replaceState(null, '', location.pathname);
+      renderRegistration();
+    }
+    try { const session = await api('auth/session'); csrfToken = session.csrf_token; await load(true); }
+    catch (failure) { if (failure.status === 401) showSignIn(); else showError(failure); }
+  } else {
+    try { await load(); }
+    catch (failure) { if (failure.status === 403) await login(); else showError(failure); }
   }
 }
 init().catch(showError);
 setInterval(() => {
   const editingWorker = document.activeElement?.closest('.worker-settings');
-  if (!busy && !loading && !$('enrollmentDialog').open && !editingWorker && !document.querySelector('.worker-settings[open]')) {
-    load().catch(showError);
-  }
+  if (!document.body.classList.contains('signed-out') && !busy && !loading && !$('enrollmentDialog').open && !editingWorker && !document.querySelector('.worker-settings[open]')) load().catch(showError);
 }, 5000);

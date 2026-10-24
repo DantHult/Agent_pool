@@ -1,6 +1,6 @@
 # Relay
 
-Persistent coding conversations with separately owned Codex worker identities, explicit project approval, and durable handoffs. The credential-free demo runs **simulated inference with real Git files and Python tests**. An optional organization API adapter runs official Codex in a constrained Docker container; personal subscription delegation is disabled.
+Persistent coding conversations with separately owned Codex worker identities, explicit project approval, and durable handoffs. The credential-free demo runs **simulated inference with real Git files and Python tests**. The native macOS adapter runs three official Codex App Servers with isolated local ChatGPT logins. An optional Docker/organization API backend is preserved; hosted cross-user subscription delegation remains disabled.
 
 ## Start locally
 
@@ -23,7 +23,7 @@ python3 scripts/demo.py --data ./demo-recording
 
 If startup reports an existing server, open the URL shown or press Ctrl+C in its original terminal before restarting. **Do not delete a live `server.lock`.** A leftover lock file after shutdown is harmless. Existing data migrates automatically without replacing conversation IDs, transcripts or custom worker names. Stop any old Relay process before starting this version against the same data directory.
 
-`RELAY_DATA_DIR` changes the default storage path. `.env.example` contains placeholders; Relay does not auto-load `.env`. State under `data/` is ignored by Git. Use a different directory to start fresh.
+`RELAY_DATA_DIR` changes the default storage path. `.env.example` contains placeholders. Load a locally configured file explicitly with `--env-file .env`; Relay does not auto-load it. Existing shell exports take precedence. State under `data/` is ignored by Git. Use a different directory to start fresh.
 
 ## Exact hackathon demo
 
@@ -39,20 +39,24 @@ The **Run handoff demo** button performs steps 3–6 as one operation on a fresh
 
 For approval behavior, create a new project. Membership alone does not make A/B eligible: each owner/admin must explicitly grant that project in worker settings. For no-capacity behavior, set B offline as Sam before step 4; the task remains `handoff_pending`. Restore B and use **Switch Worker**. To show revocation, opt out an active worker: Relay requests safe stop and selects an approved alternate, or retains pending work.
 
-## Arbitrary requests with real Codex
+## Native Codex with ChatGPT authentication
 
-Provision the organization API sandbox in [deploy/README.md](deploy/README.md), including rebuilding the reviewed execution image. Select an explicitly approved **Organization API** worker in the composer and submit your own coding request. Logs distinguish real Codex activity from simulation and include actual command exits and timings. No failed live execution falls back to the canned demo.
-
-For a deterministic live handoff, enroll two organization API workers for the same project and select **Live demo: pause after the first phase for handoff** before submitting. A performs useful partial work, reports completed/pending steps, and reaches a saved `handoff_pending` boundary. Select B and click **Switch Worker**; B reads HANDOFF and history against the preserved files in the same conversation. You can also interrupt a running execution; no replacement writes before confirmed container shutdown. Live initialization takes time and does not transfer hidden model state.
-
-The opt-in proof uses actual Docker/OpenAI execution and may incur organization API charges:
+On macOS, install the official Codex CLI, then initialize and authenticate three separate profiles with different accounts you control:
 
 ```sh
-python3 scripts/live_smoke.py --run-live --data ./live-proof
-python3 scripts/live_smoke.py --run-live --data ./live-proof-custom --prompt-file ./request.txt
+python3 scripts/native_profiles.py init
+CODEX_HOME="$PWD/.relay-native/profiles/a" codex -c 'cli_auth_credentials_store="file"' login --device-auth
+CODEX_HOME="$PWD/.relay-native/profiles/b" codex -c 'cli_auth_credentials_store="file"' login --device-auth
+CODEX_HOME="$PWD/.relay-native/profiles/c" codex -c 'cli_auth_credentials_store="file"' login --device-auth
+python3 scripts/live_smoke.py --backend native --check
+python3 scripts/live_smoke.py --backend native --run-live --data ./live-proof
 ```
 
-The second command accepts an unseen task objective. Include appropriate tests and meaningful work across two phases. Without `--run-live`, the script explicitly skips. It cannot report success without real code changes, successful test commands, distinct native threads, the same conversation and restart persistence. See [LIVE_CODEX_STATUS.md](docs/LIVE_CODEX_STATUS.md) for exactly what was tested here. **Docker and organization credentials were unavailable, so a genuine run remains unverified.**
+Native execution needs no Docker, organization API key, proxy or required model setting. Each App Server owns its profile and private workspaces. Authentication stays with the CLI; never copy auth files or put credentials in Relay. The smoke requests genuine A → B → C coding work, two Git-checkpointed handoffs, new threads per profile, successful test output and restart persistence. It marks success only after all checks pass. **Real native A → B → C execution was verified on 2026-10-24 with three distinct authenticated accounts, two checkpointed handoffs and seven passing generated tests.** Mocked RPC integration and real CLI protocol/sandbox checks are reported separately in [LIVE_CODEX_STATUS.md](docs/LIVE_CODEX_STATUS.md).
+
+Launch the dashboard with `python3 -m relay.server --backend native`. As the configured local owner (`alice` / Alex by default), enroll **Native Codex** workers with profiles A/B/C and approve your project. Choose a native worker explicitly, enter any coding objective and optionally pause after the first phase. Select another native worker and use **Switch Worker** to continue. The same Relay conversation retains files, visible history and pending steps; each account gets a fresh Codex thread. Only the configured owner can initiate their subscriptions. Usage limits do not automatically rotate accounts.
+
+See [deploy/README.md](deploy/README.md) for exact setup, isolation, recovery, optional custom objectives and the preserved **Docker/API** path. The latter uses `--backend docker-api` and still requires authorized organization funding/configuration. Live execution never falls back to simulation.
 
 ## Architecture
 
@@ -63,12 +67,14 @@ flowchart LR
     API --> DB[(SQLite events, grants, capacity, leases)]
     API --> S[Worker scheduler]
     S --> SIM[Owned simulated A / B]
-    S --> LIVE[Organization API adapter]
+    S --> NATIVE[Native App Server adapter]
+    NATIVE --> PROFILES[Three isolated local ChatGPT profiles]
+    S --> LIVE[Optional organization API adapter]
     LIVE --> BOX[Restricted Codex container]
     BOX --> PROXY[Internal inference proxy]
     PROXY --> OA[OpenAI organization API]
     S --> GIT[Server-side Git + HANDOFF + history artifacts]
-    S --> OFF[Personal subscription: unsupported]
+    S --> OFF[Hosted cross-user subscription delegation: unsupported]
 ```
 
 A **Relay user** is a human account; a **worker owner** controls eligibility; a **worker** is an isolated logical execution session; an **execution credential reference** is server-only. User membership and worker project grants are separate. The administrator has an explicit organization role. The seed workers have explicit demo approvals; new workers start with only their configured grants.
@@ -77,7 +83,7 @@ A **Relay user** is a human account; a **worker owner** controls eligibility; a 
 | --- | --- |
 | Data, migrations, permissions and scheduling | `relay/store.py`, `relay/migrations.py` |
 | HTTP and identity boundary | `relay/server.py`, `relay/auth.py` |
-| Typed adapters and capability checks | `relay/workers.py` |
+| Typed adapters and capability checks | `relay/workers.py`, `relay/native.py`, `relay/app_server.py` |
 | Git, context artifacts, safe files and redaction | `relay/workspace.py`, `relay/security.py` |
 | Dashboard / worker directory / owner settings | `static/index.html`, `app.js`, `style.css` |
 | Optional isolated live execution | `deploy/`, [setup instructions](deploy/README.md) |
@@ -85,19 +91,20 @@ A **Relay user** is a human account; a **worker owner** controls eligibility; a 
 
 Full original visible events are append-only, ordered and paginated. Summaries are separate, versioned, lossy context with event references, not an unbounded active model window. `HANDOFF.md` and per-event historical files remain in the server workspace; a new worker can read older files on demand. Provider native thread IDs are stored on assignments separately from the stable Relay conversation ID. Reasoning items are excluded.
 
-States follow `queued → running → pausing → checkpointed → handoff_pending → running → completed/failed`, with terminal cancellation. A mutex, transactional assignment, workspace lease, one active task per conversation, generation checks, and request idempotency prevent duplicate writers. Real execution runs in a background thread; a handoff/cancel waits for container shutdown before checkpointing and reassigning. Simulation deliberately waits at a safe boundary after implementation for the demo.
+States follow `queued → running → pausing → checkpointed → handoff_pending → running → completed/failed`, with terminal cancellation. A mutex, transactional assignment, workspace lease, one active task per conversation, generation checks, and request idempotency prevent duplicate writers. Real execution runs in a background thread; a handoff/cancel waits for native interruption or container shutdown before checkpointing and reassigning. Simulation deliberately waits at a safe boundary after implementation for the demo.
 
 ## Execution modes and configuration
 
 | Mode | Behavior |
 | --- | --- |
 | **Simulation** | Fully runnable default, no credentials, deterministic validator code and actual tests; capacity signals are simulated independently per worker |
+| **Native Codex** | macOS App Server stdio; isolated `CODEX_HOME` ChatGPT logins and workspaces, owner-initiated tasks and explicit same-owner handoffs; no Docker/API key required |
 | **Organization API** | Docker-only adapter using documented `codex exec --json`; API funding/quota shared by organization. Requires explicitly configured server secrets, reviewed container image, internal network/proxy, model, owner/admin approval and opt-in |
 | **Personal subscription** | **Unsupported** for Relay's remotely hosted cross-user delegation use case; enrollment is visible but execution fails closed with `unsupported_execution_mode` |
 
-The optional live adapter is implemented, supports arbitrary objectives and safe two-worker continuation, and is tested against a mock Codex JSONL subprocess, but **no Docker build or paid API execution was verified here** because Docker and an authorized credential were unavailable. Follow [deploy/README.md](deploy/README.md) for the concrete setup and live acceptance procedure. Adding a raw key to the frontend or copying a CLI auth directory is never supported. Worker switches do not reset shared API limits. Unknown remaining quota and reset times remain unknown.
+Native execution and optional Docker/API execution have separate mocked protocol tests. **Native real model execution and A → B → C continuation passed**, including seven generated tests and restart persistence. The optional Docker/API model path remains unverified. Follow [deploy/README.md](deploy/README.md) for the concrete setup and live acceptance procedure. Adding a raw key to the frontend or copying a CLI auth directory is never supported. Worker switches do not reset shared API limits. Unknown remaining quota and reset times remain unknown.
 
-See [AUTH_EXECUTION_COMPATIBILITY.md](docs/AUTH_EXECUTION_COMPATIBILITY.md) for official documentation reviewed and the reason personal delegation stays disabled, and [IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md) for an honest feature inventory.
+See [AUTH_EXECUTION_COMPATIBILITY.md](docs/AUTH_EXECUTION_COMPATIBILITY.md) for official documentation reviewed and the difference between local owner-initiated ChatGPT execution and cross-user subscription delegation, and [IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md) for an honest feature inventory.
 
 ## HTTP API
 
@@ -123,7 +130,7 @@ All data routes require a Relay demo session; mutation bodies are JSON. Worker e
 | POST | `/api/demo` | `{project_id}` runs the designated A→B simulated handoff flow |
 | POST | `/api/membership` | Admin explicitly grants a user's project membership; never grants worker access implicitly |
 
-Approved organization API tasks can be saved queued while their runtime is unavailable; an explicit `execution_mode: organization_api` preserves that intent. Simulation still accepts only the validator fixture.
+Approved native and organization API tasks can be saved queued while their runtime is unavailable; an explicit `execution_mode: native` or `organization_api` preserves that intent. Simulation still accepts only the validator fixture.
 
 Mutations accept `request_id` for retries. Reusing a key with different input is rejected. Directory responses omit even credential references. Hidden/unshared workers are not automatically listed to colleagues. Seed private sandbox belongs only to Sam; explicit administrators can inspect organization projects.
 
@@ -141,7 +148,7 @@ Optional development checks (no production dependency):
 ```sh
 python3 -m pip install -r requirements-dev.txt
 python3 -m ruff check .
-python3 -m mypy relay/workers.py relay/auth.py relay/codex_events.py
+python3 -m mypy relay/workers.py relay/auth.py relay/codex_events.py relay/native.py relay/app_server.py
 ```
 
 There is no framework build step. UI checking validates HTML IDs and uses Node or macOS JavaScriptCore for syntax. Browser visual QA was unavailable. Tests cover real process restart, migration preservation, project/grant privacy, worker ownership, credential rejection/redaction, unsupported personal mode, real fixture tests, idempotency/concurrent handoffs, async safe stop, shared-capacity provenance, checkpoint failure and unverified-container cleanup. Controlled live-mode fixtures never call a paid provider.
@@ -152,6 +159,6 @@ Keep one server per data directory; the process lock protects HTTP startup. Do n
 
 Git and SQLite cannot commit atomically. If a checkpoint fails, files and the error remain; inspect the worktree before explicit retry. The application never resets a repository to discard partial work. Checkpoint diffs are the reviewable output; remote PR creation is not implemented.
 
-Simulation executes only trusted fixture code with a bounded test command. General coding uses the optional non-root container, limited CPU/memory/processes/deadline, read-only host metadata, no host home/auth/socket, and internal-only networking through the narrow API proxy. The organization key remains outside generated code; a bounded inference capability is available to the coding container. Only trusted operators may control Docker or the data volume. Add filesystem quotas to the volume for deployed workloads.
+Simulation executes only trusted fixture code with a bounded test command. Native coding uses the verified macOS permission profile and private Git clones; tools cannot read credential homes or other workers, and uncertain changes are retained privately. The optional Docker/API backend uses a non-root container, limited CPU/memory/processes/deadline, read-only host metadata, no host home/auth/socket, and internal-only networking through the narrow API proxy. The organization key remains outside generated code; a bounded inference capability is available to the coding container. Only trusted operators may control Docker or the data volume. Add filesystem quotas to the volume for deployed workloads.
 
 The app remains a single-organization local demo. Replace seed identity selection with verified SSO/OIDC and secure sessions before hosting remotely; also configure TLS, backups, secret rotation, retention and tenant-scoped infrastructure. Exact configured secrets/common key patterns are filtered, but no detector can identify every arbitrary secret: never paste credentials into prompts or repositories. Event triggers prevent application updates/deletes, not tampering by a database administrator.

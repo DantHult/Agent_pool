@@ -1,76 +1,94 @@
 # Live Codex execution status
 
-Updated **2026-10-24**. **No genuine Docker/OpenAI run was verified in this environment.** Docker, the organization API key and proxy capability were absent. Installed Codex CLI was `0.163.0`; `codex exec --help` and current official documentation were reviewed. No local ChatGPT login state or personal credentials were used.
+Updated **2026-10-24**. **Real native A → B → C model execution and cross-account continuation passed** after the owner independently authenticated three distinct ChatGPT accounts. The exact requested command exited 0 and produced `live-proof/native-smoke-report.json` with `live_verified: true`. The optional Docker/API backend remains unverified against the real provider.
 
-## Completed implementation
+## Actual installed CLI checks
 
-The existing Python/SQLite/Git architecture and simulated demo were preserved. The live path remains the documented official `codex exec --json` integration inside the existing non-root Docker sandbox and narrow organization API proxy.
+Installed CLI: **0.163.0**. Reviewed official [App Server](https://learn.chatgpt.com/docs/app-server), [authentication](https://learn.chatgpt.com/docs/auth) and [permissions](https://learn.chatgpt.com/docs/permissions) documentation, and generated the installed CLI's experimental JSON schema in a temporary directory. No authentication files were read or copied.
 
-- A freeform objective is passed intact to Codex stdin, except required secret filtering. The simulation fixture is never substituted for a failed live task. Handoffs cannot cross from organization API execution to simulation.
-- stdout JSONL and stderr are captured separately, with bounded output, command/exit metadata, and redaction. A final event without a newline is processed. Reasoning items are discarded before persistence; visible agent/tool items are retained. Native thread IDs are persisted as soon as they arrive.
-- Additive migration **3** stores task phase/progress and `execution_runs`: assignment/worker/mode, start/end, exit code, duration, native thread, error category, retry guidance and progress. Events remain append-only and correlated by execution run. `GET /api/tasks/:id/result` requires project access.
-- `start`/`resume` retain the durable event callback interface. The live adapter additionally exposes `stream_events`, `get_result` and `resume_or_start_from_handoff`; Git checkpoints remain scheduler-owned. These are Relay's interfaces, not invented SDK methods.
-- The pinned image includes an official `--output-schema` schema for visible final progress: summary, completed work, pending steps, decisions, tests, errors and limitations. The next context uses that actual output, current Git branch/checkpoint, changed files and referenced event artifacts.
-- `pause_after_turn: true` requests a useful partial first phase and a backend-enforced safe boundary. After the first completed turn, Relay checkpoints, releases the lease and remains `handoff_pending` until the user selects a worker. It does not fake a usage limit. If the model finishes everything anyway, the live smoke refuses to claim proof of unfinished-work continuation.
-- Mid-run Switch requests cancellation, verifies container/process shutdown, checkpoints preserved bytes and rehydrates a fresh worker against the same project/conversation. A stop can leave partially edited code; diffs and tests must be inspected. A second writer cannot start before verified cleanup. Unverified cleanup retains the lease.
-- Wall-clock deadlines also bound a blocked stdin pipe. Failed or interrupted jobs preserve files/history. Transient runtime errors remain pending for explicit review/retry; no entire coding turn or non-idempotent tool is automatically replayed. Only official bounded request/stream retries are configured.
-- Explicit provider 429/rate-limit/billing categories and available retry information are recorded. All workers sharing that organization scope become quota-blocked. This takes precedence over a pending switch; another logical worker is not a quota workaround. Owner opt-out/offline affects that worker's eligibility separately.
-- The existing UI now shows LIVE CODEX / SIMULATED / HUMAN / RELAY origins, stderr/exit/timing metadata, a live phase-boundary checkbox, same-mode worker targets, full-task Git diff and the unchanged conversation ID. No dashboard redesign was introduced.
-
-## Verification evidence
-
-Baseline: **76 tests passed** in 66.974 seconds; `python3 scripts/demo.py` passed with five actual validator tests. During implementation, a full run found one changed-file context regression in the simulation; it was corrected and the original 11 acceptance tests passed again. The new live transport suite passed all ten scenarios before the final full run.
-
-`tests/test_live_codex.py` exercises the **real OrganizationApiCodexAdapter** and scheduler with a faithful, explicitly mocked JSONL process replacing only Docker launch/health/cleanup. The fixture performs actual temporary-repository writes and runs two real unittest checks. It tests:
-
-1. Unseen/freeform prompt passage, phase A, source/test changes on B, same conversation, structured progress, distinct native IDs, stderr, timings and restart replay.
-2. A running process interrupted before B starts; a PID assertion verifies the previous process has stopped.
-3. A real-format 429 observed just before a switch; no peer execution on shared exhausted capacity.
-4. Authorization, revoked grants, cross-project isolation and no live→simulation fallback.
-5. Nonzero exit despite a completion event, partial-work timeout recovery, and runtime startup that never consumes stdin.
-
-These are transport fixtures, **not real Codex reasoning or paid inference evidence**. Production offers no mock transport switch. Default CI explicitly skips `tests/test_real_codex_smoke.py` unless the operator opts in.
-
-## Genuine opt-in smoke
-
-Provision the isolated proxy/image using [deploy/README.md](../deploy/README.md). Run on a trusted non-root Docker host with an authorized organization API key configured server-side. This can incur organization API charges.
+The requested command was run against the actual CLI:
 
 ```sh
-# Dedicated data directory; do not share it with a running Relay process.
-python3 scripts/live_smoke.py --run-live --data ./live-proof
-
-# An unseen programming objective can be supplied as a local text file.
-# Include test expectations and meaningful work for two phases.
-python3 scripts/live_smoke.py --run-live --data ./live-proof-custom --prompt-file ./request.txt
-
-# Equivalent opt-in unittest (temporary workspace):
-RELAY_RUN_LIVE_SMOKE=1 python3 -m unittest discover -s tests -p test_real_codex_smoke.py -v
+python3 scripts/live_smoke.py --backend native --run-live --data ./live-proof
 ```
 
-The smoke checks the image's actual CLI version, creates a fresh project and two organization-owned approved workers, submits the objective on A, waits for a real partial phase/checkpoint, explicitly switches to B, and requires real successful command/test output and completed native runs. It reopens the backend and compares transcript, files, runs and contexts. Only then does it write `live_verified: true` in `live-smoke-report.json`. No simulated workers are scheduled. Running without `--run-live` prints SKIP and makes no provider request; missing prerequisites fail closed before creating a workspace.
+After the three interactive logins, it exits **0**. Verified prerequisites and protocol:
 
-For the UI, launch Relay with the same configured server environment, enroll/approve two organization API workers as Jordan, and grant Alex project membership. As Alex choose A, enter an arbitrary task, check **Live demo: pause after the first phase for handoff**, and submit. At `handoff_pending`, select B and click **Switch Worker**. For a running-job demo, click Switch while activity is still arriving. Inspect HANDOFF, context, full-task diff, actual outputs and worker origins, then refresh/restart.
+- PASS: macOS host and Codex CLI.
+- PASS: three independent App Server processes initialize over stdio with isolated `CODEX_HOME` directories.
+- PASS: native named permissions and accessible workspaces; actual sandboxed commands can write their workspace but cannot read nonsecret canaries in the profile home or another worker's workspace. The host Python unittest runtime imports successfully inside this sandbox.
+- PASS: actual `thread/start` with the private native permission and shell configuration, exercising Codex's sandboxed instruction loader. The CLI executable is canonicalized and allowed as a single runtime read so its helper can run; no auth-directory read exception is granted. The server’s specific Python installation is also readable so framework/Homebrew Python can run tests; home/root runtime prefixes are refused.
+- PASS: A, B and C authenticated with ChatGPT and three distinct account identities, checked without displaying or persisting their values. API-key auth is rejected by this backend.
 
-## Remaining limits
+Preflight starts no model turn. It performs no Docker/API backend checks and requires no organization API key, proxy token or configured model. Preflight alone does not prove inference or capacity. The completed real execution below supplies the coding and continuation evidence.
 
-No Docker image build, cloud deployment, live OpenAI call, or browser visual QA was possible here. The live runner is implemented and transport-tested; genuine integration remains unverified until the opt-in smoke passes on a configured host. Model access and the contents of a reviewed image determine which languages/tests are usable. Coding containers have no general package-download network; install dependencies in the reviewed image. Data-volume filesystem quotas and backups are operator responsibilities.
+## Successful real execution
 
-Relay authentication is still local demo identity selection. It is not safe to publish this login on the Internet. A cloud VM can run the backend/workspace behind an authenticated SSH tunnel for a trusted demo; production sharing still requires real SSO, secure sessions and TLS. Personal ChatGPT/Codex subscription delegation remains unsupported. Nothing transfers inaccessible model reasoning or promises instantaneous initialization on worker B.
+The unchanged acceptance command used three actual `codex app-server --stdio` processes and consumed the authenticated profiles' Codex allowance. No Docker, organization API key, proxy token or required model setting was supplied for native execution. No test fixture or mock transport was used.
 
-## Official contracts reviewed
+| Worker / profile | Actual work | Turn duration | Tests at boundary |
+| --- | --- | --- | --- |
+| A / `a` | Created `text_tools.py`, initial line/longest-line logic, tests and README; reported unfinished work | 38.710 s | 2 passed |
+| B / `b` | Read A's committed code and handoff/history, implemented word counting, added empty/blank-input tests | 33.045 s | 5 passed |
+| C / `c` | Read B's handoff/history, added Unicode/mixed-line-ending tests, completed README | 38.169 s | 7 passed |
 
-- [Codex non-interactive mode](https://developers.openai.com/codex/noninteractive/): stdin prompts, JSONL events, explicit API automation and structured outputs.
-- [Codex configuration reference](https://developers.openai.com/codex/config-reference/): custom Responses provider and bounded request/stream retry settings.
-- [API rate limits](https://developers.openai.com/api/docs/guides/rate-limits): shared provider limits; a worker identity does not create new quota.
+All three turns finished with state `completed` and exit code 0, contributed nonempty project patches, and used different native threads. The conversation stayed `2a325a7a4efb447db6f6cbaff411cc06`; task `6e6199a067e2402aaa08a0477851df59` completed with no pending steps. Two handoffs resumed successfully:
 
+- A → B checkpoint: `57867d89b63c7676acb7fcff83e789ccff26a6a6`.
+- B → C checkpoint: `b6ef5191f8acd4039732fcd6390711067f64e7a3`.
+- Final acceptance checkpoint: `9229c2e78c052b5e1be02bba457bab4e5d13c0ca`.
 
-## Recorded check commands
+The smoke reopened Relay and compared events, execution records, context snapshots and files. Persistence passed and all writer leases were released. The report retains native thread IDs, durations and the checkpointed handoffs. Generated code/tests and full visible events remain in the Git-ignored local `live-proof/` directory; credentials and account identities are absent from this proof.
 
-- `python3 -m unittest discover -s tests -v`: 88 tests, 87 passed and the genuine paid integration test explicitly skipped; 87.294 seconds. Final `python3 -m unittest discover -s tests -q` rerun, including the structured-progress redaction edge case: the same 87 passed / one skipped in 84.027 seconds.
-- `python3 scripts/demo.py`: PASS; five actual validator tests, 30 persisted events, A→B and reopen persistence.
-- `python3 scripts/check_ui.py`: PASS for HTML IDs and JavaScriptCore syntax.
+Post-run repository review corrected one README expected-output comment: the example's longest line is `naïve texte`. The original model execution records and acceptance checkpoint remain intact. The separate documentation review checkpoint is `07706c1e52494191dc25ecf48599c2fa00ac182e`, recorded in the report's `review_checkpoint`; implementation and the seven tests were unchanged.
+
+C corrected an initially incorrect Unicode test fixture and reran all seven tests successfully. Its optional `git status` and a shell heredoc encountered macOS temporary-cache restrictions; these are retained as genuine tool diagnostics. They did not prevent the Python tests, scheduler-owned checkpoints, handoffs or restart verification. Arbitrary developer-tool/temp-file compatibility has not been established by this one smoke run.
+
+## Implemented path
+
+`relay/app_server.py` provides bounded JSONL stdio RPC, initialization, responses/notifications, fail-closed server requests, process-group cleanup and a minimal child environment. `relay/native.py` manages persistent per-profile App Servers and file locks, local ChatGPT auth checks, private clones, new threads/turns, visible streaming events, interruption, errors and validated publication to canonical workspaces. Auth notifications, stderr, raw account objects and reasoning are not persisted. Neither raw auth nor credentials move between workers.
+
+The existing scheduler retains project grants, authorizer checks, events, workspace leases, Git checkpoints, structured progress, context snapshots and handoff history. Schema migration **4** adds native profile identity and configurable two/three-phase boundaries without replacing existing data. Each cross-profile continuation creates a fresh Codex thread with the same Relay conversation, committed project state and visible task context. Only the configured local owner initiates subscription work. Usage exhaustion does not automatically rotate profiles or bypass limits.
+
+The native smoke requires real changes by each worker, completed turns with distinct thread IDs, two checkpointed handoffs, C's successful test command, final progress with no pending steps and restart persistence before marking a report verified. Production has no mock transport setting or simulated fallback. The optional `docker-api` backend remains separately configured.
+
+## Automated versus real evidence
+
+`tests/fixtures/native_app_server.py` is an explicit test-only JSON-RPC peer. It writes real temporary source/tests and produces protocol events, but performs **no Codex inference or ChatGPT authentication**. Native tests cover:
+
+- A → B → C continuation, separate workspaces/homes and new threads, checkpoints/context, original objective, visible history and restart persistence.
+- Mocked end-to-end smoke orchestration and proof validation; generated reports stay in test temporary directories and are not real execution evidence.
+- `turn/interrupt` preserving partial work before another profile starts.
+- Conflict rejection when the canonical checkpoint changes.
+- Native readiness independent of Docker, organization API credentials or required API models; API-key profile rejection.
+- Owner restrictions, duplicate-profile rejection, no quota-driven account rotation, no forwarded API secrets or persisted reasoning/account identity.
+- Refusal of escalation and external token requests, and canonical CLI executable handling for its sandbox helper.
+
+Existing Docker/API transport fixtures, permissions, startup, recovery, proxy and simulation tests remain. Ordinary CI skips both genuine provider integration tests. A passing mocked test is never described as real Codex execution.
+
+## Repeat real verification
+
+See [deployment commands](../deploy/README.md) for three independent interactive logins. Then run:
+
+```sh
+python3 scripts/live_smoke.py --backend native --check
+python3 scripts/live_smoke.py --backend native --run-live --data ./live-proof
+# Optional genuine native unittest, consuming signed-in Codex allowance:
+RELAY_RUN_NATIVE_SMOKE=1 python3 -m unittest discover -s tests -p test_real_codex_smoke.py -v
+```
+
+A successful real run creates `live-proof/native-smoke-report.json` with `live_verified: true`, execution records and checkpointed handoffs. Failure retains available evidence for inspection and never silently replays a turn. The original paid path remains available with `--backend docker-api` and `RELAY_RUN_LIVE_SMOKE=1` after its separate setup.
+
+Native execution uses macOS permissions and deadlines, not the Docker backend's CPU/memory/container controls. Dependency availability, disk quotas and cleanup/retention are local operator responsibilities. The dashboard remains a loopback local demo with seeded identity selection; browser visual QA and remote deployment have not been verified.
+
+## Recorded automated checks
+
+- `python3 -m unittest discover -s tests -q`: **108 tests, 106 passed, 2 genuine-provider tests skipped**, 121.851 seconds. No model calls in ordinary CI.
+- Native integration suite: 11 tests against the test-only JSON-RPC peer, included in the full run.
+- `python3 scripts/demo.py`: PASS, simulated A → B with five actual validator tests and restart persistence.
+- `python3 scripts/check_ui.py`: PASS, HTML IDs and JavaScriptCore syntax; not browser visual QA.
 - `python3 -m compileall -q relay tests scripts deploy`: PASS.
-- Ruff configured checks: PASS. Mypy on `relay/workers.py`, `relay/auth.py`, `relay/codex_events.py`: PASS. Development tools ran from a temporary installation; the application runtime remains standard-library Python.
-- `python3 scripts/live_smoke.py`: SKIP without opt-in; no provider request.
-- `python3 scripts/live_smoke.py --run-live --data /private/tmp/relay-live-preflight-check`: exited 2 at fail-closed preflight because organization API execution was disabled. Independent prerequisite inspection also confirmed Docker, the authorized organization key, and the proxy capability were absent. No workspace, Docker task or paid request was created by this attempt.
+- Ruff configured checks: PASS. Mypy on `relay/workers.py`, `relay/auth.py`, `relay/codex_events.py`, `relay/native.py`, `relay/app_server.py`: PASS. Development tools run from a temporary installation; runtime remains standard-library Python.
 - `git diff --check`: PASS.
+- `python3 scripts/live_smoke.py --backend native`: explicit SKIP without `--run-live`.
+- Before authentication, native preflight exited 2 without a model turn. After the three interactive logins, **the exact native `--run-live` command exited 0**, with three real model turns, two checkpointed handoffs, seven passing generated tests and restart persistence. This evidence is separate from the ordinary mocked test suite.

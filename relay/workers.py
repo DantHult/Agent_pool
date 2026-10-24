@@ -1,6 +1,7 @@
-"""Codex execution adapters. Personal subscription delegation is deliberately disabled.
+"""Codex adapters with explicit native and optional Docker/API backends.
 
-Live coding runs only in a restricted Docker container; no host Codex/auth fallback.
+Native subscriptions are local and owner initiated; cross-user delegation is disabled.
+The Docker/API backend never falls back to host execution or native authentication.
 The scheduler owns persistence, writer leases, checkpoints, and handoff authorization.
 """
 from dataclasses import dataclass, field
@@ -22,10 +23,10 @@ from .codex_events import provider_error, progress_from_message
 
 Emit = Callable[[str, str, dict], None]
 PERSONAL_UNSUPPORTED_REASON = (
-    'Employee-owned ChatGPT/Codex subscription execution is unsupported in Relay. '
+    'Hosted cross-user ChatGPT/Codex subscription delegation is unsupported in Relay. '
     'The official documentation reviewed does not explicitly authorize this remotely hosted '
     'cross-user delegated execution use case. A Relay login or owner opt-in is insufficient. '
-    'Use simulation or an explicitly authorized organization API worker; never upload personal '
+    'Use native mode for local owner-initiated execution, simulation, or an explicitly authorized organization API worker; never upload personal '
     'ChatGPT tokens, cookies, or CLI auth files.'
 )
 
@@ -130,6 +131,9 @@ class SimulationWorkerAdapter:
                        f"{context.get('tests', 'Tests not run yet')}. Adding and running validator tests.")
             emit('response', summary, {'context_received': context})
             _safe_file(workspace, 'test_validator.py').write_text(TESTS)
+            if task.get('native_phases')==3 and task.get('execution_phase')==1:
+                emit('tool_output','SIMULATED phase B wrote the trusted tests; worker C must execute them.',{'simulated_worker':True})
+                return ExecutionResult('running','SIMULATED: tests prepared. Pause/checkpoint and request worker C to run them.',progress={'completed_work':['Prepared validator tests'],'pending_steps':['Execute the fixed validator suite on worker C']})
             emit('tool_invocation', 'Run fixed isolated Python unittest suite', {})
             command = [sys.executable, '-I', '-c',
                        "import sys,unittest; sys.path.insert(0,'.'); r=unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.discover('.',pattern='test_validator.py')); sys.exit(not r.wasSuccessful())"]
@@ -508,6 +512,9 @@ def get_adapter(worker: dict) -> WorkerAdapter:
     mode = worker.get('execution_mode', 'simulation')
     if mode == 'simulation': return SimulationWorkerAdapter(worker)
     if mode == 'organization_api': return OrganizationApiCodexAdapter(worker)
+    if mode == 'native':
+        from .native import NativeCodexAdapter
+        return NativeCodexAdapter(worker)
     if mode == 'personal_supported': return PersonalSubscriptionCodexAdapter(worker)
     raise UnsupportedExecutionMode('Unknown execution mode; assignment refused')
 

@@ -1,8 +1,9 @@
-"""Opt-in genuine Docker/OpenAI A→B handoff smoke test. Never uses simulated workers.
+"""Opt-in genuine native A→B→C or optional Docker/API A→B smoke test.
 
 Configure deploy/README.md, then run:
-python3 scripts/live_smoke.py --run-live --data ./live-proof
-This may incur organization API charges. Without --run-live, it explicitly skips.
+python3 scripts/live_smoke.py --backend native --run-live --data ./live-proof
+Native uses ChatGPT subscriptions; docker-api uses organization API billing.
+Without --run-live, execution explicitly skips. No simulated fallback.
 """
 import argparse
 import json
@@ -130,18 +131,94 @@ def run(data,objective):
             print(f'Workspace: {Path(data).resolve()/"workspaces"/project}\nReport: {report_path.resolve()}',flush=True)
         finally:relay.close()
 
+def native_preflight():
+    from relay.native import native_readiness
+    checks,details=native_readiness()
+    for label,ok in checks:print(('PASS: ' if ok else 'MISSING: ')+label,flush=True)
+    if not all(ok for _,ok in checks):
+        raise RuntimeError('Native preflight blocked: '+'; '.join(details or ['See failed checks'])+'. Run scripts/native_profiles.py init, then authenticate each dedicated CODEX_HOME using codex login.')
+    return max(5,min(int(os.environ.get('RELAY_NATIVE_TIMEOUT_SECONDS','180')),900))
+
+def run_native(data,objective):
+    from relay.native import native_owner,close_native_sessions
+    os.environ['RELAY_ENABLE_NATIVE']='1'
+    try:
+        timeout=native_preflight();owner=native_owner()
+        with exclusive_demo_directory(data):
+            relay=Relay(data)
+            try:
+                project=relay.mutate(owner,'projects',{'name':'Native Codex A to B to C'})['id']
+                conversation=relay.detail(owner,project)['conversation']['id'];workers=[]
+                for profile in ('a','b','c'):
+                    existing=relay.rows("SELECT * FROM workers WHERE execution_mode='native' AND native_profile=?",(profile,))
+                    if existing:
+                        worker=existing[0];grants=[r['project_id'] for r in relay.rows('SELECT project_id FROM worker_projects WHERE worker_id=?',(worker['id'],))]
+                        relay.mutate(owner,'workers/configure',{'worker_id':worker['id'],'opt_in':True,'state':'available','project_ids':list(set(grants+[project]))})
+                    else:worker=relay.mutate(owner,'workers/enroll',{'display_name':'Native '+profile.upper(),'owner_type':'user','execution_mode':'native','native_profile':profile,'project_ids':[project]})
+                    workers.append(worker['id'])
+                task=relay.mutate(owner,'prompt',{'conversation_id':conversation,'worker_id':workers[0],'execution_mode':'native','prompt':objective,'pause_after_turn':True,'native_phases':3})
+                report={'backend':'native','live_verified':False,'project_id':project,'conversation_id':conversation,'task_id':task['id'],'workers':workers}
+                report_path=Path(data)/'native-smoke-report.json';report_path.write_text(json.dumps(report,indent=2))
+                cursor=0
+                for phase in range(3):
+                    deadline=time.monotonic()+timeout+45
+                    while time.monotonic()<deadline:
+                        with relay.lock:
+                            current=relay.task(owner,task['id'])
+                            events=relay.events(owner,conversation,cursor,100)['events']
+                            for event in events:
+                                cursor=event['sequence']
+                                if event['event_type'] in ('tool_invocation','tool_output','response','error','provider_error','state','handoff','native_patch'):print(f"[{event['worker_id']} / {event['event_type']}] {clean(event['content'])[:2000]}",flush=True)
+                            if task['id'] not in relay.jobs and current['state'] in ('completed','failed','cancelled','handoff_pending'):break
+                        time.sleep(.2)
+                    else:raise RuntimeError('Native task exceeded smoke deadline; private and canonical workspaces retained')
+                    if phase<2:
+                        if current['state']!='handoff_pending' or not json.loads(current['progress_json']).get('pending_steps'):raise RuntimeError('Native phase did not retain substantive unfinished work')
+                        detail=relay.detail(owner,project)
+                        if not detail['workspace'].get('task_diff'):raise RuntimeError('No genuine code changes at the native handoff boundary')
+                        print(f'OWNER-INITIATED HANDOFF: {phase+1} -> {phase+2}; same conversation '+conversation,flush=True)
+                        relay.mutate(owner,'switch',{'task_id':task['id'],'generation':current['generation'],'target_worker_id':workers[phase+1]})
+                    elif current['state']!='completed':raise RuntimeError('Native C did not finish the objective')
+                detail=relay.detail(owner,project);runs=detail['execution_runs'];history=full_events(relay,owner,conversation)
+                if len(runs)!=3 or len({r['native_thread_id'] for r in runs})!=3 or any(r['state']!='completed' or r['execution_mode']!='native' for r in runs):raise RuntimeError('Three distinct completed native executions were not verified')
+                for worker_id in workers:
+                    if not any(e['worker_id']==worker_id and e['event_type']=='native_patch' and json.loads(e['metadata']).get('patch_bytes',0)>0 for e in history):raise RuntimeError('Each native worker must contribute actual project changes')
+                if len(detail['handoffs'])!=2 or not all(h['checkpoint'] and h['target'] for h in detail['handoffs']):raise RuntimeError('Two successful checkpointed native handoffs were not verified')
+                progress=json.loads(current['progress_json'])
+                if progress.get('pending_steps') or not progress.get('test_results'):raise RuntimeError('Final native progress lacks test/completion evidence')
+                test_ids=[json.loads(e['metadata']).get('provider_item_id') for e in history if e['worker_id']==workers[2] and e['event_type']=='tool_invocation' and re.search(r'test|pytest|unittest|spec',e['content'],re.I)]
+                if not any(e['worker_id']==workers[2] and e['event_type']=='tool_output' and json.loads(e['metadata']).get('provider_item_id') in test_ids and json.loads(e['metadata']).get('exit_code')==0 for e in history):raise RuntimeError('Native C did not execute a successful test command')
+                relay.close();relay=Relay(data);restored=relay.detail(owner,project)
+                if restored['contexts']!=detail['contexts'] or restored['execution_runs']!=runs or restored['workspace']['files']!=detail['workspace']['files'] or full_events(relay,owner,conversation)!=history:raise RuntimeError('Native restart persistence verification failed')
+                report.update({'live_verified':True,'handoffs':detail['handoffs'],'execution_runs':runs,'checkpoint':detail['workspace']['checkpoint']})
+                report_path.write_text(json.dumps(report,indent=2));print('PASS: genuine native Codex A → B → C, three authenticated accounts, successful tests and restart persistence.',flush=True)
+            finally:relay.close()
+    finally:close_native_sessions()
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--backend',choices=('native','docker-api'),default='docker-api',help='Native local ChatGPT App Server or optional organization API Docker runner')
     parser.add_argument('--env-file',type=Path,help='Explicit Relay environment file; shell exports take precedence')
-    parser.add_argument('--check',action='store_true',help='Check prerequisites only; never run Codex or call OpenAI')
-    parser.add_argument('--run-live',action='store_true',help='Explicitly authorize a genuine organization API smoke run')
+    parser.add_argument('--check',action='store_true',help='Check backend prerequisites without starting a model turn (native starts local App Servers)')
+    parser.add_argument('--run-live',action='store_true',help='Authorize genuine execution using the selected backend')
     parser.add_argument('--data',default='live-proof',help='Dedicated persistent directory; cannot be shared with a running server')
-    parser.add_argument('--prompt-file',type=Path,help='Optional unseen programming objective; include meaningful tests and two phases')
+    parser.add_argument('--prompt-file',type=Path,help='Optional programming objective; include tests and useful work across the backend handoff phases')
     args=parser.parse_args()
     try:
         if args.env_file: load_env_file(args.env_file)
     except (ValueError,OSError) as exc:
         parser.exit(2,clean(str(exc))+'\n')
+    if args.backend=='native':
+        from relay.native import close_native_sessions
+        if not args.check and not args.run_live:
+            print('SKIP: native execution requires --run-live; no model request made.');return
+        try:
+            if args.check:native_preflight()
+            else:run_native(args.data,args.prompt_file.read_text() if args.prompt_file else DEFAULT_OBJECTIVE.replace('two-phase','three-phase'))
+        except (RuntimeError,OSError,ValueError,subprocess.SubprocessError) as exc:
+            parser.exit(2,'NATIVE BLOCKED/FAILED: '+clean(str(exc))+'\n')
+        finally:close_native_sessions()
+        return
     if args.check:
         checks=readiness()
         for label,ready in checks: print(('PASS: ' if ready else 'MISSING: ')+label)
