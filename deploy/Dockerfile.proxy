@@ -1,0 +1,5 @@
+FROM python:3.12-slim
+WORKDIR /app
+COPY deploy/api_proxy.py /app/api_proxy.py
+USER 65534:65534
+CMD ["python3", "-I", "/app/api_proxy.py"]

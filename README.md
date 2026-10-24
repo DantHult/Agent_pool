@@ -1,8 +1,157 @@
-Relay — Collaborative AI Without Limits
-Relay is a cloud-based AI orchestration platform that allows teams to seamlessly transfer ongoing tasks between AI agents without losing progress or context.
+# Relay
 
-In a company where employees have separate AI subscriptions, some may exhaust their usage limits while others have unused capacity. Relay helps teams coordinate this available capacity by allowing authorized agents to take over unfinished work.
+Persistent coding conversations with separately owned Codex worker identities, explicit project approval, and durable handoffs. The credential-free demo runs **simulated inference with real Git files and Python tests**. An optional organization API adapter runs official Codex in a constrained Docker container; personal subscription delegation is disabled.
 
-By centrally storing conversation histories, project files, and execution states, Relay enables seamless handoffs between agents such as Claude Code and Codex. Employees can switch agents, preserve context, and continue working without restarting tasks or manually transferring files.
+## Start locally
 
-Relay turns individual AI tools into a collaborative, continuous workflow.
+Requires Python 3.10+, Git, and macOS/Linux. The local demo has no package installation or API credential requirement.
+
+```sh
+python3 -m relay.server
+```
+
+Open **http://127.0.0.1:8000**. Alex, Sam and Jordan are seeded **local demo identities**, not authenticated production accounts. The server binds to loopback. Do not expose demo login remotely.
+
+```sh
+# Separate demo instance: change BOTH the data directory and port.
+python3 -m relay.server --data ./data-other --port 8001
+# Repeatable command-line demo with fresh temporary state:
+python3 scripts/demo.py
+# Or preserve demo state for inspection (do not share with a running server):
+python3 scripts/demo.py --data ./demo-recording
+```
+
+If startup reports an existing server, open the URL shown or press Ctrl+C in its original terminal before restarting. **Do not delete a live `server.lock`.** A leftover lock file after shutdown is harmless. Existing data migrates automatically without replacing conversation IDs, transcripts or custom worker names. Stop any old Relay process before starting this version against the same data directory.
+
+`RELAY_DATA_DIR` changes the default storage path. `.env.example` contains placeholders; Relay does not auto-load `.env`. State under `data/` is ignored by Git. Use a different directory to start fresh.
+
+## Exact hackathon demo
+
+1. Launch with a fresh directory: `python3 -m relay.server --data ./demo-session --port 8001`; open http://127.0.0.1:8001 as Alex.
+2. Select **Password toolkit**. Worker A belongs to Alex; B belongs to Sam. Both have explicitly seeded project approval, opt-in, and independently labeled **simulated** capacity.
+3. Submit the prefilled “Add a password-strength validator and tests to this sample project.” prompt on Worker A. A writes the actual `validator.py` and waits at a safe boundary. Inspect its attributed events and files.
+4. Click **Simulate Usage Limit**. A becomes quota-blocked **in the simulation only**. Relay stops writes, creates a Git checkpoint and context, then assigns approved Worker B.
+5. Open the handoff timeline, **HANDOFF.md**, **Working context**, **Checkpoints**, and file diff. The handoff records reason, authorizer, source/target, context version and Git commit. The Relay conversation ID remains unchanged.
+6. B reads the unfinished objective/current state/test information, writes tests, and executes five real unittest checks. Completion appears only after the actual result.
+7. Refresh, stop/restart the backend, and reselect the project. Transcript, context, assignments, checkpoints and code persist.
+
+The **Run handoff demo** button performs steps 3–6 as one operation on a fresh demo project. To repeat after a simulated limit, Alex can manually mark A available in owner settings; this is explicitly simulated capacity management. `scripts/demo.py` resets only the designated demo workers and is repeatable on its own data directory. Never run the CLI demo concurrently against a server's directory.
+
+For approval behavior, create a new project. Membership alone does not make A/B eligible: each owner/admin must explicitly grant that project in worker settings. For no-capacity behavior, set B offline as Sam before step 4; the task remains `handoff_pending`. Restore B and use **Switch Worker**. To show revocation, opt out an active worker: Relay requests safe stop and selects an approved alternate, or retains pending work.
+
+## Arbitrary requests with real Codex
+
+Provision the organization API sandbox in [deploy/README.md](deploy/README.md), including rebuilding the reviewed execution image. Select an explicitly approved **Organization API** worker in the composer and submit your own coding request. Logs distinguish real Codex activity from simulation and include actual command exits and timings. No failed live execution falls back to the canned demo.
+
+For a deterministic live handoff, enroll two organization API workers for the same project and select **Live demo: pause after the first phase for handoff** before submitting. A performs useful partial work, reports completed/pending steps, and reaches a saved `handoff_pending` boundary. Select B and click **Switch Worker**; B reads HANDOFF and history against the preserved files in the same conversation. You can also interrupt a running execution; no replacement writes before confirmed container shutdown. Live initialization takes time and does not transfer hidden model state.
+
+The opt-in proof uses actual Docker/OpenAI execution and may incur organization API charges:
+
+```sh
+python3 scripts/live_smoke.py --run-live --data ./live-proof
+python3 scripts/live_smoke.py --run-live --data ./live-proof-custom --prompt-file ./request.txt
+```
+
+The second command accepts an unseen task objective. Include appropriate tests and meaningful work across two phases. Without `--run-live`, the script explicitly skips. It cannot report success without real code changes, successful test commands, distinct native threads, the same conversation and restart persistence. See [LIVE_CODEX_STATUS.md](docs/LIVE_CODEX_STATUS.md) for exactly what was tested here. **Docker and organization credentials were unavailable, so a genuine run remains unverified.**
+
+## Architecture
+
+```mermaid
+flowchart LR
+    U[Local demo identity / future SSO] --> API[Relay HTTP API + permission checks]
+    UI[Dashboard] --> API
+    API --> DB[(SQLite events, grants, capacity, leases)]
+    API --> S[Worker scheduler]
+    S --> SIM[Owned simulated A / B]
+    S --> LIVE[Organization API adapter]
+    LIVE --> BOX[Restricted Codex container]
+    BOX --> PROXY[Internal inference proxy]
+    PROXY --> OA[OpenAI organization API]
+    S --> GIT[Server-side Git + HANDOFF + history artifacts]
+    S --> OFF[Personal subscription: unsupported]
+```
+
+A **Relay user** is a human account; a **worker owner** controls eligibility; a **worker** is an isolated logical execution session; an **execution credential reference** is server-only. User membership and worker project grants are separate. The administrator has an explicit organization role. The seed workers have explicit demo approvals; new workers start with only their configured grants.
+
+| Area | Files |
+| --- | --- |
+| Data, migrations, permissions and scheduling | `relay/store.py`, `relay/migrations.py` |
+| HTTP and identity boundary | `relay/server.py`, `relay/auth.py` |
+| Typed adapters and capability checks | `relay/workers.py` |
+| Git, context artifacts, safe files and redaction | `relay/workspace.py`, `relay/security.py` |
+| Dashboard / worker directory / owner settings | `static/index.html`, `app.js`, `style.css` |
+| Optional isolated live execution | `deploy/`, [setup instructions](deploy/README.md) |
+| Tests and repeatable demo | `tests/`, `scripts/demo.py`, `scripts/check_ui.py` |
+
+Full original visible events are append-only, ordered and paginated. Summaries are separate, versioned, lossy context with event references, not an unbounded active model window. `HANDOFF.md` and per-event historical files remain in the server workspace; a new worker can read older files on demand. Provider native thread IDs are stored on assignments separately from the stable Relay conversation ID. Reasoning items are excluded.
+
+States follow `queued → running → pausing → checkpointed → handoff_pending → running → completed/failed`, with terminal cancellation. A mutex, transactional assignment, workspace lease, one active task per conversation, generation checks, and request idempotency prevent duplicate writers. Real execution runs in a background thread; a handoff/cancel waits for container shutdown before checkpointing and reassigning. Simulation deliberately waits at a safe boundary after implementation for the demo.
+
+## Execution modes and configuration
+
+| Mode | Behavior |
+| --- | --- |
+| **Simulation** | Fully runnable default, no credentials, deterministic validator code and actual tests; capacity signals are simulated independently per worker |
+| **Organization API** | Docker-only adapter using documented `codex exec --json`; API funding/quota shared by organization. Requires explicitly configured server secrets, reviewed container image, internal network/proxy, model, owner/admin approval and opt-in |
+| **Personal subscription** | **Unsupported** for Relay's remotely hosted cross-user delegation use case; enrollment is visible but execution fails closed with `unsupported_execution_mode` |
+
+The optional live adapter is implemented, supports arbitrary objectives and safe two-worker continuation, and is tested against a mock Codex JSONL subprocess, but **no Docker build or paid API execution was verified here** because Docker and an authorized credential were unavailable. Follow [deploy/README.md](deploy/README.md) for the concrete setup and live acceptance procedure. Adding a raw key to the frontend or copying a CLI auth directory is never supported. Worker switches do not reset shared API limits. Unknown remaining quota and reset times remain unknown.
+
+See [AUTH_EXECUTION_COMPATIBILITY.md](docs/AUTH_EXECUTION_COMPATIBILITY.md) for official documentation reviewed and the reason personal delegation stays disabled, and [IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md) for an honest feature inventory.
+
+## HTTP API
+
+All data routes require a Relay demo session; mutation bodies are JSON. Worker enrollment/settings never accept raw keys, tokens, cookies, auth directories or credential references.
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| POST | `/api/login` | `{user_id: alice\|bob\|admin}` selects a local demo identity |
+| GET | `/api/overview` | User/org/project/worker directory, explicit auth/execution modes |
+| GET | `/api/workers?project_id=ID&mine=1` | Authorized directory, project eligibility, ownership/capacity, optional own workers |
+| POST | `/api/workers/enroll` | `display_name`, `owner_type`, `execution_mode`, `project_ids`, `opt_in`, max parallel tasks (1) |
+| POST | `/api/workers/configure` | Owner/admin changes `worker_id`, name, opt-in, availability or project grants |
+| POST | `/api/workers/revoke` | Owner/admin revokes a project grant or all opt-in eligibility |
+| POST | `/api/availability` | Compatibility route for owner/admin availability changes |
+| POST / GET | `/api/projects` / `/api/projects/:id` | Create project; inspect its ongoing conversation/tasks/files/contexts/handoffs/checkpoints/assignments |
+| GET | `/api/conversations/:id/events?after=0&limit=100` | Ordered transcript pages; `next_after` cursor, max 100 |
+| GET | `/api/tasks/:id/result` | Project-authorized execution runs, native IDs, exit codes, timings and progress |
+| GET | `/api/artifacts/:id` | Authorized large event content |
+| POST | `/api/prompt` | `{conversation_id,prompt,worker_id?,execution_mode?,pause_after_turn?}` saves task; queues if no approved worker is available |
+| POST | `/api/switch` | `{task_id,generation,target_worker_id?,reason_code?}`; manual_switch/task_pause/retry |
+| POST | `/api/limit` | `{task_id,generation}` simulated limit, only valid on simulated tasks |
+| POST | `/api/continue`, `/api/cancel` | Finish at the current simulation boundary or request safe cancellation |
+| POST | `/api/demo` | `{project_id}` runs the designated A→B simulated handoff flow |
+| POST | `/api/membership` | Admin explicitly grants a user's project membership; never grants worker access implicitly |
+
+Approved organization API tasks can be saved queued while their runtime is unavailable; an explicit `execution_mode: organization_api` preserves that intent. Simulation still accepts only the validator fixture.
+
+Mutations accept `request_id` for retries. Reusing a key with different input is rejected. Directory responses omit even credential references. Hidden/unshared workers are not automatically listed to colleagues. Seed private sandbox belongs only to Sam; explicit administrators can inspect organization projects.
+
+## Verification
+
+```sh
+python3 -m unittest discover -s tests -v
+python3 scripts/demo.py
+python3 scripts/check_ui.py
+python3 -m compileall -q relay tests scripts deploy
+```
+
+Optional development checks (no production dependency):
+
+```sh
+python3 -m pip install -r requirements-dev.txt
+python3 -m ruff check .
+python3 -m mypy relay/workers.py relay/auth.py relay/codex_events.py
+```
+
+There is no framework build step. UI checking validates HTML IDs and uses Node or macOS JavaScriptCore for syntax. Browser visual QA was unavailable. Tests cover real process restart, migration preservation, project/grant privacy, worker ownership, credential rejection/redaction, unsupported personal mode, real fixture tests, idempotency/concurrent handoffs, async safe stop, shared-capacity provenance, checkpoint failure and unverified-container cleanup. Controlled live-mode fixtures never call a paid provider.
+
+## Recovery and security limits
+
+Keep one server per data directory; the process lock protects HTTP startup. Do not operate directly on its database/worktree from another process. A restart never automatically replays an uncertain model/tool action. Interrupted tasks become pending. If Docker cleanup cannot be verified, Relay retains the writer lease and pausing state: restore Docker, verify/stop the task-labeled container, and restart Relay before requesting another worker.
+
+Git and SQLite cannot commit atomically. If a checkpoint fails, files and the error remain; inspect the worktree before explicit retry. The application never resets a repository to discard partial work. Checkpoint diffs are the reviewable output; remote PR creation is not implemented.
+
+Simulation executes only trusted fixture code with a bounded test command. General coding uses the optional non-root container, limited CPU/memory/processes/deadline, read-only host metadata, no host home/auth/socket, and internal-only networking through the narrow API proxy. The organization key remains outside generated code; a bounded inference capability is available to the coding container. Only trusted operators may control Docker or the data volume. Add filesystem quotas to the volume for deployed workloads.
+
+The app remains a single-organization local demo. Replace seed identity selection with verified SSO/OIDC and secure sessions before hosting remotely; also configure TLS, backups, secret rotation, retention and tenant-scoped infrastructure. Exact configured secrets/common key patterns are filtered, but no detector can identify every arbitrary secret: never paste credentials into prompts or repositories. Event triggers prevent application updates/deletes, not tampering by a database administrator.

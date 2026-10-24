@@ -1,0 +1,14 @@
+data/
+__pycache__/
+*.pyc
+.env
+.venv/
+
+.ruff_cache/
+.mypy_cache/
+# Documented runtime/demo directories contain conversations and workspace artifacts.
+demo-session/
+demo-recording/
+data-other/
+live-proof/
+live-proof-custom/

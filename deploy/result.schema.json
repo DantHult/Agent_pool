@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "properties": {
+    "summary": {"type": "string"},
+    "completed_work": {"type": "array", "items": {"type": "string"}},
+    "pending_steps": {"type": "array", "items": {"type": "string"}},
+    "decisions": {"type": "array", "items": {"type": "string"}},
+    "test_results": {"type": "array", "items": {"type": "string"}},
+    "errors": {"type": "array", "items": {"type": "string"}},
+    "limitations": {"type": "array", "items": {"type": "string"}}
+  },
+  "required": ["summary", "completed_work", "pending_steps", "decisions", "test_results", "errors", "limitations"],
+  "additionalProperties": false
+}

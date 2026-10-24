@@ -1,0 +1,3 @@
+# Optional development tools only; the application runtime is standard-library Python.
+ruff==0.17.2
+mypy==2.4.0

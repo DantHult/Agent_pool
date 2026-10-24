@@ -1,0 +1,26 @@
+services:
+  inference-proxy:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.proxy
+    image: relay-codex-proxy:local
+    container_name: relay-codex-proxy
+    environment:
+      RELAY_ORG_OPENAI_API_KEY: ${RELAY_ORG_OPENAI_API_KEY:?Set an authorized organization API key}
+      RELAY_CODEX_PROXY_TOKEN: ${RELAY_CODEX_PROXY_TOKEN:?Set a random proxy token}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 32
+    mem_limit: 128m
+    cpus: 0.5
+    networks:
+      coding:
+        aliases: [relay-codex-proxy]
+      inference-egress: {}
+    # No host port and no host mounts. Coding containers only join the internal network.
+networks:
+  coding:
+    name: relay-codex-internal
+    internal: true
+  inference-egress: {}
