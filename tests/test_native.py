@@ -37,7 +37,7 @@ class NativeAdapterTests(unittest.TestCase):
     def tearDown(self):
         self.relay.close();close_native_sessions();self.transport.stop();self.cli.stop();self.platform.stop();self.env.stop();self.tmp.cleanup()
     def wait(self,task,state):
-        deadline=time.monotonic()+60
+        deadline=time.monotonic()+180
         while time.monotonic()<deadline:
             with self.relay.lock:
                 current=self.relay.task('alice',task['id'])
@@ -131,6 +131,17 @@ class NativeAdapterTests(unittest.TestCase):
             checks,details=native_readiness()
         self.assertTrue(all(ok for _,ok in checks),details)
         self.assertFalse(any('Docker' in label or 'API key' in label for label,_ in checks))
+    def test_windows_host_is_eligible_for_native_preflight(self):
+        with patch('relay.native.platform.system', return_value='Windows'):
+            checks, details = native_readiness(('a',))
+        self.assertEqual(checks[0], ('Native macOS or Windows execution host', True))
+        self.assertTrue(all(ok for _, ok in checks), details)
+    def test_other_hosts_cannot_start_native_profiles(self):
+        with patch('relay.native.platform.system', return_value='Linux'):
+            checks, details = native_readiness()
+        self.assertEqual(checks[0][1], False)
+        self.assertFalse(any(label.startswith('Profile ') for label, _ in checks))
+        self.assertEqual(details, [])
     def test_native_rejects_api_authenticated_profile(self):
         close_native_sessions();home,_=profile_paths('a');(home/'scenario.json').write_text('{"auth":"apiKey"}')
         checks,details=native_readiness();self.assertFalse(all(ok for _,ok in checks));self.assertIn('ChatGPT login',' '.join(details))

@@ -10,7 +10,6 @@ import os
 from pathlib import Path
 import platform
 import shutil
-import shlex
 import subprocess
 import sys
 import tempfile
@@ -97,9 +96,7 @@ class NativeSession:
         canary.write_text('nonsecret-isolation-probe')
         try:
             peer_canary.write_text('nonsecret-peer-isolation-probe')
-            paths=' '.join(shlex.quote(str(path)) for path in (canary,peer_canary))
-            command='for path in '+paths+'; do if /bin/cat "$path" >/dev/null 2>&1; then exit 91; fi; done; printf probe > .native-probe; /bin/rm .native-probe; printf native-isolation-ok'
-            result=self.connect().request('command/exec',{'command':['/bin/sh','-c',command],'cwd':str(cwd),'permissionProfile':PERMISSION_NAME,'timeoutMs':10000})
+            result=self.connect().request('command/exec',{'command':_isolation_command(canary,peer_canary),'cwd':str(cwd),'permissionProfile':PERMISSION_NAME,'timeoutMs':10000})
             if result.get('exitCode')!=0 or result.get('stdout')!='native-isolation-ok':raise AppServerError('Native OS sandbox isolation probe failed; no model execution is allowed')
             result=self.connect().request('command/exec',{'command':[sys.executable,'-I','-c','import unittest; print("native-python-ok")'],'cwd':str(cwd),'permissionProfile':PERMISSION_NAME,'timeoutMs':10000})
             if result.get('exitCode')!=0 or result.get('stdout','').strip()!='native-python-ok':raise AppServerError('Native Python test runtime probe failed')
@@ -109,9 +106,10 @@ class NativeSession:
                 working=Path(directory);(working/'.tmp').mkdir()
                 if toolchain():
                     env=workspace_environment(working);create_shell_profile(working)
-                    result=self.connect().request('command/exec',{'command':['/bin/zsh','-lc','node --version && npm --version'],
-                        'cwd':str(working),'env':env,'permissionProfile':PERMISSION_NAME,'timeoutMs':10000})
-                    if result.get('exitCode')!=0:raise AppServerError('Approved native Node/npm runtime probe failed; inspect toolchain preparation')
+                    for args in (['node','--version'],['npm','--version']):
+                        result=self.connect().request('command/exec',{'command':args,
+                            'cwd':str(working),'env':env,'permissionProfile':PERMISSION_NAME,'timeoutMs':10000})
+                        if result.get('exitCode')!=0:raise AppServerError('Approved native Node/npm runtime probe failed; inspect toolchain preparation')
                 if not self.connect().request('thread/start',thread_options(working)).get('thread',{}).get('id'):
                     raise AppServerError('App Server did not create a native probe thread')
             self.probed=True
@@ -138,8 +136,24 @@ def close_native_sessions():
     for session in sessions:session.close()
 atexit.register(close_native_sessions)
 
+def native_host():
+    # Codex supplies the OS sandbox. The isolation probe must pass before any model turn.
+    return platform.system() in ('Darwin', 'Windows')
+
+def _isolation_command(canary, peer):
+    script = (
+        'import pathlib,sys\n'
+        'for raw in sys.argv[1:]:\n'
+        '    try: pathlib.Path(raw).read_bytes()\n'
+        '    except OSError: continue\n'
+        '    raise SystemExit(91)\n'
+        'probe=pathlib.Path(".native-probe"); probe.write_text("probe"); probe.unlink()\n'
+        'print("native-isolation-ok")\n'
+    )
+    return [sys.executable, '-I', '-c', script, str(canary), str(peer)]
+
 def native_readiness(profiles=PROFILE_IDS):
-    checks=[('Native macOS execution host',platform.system()=='Darwin'),('Codex CLI installed',bool(shutil.which(os.environ.get('RELAY_CODEX_BIN','codex'))))]
+    checks=[('Native macOS or Windows execution host',native_host()),('Codex CLI installed',bool(shutil.which(os.environ.get('RELAY_CODEX_BIN','codex'))))]
     details=[];identities=[]
     if not all(ok for _,ok in checks):return checks,details
     for profile in profiles:
@@ -166,7 +180,7 @@ class NativeCodexAdapter:
     def health(self):
         base={'available':False,'connected':False,'mode':'native','status':'unavailable','authentication':'unknown','capabilities':self.capabilities}
         if not self.worker.get('_native_enabled',os.environ.get('RELAY_ENABLE_NATIVE')=='1'):return {**base,'reason':'Native execution disabled; use --auth local-owner --backend native'}
-        if platform.system()!='Darwin':return {**base,'reason':'Native execution requires macOS sandbox support'}
+        if not native_host():return {**base,'reason':'Native execution requires the Codex CLI sandbox on macOS or Windows'}
         expected_owner=self.worker.get('_native_owner_id') or native_owner()
         if self.worker.get('owner_type')!='user' or self.worker.get('owner_id')!=expected_owner:return {**base,'reason':'Native subscription is restricted to its configured local owner'}
         if self.worker.get('state')=='quota_blocked':return {**base,'status':'quota_blocked','reason':'Provider reported this profile exhausted; wait for capacity. No automatic account rotation.'}

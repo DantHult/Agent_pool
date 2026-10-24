@@ -30,11 +30,13 @@ def private_workspace(workspace):
     parts = workspace.relative_to(base).parts
     if len(parts) != 2 or parts[0] not in ('a', 'b', 'c') or not re.fullmatch('[0-9a-f]{32}', parts[1]):
         raise ValueError('Preview requires one isolated native worktree')
-    if not workspace.is_dir() or workspace.stat().st_uid != os.getuid():
+    if not workspace.is_dir():
         raise ValueError('Preview workspace must be owned by this OS user')
+    uid = getattr(os, 'getuid', lambda: None)()
     profile = workspace.parent
-    if profile.stat().st_mode & 0o077 or profile.stat().st_uid != os.getuid():
-        raise ValueError('Preview workspace parent must have mode 0700 and belong to this user')
+    # Windows has no uid and its permission bits do not encode mode 0700.
+    if uid is not None and (workspace.stat().st_uid != uid or profile.stat().st_mode & 0o077 or profile.stat().st_uid != uid):
+        raise ValueError('Preview workspace must be owned by this OS user and its parent must have mode 0700')
     return workspace
 
 
@@ -159,12 +161,16 @@ class Preview:
         log_path = self.workspace / '.native' / ('preview-' + name + '.log')
         if log_path.is_symlink():
             raise ValueError('Preview log must not be a symlink')
-        directory = os.open(self.workspace / '.native', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            fd = os.open(log_path.name, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=directory)
-        finally:
-            os.close(directory)
-        output = os.fdopen(fd, 'ab')
+        if hasattr(os, 'O_DIRECTORY') and hasattr(os, 'O_NOFOLLOW'):
+            directory = os.open(self.workspace / '.native', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                fd = os.open(log_path.name, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+            finally:
+                os.close(directory)
+            output = os.fdopen(fd, 'ab')
+        else:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            output = open(log_path, 'ab')
         try:
             child = subprocess.Popen(['/usr/bin/sandbox-exec', '-p', self.policy, *map(str, command)],
                                      cwd=cwd, env=self.environment, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
@@ -198,22 +204,31 @@ class Preview:
         if child is None:
             return
         # Always signal the whole process group, even if its direct child exited.
-        try:
-            os.killpg(child.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        try:
-            child.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
-        finally:
-            # A parent may exit while a descendant ignores SIGTERM. Reaping the
-            # direct process alone must not leave a project server running.
+        if hasattr(os, 'killpg'):
             try:
-                os.killpg(child.pid, signal.SIGKILL)
+                os.killpg(child.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
-        child.wait(timeout=5)
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            finally:
+                # A parent may exit while a descendant ignores SIGTERM. Reaping the
+                # direct process alone must not leave a project server running.
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            child.wait(timeout=5)
+            return
+        try:
+            if child.poll() is None:
+                child.terminate()
+            child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait(timeout=5)
 
     def stop_backend(self):
         self.stop('backend')

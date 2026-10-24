@@ -1,6 +1,6 @@
 # Relay
 
-Persistent coding conversations with separately owned Codex worker identities, explicit project approval, and durable handoffs. The credential-free demo runs **simulated inference with real Git files and Python tests**. The native macOS adapter runs three official Codex App Servers with isolated local ChatGPT logins. An optional Docker/organization API backend is preserved; hosted cross-user subscription delegation remains disabled.
+Persistent coding conversations with separately owned Codex worker identities, explicit project approval, and durable handoffs. The credential-free demo runs **simulated inference with real Git files and Python tests**. The native adapter runs three official Codex App Servers with isolated local ChatGPT logins on macOS or Windows. An optional Docker/organization API backend is preserved; hosted cross-user subscription delegation remains disabled.
 
 ## Shared access from multiple computers
 
@@ -17,7 +17,7 @@ Shared mode uses organization-authorized API workers and disables local native s
 
 ## Start the explicit local demo
 
-Requires Python 3.10+, Git, and Windows, macOS, or Linux. The local demo has no package installation or API credential requirement. Native ChatGPT App Server workers remain **macOS-only**. Organization API containers require a Unix-capable Docker host.
+Requires Python 3.10+, Git, and Windows, macOS, or Linux. The local demo has no package installation or API credential requirement. Native ChatGPT App Server workers run on macOS and Windows; the project console and Seatbelt preview remain macOS-only. Organization API containers require a Unix-capable Docker host.
 
 **Windows:** Install [Git for Windows](https://git-scm.com/download/win) so `git.exe` is on `PATH` (Relay also probes the usual `Program Files\Git` locations). The simulated demo and unit tests need Git. If your system drive is full, point temp space at an SSD before running tests or the demo:
 
@@ -67,7 +67,7 @@ For approval behavior, create a new project. Membership alone does not make A/B 
 
 ## Native Codex with ChatGPT authentication
 
-On macOS, install the official Codex CLI, then initialize and authenticate three separate profiles with different accounts you control:
+On macOS or Windows, install the official Codex CLI, then initialize and authenticate three separate profiles with different accounts you control. `scripts/native_profiles.py init` prints the login command for this operating system:
 
 ```sh
 python3 scripts/native_profiles.py init
@@ -131,7 +131,7 @@ States follow `queued → running → pausing → checkpointed → handoff_pendi
 | Mode | Behavior |
 | --- | --- |
 | **Simulation** | Fully runnable default, no credentials, deterministic validator code and actual tests; capacity signals are simulated independently per worker |
-| **Native Codex** | macOS App Server stdio; isolated `CODEX_HOME` ChatGPT logins and workspaces, owner-initiated tasks and explicit same-owner handoffs; no Docker/API key required |
+| **Native Codex** | macOS or Windows App Server stdio; isolated `CODEX_HOME` ChatGPT logins and workspaces, owner-initiated tasks and explicit same-owner handoffs; no Docker/API key required |
 | **Organization API** | Docker-only adapter using documented `codex exec --json`; API funding/quota shared by organization. Requires explicitly configured server secrets, reviewed container image, internal network/proxy, model, owner/admin approval and opt-in |
 | **Personal subscription** | **Unsupported** for Relay's remotely hosted cross-user delegation use case; enrollment is visible but execution fails closed with `unsupported_execution_mode` |
 

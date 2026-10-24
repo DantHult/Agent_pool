@@ -1,5 +1,6 @@
 """Create private local Codex homes or inspect auth via App Server; never copy tokens."""
 import argparse
+import os
 from pathlib import Path
 import shlex
 import sys
@@ -22,7 +23,11 @@ def main():
             print('Created three private CODEX_HOME/workspace directories. No credentials copied. Authenticate each interactively:')
             for profile in PROFILE_IDS:
                 home,_=profile_paths(profile)
-                print('CODEX_HOME='+shlex.quote(str(home))+' codex -c \'cli_auth_credentials_store="file"\' login --device-auth')
+                quoted=shlex.quote(str(home))
+                if os.name=='nt':
+                    print("$env:CODEX_HOME="+quoted+"; codex -c 'cli_auth_credentials_store=\"file\"' login --device-auth")
+                else:
+                    print('CODEX_HOME='+quoted+' codex -c \'cli_auth_credentials_store="file"\' login --device-auth')
         else:
             checks,details=native_readiness((args.profile,) if args.profile else PROFILE_IDS)
             for label,ok in checks:print(('PASS: ' if ok else 'MISSING: ')+label)
