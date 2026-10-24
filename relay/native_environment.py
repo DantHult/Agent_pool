@@ -121,23 +121,27 @@ def workspace_environment(working):
     working = Path(working)
     # A retained clone is model-controlled. Never follow its directory links
     # while the trusted owner creates caches or starts a preview.
-    descriptor = os.open(working, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        for components in (('.tmp',), ('.native', 'home')):
-            current = os.dup(descriptor)
-            try:
-                for name in components:
-                    try:
-                        os.mkdir(name, mode=0o700, dir_fd=current)
-                    except FileExistsError:
-                        pass
-                    child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current)
+    if os.name != 'nt' and hasattr(os, 'O_DIRECTORY') and hasattr(os, 'O_NOFOLLOW'):
+        descriptor = os.open(working, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            for components in (('.tmp',), ('.native', 'home')):
+                current = os.dup(descriptor)
+                try:
+                    for name in components:
+                        try:
+                            os.mkdir(name, mode=0o700, dir_fd=current)
+                        except FileExistsError:
+                            pass
+                        child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current)
+                        os.close(current)
+                        current = child
+                finally:
                     os.close(current)
-                    current = child
-            finally:
-                os.close(current)
-    finally:
-        os.close(descriptor)
+        finally:
+            os.close(descriptor)
+    else:
+        (working / '.tmp').mkdir(exist_ok=True)
+        (working / '.native/home').mkdir(parents=True, exist_ok=True)
     home = working / '.native/home'
     env = clean_environment(home, toolchain())
     env['PATH'] = str(working / '.venv/bin') + ':' + ':'.join(env['PATH'].split(':')[1:])
@@ -149,19 +153,33 @@ def workspace_environment(working):
 
 def create_shell_profile(workspace):
     """Write only into a fresh clone; reject links and existing startup files."""
-    current = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        for name in ('.native', 'home'):
-            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current)
-            os.close(current)
-            current = child
-        file = os.open('.zprofile', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=current)
+    if os.name != 'nt' and hasattr(os, 'O_DIRECTORY') and hasattr(os, 'O_NOFOLLOW'):
+        current = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
-            os.write(file, b'export PATH="$RELAY_NATIVE_PATH"\n')
+            for name in ('.native', 'home'):
+                child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current)
+                os.close(current)
+                current = child
+            file = os.open('.zprofile', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=current)
+            try:
+                os.write(file, b'export PATH="$RELAY_NATIVE_PATH"\n')
+            finally:
+                os.close(file)
         finally:
-            os.close(file)
+            os.close(current)
+        return
+    home = Path(workspace) / '.native' / 'home'
+    if home.is_symlink() or any(parent.is_symlink() for parent in home.parents):
+        raise ValueError('Native shell profile directories must not be symlinks')
+    home.mkdir(parents=True, exist_ok=True)
+    profile = home / '.zprofile'
+    if profile.is_symlink():
+        raise ValueError('Native shell profile must not be a symlink')
+    file = os.open(profile, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(file, b'export PATH="$RELAY_NATIVE_PATH"\n')
     finally:
-        os.close(current)
+        os.close(file)
 
 
 def run(command, cwd, env, timeout=180):
@@ -222,10 +240,21 @@ def supported_node(version):
     return major >= 26 or (major == 24 and (minor, patch) >= (15, 0)) or (major == 22 and (minor, patch) >= (22, 2))
 
 
+def _manifest_git():
+    if os.name != 'nt':
+        return '/usr/bin/git', '/dev/null', {'PATH': '/usr/bin:/bin', 'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_CONFIG_NOSYSTEM': '1'}
+    from .fs_lock import host_path, null_device, which_git
+    null = null_device()
+    return which_git() or 'git', null, {
+        'PATH': host_path(), 'GIT_CONFIG_GLOBAL': null, 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_TERMINAL_PROMPT': '0',
+        'SystemRoot': os.environ.get('SystemRoot', ''), 'WINDIR': os.environ.get('WINDIR', ''),
+    }
+
+
 def manifests(workspace):
     workspace = Path(workspace).resolve()
-    env = {'PATH': '/usr/bin:/bin', 'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_CONFIG_NOSYSTEM': '1'}
-    names = run(['/usr/bin/git', '-c', 'core.hooksPath=/dev/null', 'ls-tree', '-r', '--name-only', '-z', 'HEAD'], workspace, env).stdout.decode().split('\0')
+    git, null, env = _manifest_git()
+    names = run([git, '-c', 'safe.directory=*', '-c', f'core.hooksPath={null}', 'ls-tree', '-r', '--name-only', '-z', 'HEAD'], workspace, env).stdout.decode().split('\0')
     selected = {}
     for name in names:
         path = Path(name)
@@ -235,7 +264,7 @@ def manifests(workspace):
             continue
         if path.is_absolute() or '..' in path.parts or len(selected) >= 30:
             raise ValueError('Unsafe or excessive dependency manifests')
-        data = run(['/usr/bin/git', '-c', 'core.hooksPath=/dev/null', 'show', 'HEAD:' + name], workspace, env).stdout
+        data = run([git, '-c', 'safe.directory=*', '-c', f'core.hooksPath={null}', 'show', 'HEAD:' + name], workspace, env).stdout
         if len(data) > 2_000_000:
             raise ValueError('Dependency manifest too large')
         selected[name] = data.decode()

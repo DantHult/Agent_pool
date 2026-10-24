@@ -13,6 +13,7 @@ from relay.native import NativeCodexAdapter, initialize_profiles, thread_options
 from relay.workspace import Workspace
 
 
+@unittest.skipUnless(hasattr(os, 'getuid'), 'Native environment ownership checks require a POSIX user id')
 class NativeEnvironmentTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

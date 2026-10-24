@@ -35,23 +35,40 @@ def try_exclusive_lock(fileobj) -> None:
 
 
 def which_git() -> str | None:
-    """Locate git on PATH or common Windows install directories."""
+    """Locate git on PATH or common Windows install directories.
+
+    Prefer ``bin\\git.exe`` over the ``cmd\\git.exe`` wrapper. The wrapper
+    spends several extra seconds per invocation, which blew the checkpoint
+    deadline when a full suite was already using the disk.
+    """
     found = shutil.which('git')
-    if found:
-        return found
     if os.name != 'nt':
-        return None
-    candidates = [
-        Path(r'D:\Git') / 'cmd' / 'git.exe',
+        return found
+    program_files = os.environ.get('ProgramFiles', r'C:\Program Files')
+    local = os.environ.get('LocalAppData', '')
+    candidates = []
+    if found:
+        candidates.append(Path(found))
+    candidates.extend([
         Path(r'D:\Git') / 'bin' / 'git.exe',
-        Path(os.environ.get('ProgramFiles', r'C:\Program Files')) / 'Git' / 'cmd' / 'git.exe',
-        Path(os.environ.get('ProgramFiles', r'C:\Program Files')) / 'Git' / 'bin' / 'git.exe',
+        Path(r'D:\Git') / 'cmd' / 'git.exe',
+        Path(program_files) / 'Git' / 'bin' / 'git.exe',
+        Path(program_files) / 'Git' / 'cmd' / 'git.exe',
         Path(os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)')) / 'Git' / 'cmd' / 'git.exe',
-        Path(os.environ.get('LocalAppData', '')) / 'Programs' / 'Git' / 'cmd' / 'git.exe',
-    ]
+        Path(local) / 'Programs' / 'Git' / 'bin' / 'git.exe',
+        Path(local) / 'Programs' / 'Git' / 'cmd' / 'git.exe',
+    ])
+    seen = set()
     for candidate in candidates:
-        if candidate.is_file():
-            return str(candidate)
+        key = str(candidate).lower()
+        if key in seen or not candidate.is_file():
+            continue
+        seen.add(key)
+        if candidate.parent.name.lower() == 'cmd':
+            sibling = candidate.parent.parent / 'bin' / 'git.exe'
+            if sibling.is_file():
+                return str(sibling)
+        return str(candidate)
     return None
 
 
@@ -73,6 +90,12 @@ def null_device() -> str:
 def current_uid():
     getter = getattr(os, 'getuid', None)
     return getter() if getter else None
+
+
+def process_uid() -> int:
+    """OS user id, or 0 when the platform has no uid (Windows)."""
+    uid = current_uid()
+    return 0 if uid is None else uid
 
 
 def current_gid():

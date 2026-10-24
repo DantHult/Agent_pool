@@ -393,7 +393,7 @@ class OrganizationApiCodexAdapter:
         buffers={'stdout':b'','stderr':b''}; total=0
         def line_received(line,channel):
             nonlocal native,completed,failed,failure,progress,summary
-            text=line.decode(errors='replace')
+            text=line.decode(errors='replace').rstrip('\r')
             if not text: return
             if channel=='stderr':
                 emit('runtime_output',_redact(text,secrets),{'channel':'stderr','source':'codex_runtime'})
@@ -444,11 +444,61 @@ class OrganizationApiCodexAdapter:
                     '\n\nCurated Relay context:\n'+json.dumps(context)[:30000])
             # Docker startup must not block on a full stdin pipe outside the deadline.
             input_bytes=memoryview(prompt.encode())
-            os.set_blocking(process.stdin.fileno(),False)
-            selector.register(process.stdin,selectors.EVENT_WRITE,'stdin')
-            selector.register(process.stdout,selectors.EVENT_READ,'stdout')
-            selector.register(process.stderr,selectors.EVENT_READ,'stderr')
             deadline=time.monotonic()+config['timeout']
+            # Windows select() cannot watch pipes. Read them on threads instead.
+            if os.name=='nt':
+                import queue
+                events=queue.Queue()
+                def reader(pipe,channel):
+                    try:
+                        while True:
+                            chunk=pipe.read(65536)
+                            events.put((channel,chunk))
+                            if not chunk:break
+                    except OSError:
+                        events.put((channel,b''))
+                def writer():
+                    view=bytes(input_bytes)
+                    try:
+                        while view:
+                            written=process.stdin.write(view[:16384])
+                            process.stdin.flush()
+                            if not written:break
+                            view=view[written:]
+                        process.stdin.close()
+                    except OSError:
+                        try:process.stdin.close()
+                        except OSError:pass
+                for target,args in ((reader,(process.stdout,'stdout')),(reader,(process.stderr,'stderr')),(writer,())):
+                    threading.Thread(target=target,args=args,daemon=True).start()
+                open_channels={'stdout','stderr'}
+                while open_channels:
+                    if cancel.is_set() or time.monotonic()>deadline:
+                        self._remove_container(name)
+                        if process.poll() is None: process.kill()
+                        category=None if cancel.is_set() else 'timeout'
+                        summary='Codex execution interrupted; preserved workspace will be checkpointed.' if cancel.is_set() else 'Codex execution timed out; inspect preserved files before an explicit retry.'
+                        emit('stop' if cancel.is_set() else 'error',summary,{'error_category':category})
+                        quota=failure.get('category') in ('rate_limit_exceeded','insufficient_quota')
+                        result=ExecutionResult('quota_blocked' if quota else ('cancelled' if cancel.is_set() else 'failed'),summary,native,
+                                               error_category=failure.get('category') if quota else category,
+                                               retry_after_seconds=failure.get('retry_after_seconds'))
+                        break
+                    try:channel,chunk=events.get(timeout=.1)
+                    except queue.Empty:continue
+                    if not chunk:
+                        if buffers[channel]: line_received(buffers[channel],channel); buffers[channel]=b''
+                        open_channels.discard(channel); continue
+                    total+=len(chunk)
+                    if total>2*1024*1024: raise ValueError('Codex stream exceeded its output limit')
+                    buffers[channel]+=chunk
+                    while b'\n' in buffers[channel]:
+                        line,buffers[channel]=buffers[channel].split(b'\n',1); line_received(line,channel)
+            else:
+                os.set_blocking(process.stdin.fileno(),False)
+                selector.register(process.stdin,selectors.EVENT_WRITE,'stdin')
+                selector.register(process.stdout,selectors.EVENT_READ,'stdout')
+                selector.register(process.stderr,selectors.EVENT_READ,'stderr')
             while selector.get_map():
                 if cancel.is_set() or time.monotonic()>deadline:
                     self._remove_container(name)
@@ -488,8 +538,11 @@ class OrganizationApiCodexAdapter:
                                        retry_after_seconds=failure.get('retry_after_seconds'),progress=progress)
             result.exit_code=returncode
         except (OSError,ValueError,TypeError,subprocess.SubprocessError) as exc:
-            emit('error','Organization API execution failed; workspace preserved for review.',{'error_type':type(exc).__name__})
-            result=ExecutionResult('failed','Organization API execution failed; review the persisted errors before retry.',native,error_category='transport_error')
+            # A cancel or quota result is already decided. A later wait/pipe error
+            # must not replace it with a generic transport failure.
+            if result is None:
+                emit('error','Organization API execution failed; workspace preserved for review.',{'error_type':type(exc).__name__})
+                result=ExecutionResult('failed','Organization API execution failed; review the persisted errors before retry.',native,error_category='transport_error')
         finally:
             selector.close()
             if result is None: result=ExecutionResult('failed','Codex execution did not return a result',native,error_category='runtime_error')

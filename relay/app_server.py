@@ -94,14 +94,23 @@ class AppServerClient:
         while True:
             try:self.notifications.get_nowait()
             except queue.Empty:return
+    def _stop_process(self,kill):
+        # Process groups are a POSIX facility. Windows terminates the child directly.
+        # signal.SIGKILL does not exist on Windows, so it must not be evaluated there.
+        if os.name=='nt':
+            try:
+                if kill:self.process.kill()
+                else:self.process.terminate()
+            except OSError:pass
+            return
+        try:os.killpg(self.process.pid,signal.SIGKILL if kill else signal.SIGTERM)
+        except ProcessLookupError:pass
     def close(self):
         if self.process.poll() is None:
-            try:os.killpg(self.process.pid,signal.SIGTERM)
-            except ProcessLookupError:pass
+            self._stop_process(False)
             try:self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                try:os.killpg(self.process.pid,signal.SIGKILL)
-                except ProcessLookupError:pass
+                self._stop_process(True)
                 self.process.wait(timeout=5)
         for stream in (self.process.stdin,self.process.stdout,self.process.stderr):
             if stream and not stream.closed:stream.close()

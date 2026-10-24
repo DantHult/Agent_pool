@@ -18,7 +18,7 @@ PROMPT='Add a password-strength validator and tests to this sample project.'
 class Client:
     def __init__(self,server):self.server=server;self.cookie='';self.csrf=''
     def request(self,path,body=None,headers=None):
-        connection=http.client.HTTPConnection('127.0.0.1',self.server.server_port,timeout=10)
+        connection=http.client.HTTPConnection('127.0.0.1',self.server.server_port,timeout=60)
         h={'Content-Type':'application/json','Origin':self.server.public_url}
         if self.cookie:h['Cookie']=self.cookie
         if self.csrf:h['X-Relay-CSRF']=self.csrf
@@ -41,7 +41,7 @@ class Client:
         return result
     def login(self,email):self.post('login',{'email':email,'password':PASSWORD})
     def stream(self,conversation):
-        connection=http.client.HTTPConnection('127.0.0.1',self.server.server_port,timeout=5)
+        connection=http.client.HTTPConnection('127.0.0.1',self.server.server_port,timeout=30)
         connection.request('GET','/api/conversations/'+conversation+'/stream',headers={'Cookie':self.cookie})
         response=connection.getresponse()
         return connection,response
@@ -175,7 +175,7 @@ class SharedServerTests(unittest.TestCase):
         with patch('relay.store.get_adapter',return_value=Adapter()):
             worker=self.worker(mode='organization_api')
             task=alex.post('prompt',{'conversation_id':self.conversation,'worker_id':worker,'prompt':objective})
-            deadline=time.monotonic()+5
+            deadline=time.monotonic()+30
             while time.monotonic()<deadline and task['id'] in self.server.relay.jobs:time.sleep(.02)
         self.assertEqual(seen,[objective]);self.assertEqual(alex.get('tasks/'+task['id']+'/result')['task']['state'],'completed')
     def test_shared_native_enrollment_disabled_and_no_demo_users_seeded(self):

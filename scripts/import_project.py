@@ -5,6 +5,7 @@ import subprocess
 import sys
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+from relay.fs_lock import null_device, which_git  # noqa: E402
 from relay.store import Relay  # noqa: E402
 from scripts.demo import exclusive_demo_directory  # noqa: E402
 
@@ -13,7 +14,9 @@ EXCLUDED={'.git','.relay','.codex','.aws','.ssh','auth.json','credentials','id_r
 def import_project(relay,actor,repository,name):
     if not relay.is_admin(actor):raise PermissionError('Organization administrator required')
     repository=Path(repository).resolve(strict=True)
-    def git(*args):return subprocess.check_output(['git','-c','core.hooksPath=/dev/null','-c','core.fsmonitor=false','-C',str(repository),*args],stderr=subprocess.DEVNULL,timeout=15)
+    git_bin=which_git() or 'git'
+    null=null_device()
+    def git(*args):return subprocess.check_output([git_bin,'-c','safe.directory=*','-c',f'core.hooksPath={null}','-c','core.fsmonitor=false','-C',str(repository),*args],stderr=subprocess.DEVNULL,timeout=60)
     listing=git('ls-tree','-rz','HEAD');files=[];total=0
     for record in listing.split(b'\0'):
         if not record:continue

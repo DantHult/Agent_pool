@@ -15,7 +15,7 @@ from .store import Relay
 from .auth import LocalDemoIdentityProvider
 from .accounts import InviteIdentityProvider,LoginRequired,csrf_token,digest
 from .config import load_env_file
-from .fs_lock import current_uid, try_exclusive_lock
+from .fs_lock import current_uid, process_uid, try_exclusive_lock
 from .security import reject_credentials,clean
 
 STATIC=Path(__file__).resolve().parent.parent/'static'
@@ -82,10 +82,11 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:pass
         return client
     def failure(self,exc):
-        if isinstance(exc,(BrokenPipeError,ConnectionResetError,socket.timeout)):return
+        if isinstance(exc,(BrokenPipeError,ConnectionResetError,ConnectionAbortedError,socket.timeout)):return
         status=getattr(exc,'status',403 if isinstance(exc,PermissionError) else 400 if isinstance(exc,(ValueError,KeyError,TypeError)) else 500)
         message=clean(exc) if isinstance(exc,(ValueError,PermissionError)) else 'Invalid request fields' if status==400 else 'Operation failed; inspect task state before retrying'
-        self.reply(status,{'error':message,'code':getattr(exc,'code','request_failed')},extra={'Retry-After':'600'} if status==429 else None)
+        try:self.reply(status,{'error':message,'code':getattr(exc,'code','request_failed')},extra={'Retry-After':'600'} if status==429 else None)
+        except (BrokenPipeError,ConnectionResetError,ConnectionAbortedError,socket.timeout):return
     def stream(self,user,conversation,after):
         relay=self.server.relay
         with relay.lock:relay.events(user,conversation,after,1)
@@ -296,7 +297,7 @@ def make_server(root,port=8000,auth_mode=None,origin=None,allow_http=False):
         owner_id=None
         if mode=='local-owner':
             bindings=server.relay.rows('SELECT * FROM local_owner_binding WHERE singleton=1')
-            if not bindings or bindings[0]['os_uid']!=current_uid():raise ValueError('No matching local-owner pin. Bootstrap a dedicated directory with scripts/manage_accounts.py bootstrap --local-owner')
+            if not bindings or bindings[0]['os_uid']!=process_uid():raise ValueError('No matching local-owner pin. Bootstrap a dedicated directory with scripts/manage_accounts.py bootstrap --local-owner')
             owner_id=bindings[0]['user_id']
             accounts=server.relay.rows('SELECT user_id FROM accounts WHERE disabled=0')
             if len(accounts)!=1 or accounts[0]['user_id']!=owner_id:raise ValueError('Local-owner mode requires its one pinned account; use a dedicated data directory')

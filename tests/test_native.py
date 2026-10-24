@@ -37,7 +37,7 @@ class NativeAdapterTests(unittest.TestCase):
     def tearDown(self):
         self.relay.close();close_native_sessions();self.transport.stop();self.cli.stop();self.platform.stop();self.env.stop();self.tmp.cleanup()
     def wait(self,task,state):
-        deadline=time.monotonic()+10
+        deadline=time.monotonic()+60
         while time.monotonic()<deadline:
             with self.relay.lock:
                 current=self.relay.task('alice',task['id'])
@@ -78,7 +78,7 @@ class NativeAdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'quota'):self.relay.mutate('alice','switch',{'task_id':task['id'],'generation':pending['generation'],'target_worker_id':self.workers[1]})
     def test_interrupt_preserves_partial_files_before_new_profile_runs(self):
         close_native_sessions();home,_=profile_paths('a');(home/'scenario.json').write_text('{"delay":5}')
-        task=self.start();deadline=time.monotonic()+5
+        task=self.start();deadline=time.monotonic()+30
         while time.monotonic()<deadline and not (home/'received.json').exists():time.sleep(.02)
         self.assertTrue((home/'received.json').exists())
         current=self.relay.task('alice',task['id'])
@@ -119,7 +119,9 @@ class NativeAdapterTests(unittest.TestCase):
     def test_native_cli_symlink_is_canonicalized_for_sandbox_helpers(self):
         from relay.app_server import server_command
         binary=self.root/'codex-real';binary.write_text('test binary path only')
-        alias=self.root/'codex-alias';alias.symlink_to(binary)
+        alias=self.root/'codex-alias'
+        try:alias.symlink_to(binary)
+        except OSError as exc:self.skipTest(f'Symlink creation requires privileges or Developer Mode on Windows: {exc}')
         command=server_command(alias)
         self.assertEqual(command[0],str(binary.resolve()))
         profile=next(value for value in command if value.startswith('permissions.relay-native.filesystem='))

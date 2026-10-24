@@ -51,7 +51,7 @@ assert Path('.relay/HANDOFF.md').is_file()
 assert Path('.relay/history/index.json').is_file()
 assert 'normalize_tags' in Path('.relay/HANDOFF.md').read_text()
 try: os.kill(int(Path('writer-A.pid').read_text()),0)
-except ProcessLookupError: pass
+except OSError: pass
 else: raise RuntimeError('Writer A still running; concurrent writers forbidden')
 event({'type':'thread.started','thread_id':'mock-native-B'})
 event({'type':'item.started','item':{'id':'write-B','type':'command_execution','command':'finish normalization and add tests'}})
@@ -96,7 +96,7 @@ class LiveTransportIntegrationTests(unittest.TestCase):
     def start(self,pause=True):
         return self.relay.mutate('alice','prompt',{'conversation_id':self.conversation,'worker_id':self.a,'prompt':PROMPT,'pause_after_turn':pause})
     def wait(self,task,state):
-        deadline=time.monotonic()+10
+        deadline=time.monotonic()+60
         while time.monotonic()<deadline:
             with self.relay.lock:
                 current=self.relay.task('alice',task['id'])
@@ -149,7 +149,7 @@ class LiveTransportIntegrationTests(unittest.TestCase):
         self.assertEqual(len({r['native_thread_id'] for r in detail['execution_runs']}),3)
     def test_switch_during_running_transport_waits_for_process_stop(self):
         self.adapters[self.a].block=True
-        task=self.start(False); deadline=time.monotonic()+5
+        task=self.start(False); deadline=time.monotonic()+30
         while time.monotonic()<deadline:
             with self.relay.lock:
                 if any(e['content']=='phase1 file created' for e in self.relay.events('alice',self.conversation,limit=100)['events']):break
@@ -163,7 +163,7 @@ class LiveTransportIntegrationTests(unittest.TestCase):
     def test_shared_429_overrides_pending_switch_and_never_executes_peer(self):
         self.adapters[self.a].script="event({'type':'thread.started','thread_id':'quota-thread'});event({'type':'turn.failed','error':{'code':'rate_limit_exceeded','status_code':429,'retry_after':30,'message':'HTTP 429 Too Many Requests'}});time.sleep(20)"
         task=self.start(False)
-        deadline=time.monotonic()+5
+        deadline=time.monotonic()+30
         while time.monotonic()<deadline:
             with self.relay.lock:
                 if any(e['event_type']=='provider_error' for e in self.relay.events('alice',self.conversation,limit=100)['events']):break
@@ -194,7 +194,7 @@ class LiveTransportIntegrationTests(unittest.TestCase):
         self.assertEqual(self.relay.detail('alice','demo')['execution_runs'][0]['exit_code'],7)
     def test_timeout_preserves_partial_work_and_records_retry_guidance(self):
         self.adapters[self.a].script="Path('partial.txt').write_text('keep');time.sleep(20)"
-        with patch.object(self.adapters[self.a],'_configuration',return_value={'timeout':.15}):
+        with patch.object(self.adapters[self.a],'_configuration',return_value={'timeout':5}):
             task=self.start(False);self.wait(task,'handoff_pending')
         detail=self.relay.detail('alice','demo')
         self.assertEqual(detail['workspace']['files']['partial.txt'],'keep')

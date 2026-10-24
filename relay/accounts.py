@@ -79,7 +79,9 @@ class InviteIdentityProvider:
             try:
                 if db.execute('SELECT 1 FROM accounts').fetchone():raise ValueError('Accounts already exist; bootstrap is disabled')
                 user=self.create_account(email,name,encoded,'admin')
-                if local_owner:db.execute('INSERT INTO local_owner_binding VALUES(1,?,?,?)',(user,os.getuid(),self.clock()))
+                if local_owner:
+                    from .fs_lock import process_uid
+                    db.execute('INSERT INTO local_owner_binding VALUES(1,?,?,?)',(user,process_uid(),self.clock()))
                 self.relay.audit(user,'account_bootstrap',metadata={'local_owner':local_owner})
                 db.execute('COMMIT');return {'id':user,'name':name}
             except Exception:db.execute('ROLLBACK');raise

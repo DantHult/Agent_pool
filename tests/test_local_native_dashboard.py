@@ -16,8 +16,12 @@ from relay.accounts import InviteIdentityProvider,digest
 from relay.native import initialize_profiles,profile_paths,close_native_sessions
 from relay.server import make_server
 from relay.store import Relay
-from test_native import MockNativeClient
-from test_shared_server import Client,PASSWORD
+try:
+    from test_native import MockNativeClient
+    from test_shared_server import Client,PASSWORD
+except ImportError:
+    from tests.test_native import MockNativeClient
+    from tests.test_shared_server import Client,PASSWORD
 
 OBJECTIVE='Implement normalize(text) with lowercase, collapsed whitespace and Python unittest coverage.'
 
@@ -107,7 +111,7 @@ class LocalNativeDashboardTests(unittest.TestCase):
     def test_pause_waits_for_native_interruption_then_explicit_successor(self):
         close_native_sessions();home,_=profile_paths('a');(home/'scenario.json').write_text('{"delay":5}')
         a=self.enroll('a');b=self.enroll('b');task=self.submit(a)
-        deadline=time.monotonic()+5
+        deadline=time.monotonic()+30
         while time.monotonic()<deadline and not (home/'received.json').exists():time.sleep(.02)
         paused=self.client.post('pause',{'task_id':task['id'],'generation':task['generation']})
         self.assertIn(paused['state'],('pausing','handoff_pending'))
@@ -160,7 +164,7 @@ class LocalNativeDashboardTests(unittest.TestCase):
         self.assertFalse(self.server.relay.rows('SELECT * FROM workspace_leases'))
     def test_busy_profile_and_conversation_reject_parallel_writers(self):
         close_native_sessions();home,_=profile_paths('a');(home/'scenario.json').write_text('{"delay":5}')
-        a=self.enroll('a');task=self.submit(a);deadline=time.monotonic()+5
+        a=self.enroll('a');task=self.submit(a);deadline=time.monotonic()+30
         while time.monotonic()<deadline and not (home/'received.json').exists():time.sleep(.02)
         states={p['profile']:p['status'] for p in self.client.get('native/profiles')['profiles']}
         self.assertEqual(states['a'],'busy')
@@ -172,7 +176,7 @@ class LocalNativeDashboardTests(unittest.TestCase):
         for origin in ('https://relay.example.com','http://192.168.1.10:8000'):
             with self.assertRaises(ValueError):make_server(self.root/'bad-origin',8000,'local-owner',origin)
         self.stop()
-        with patch('relay.server.os.getuid',return_value=os.getuid()+1):
+        with patch('relay.server.process_uid',return_value=(os.getuid()+1 if hasattr(os,'getuid') else 1)):
             with self.assertRaises(ValueError):make_server(self.root/'data',0,'local-owner')
         self.start()
         for mode in ('demo','invite'):

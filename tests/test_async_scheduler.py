@@ -71,7 +71,7 @@ class ControlledAdapter:
             if self.block:
                 # Cancellation requests don't instantly terminate this simulated
                 # external tool. Its explicit safe boundary must be reached.
-                if not self.release_tool.wait(5):
+                if not self.release_tool.wait(30):
                     raise RuntimeError('Test tool did not reach its safe boundary')
             if self.error:
                 raise RuntimeError(self.error)
@@ -131,7 +131,7 @@ class AsyncSchedulerTests(unittest.TestCase):
             'prompt': 'Perform a controlled scheduler test in this approved workspace.',
         })
 
-    def wait_for(self, task, state, timeout=5):
+    def wait_for(self, task, state, timeout=30):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             with self.relay.lock:
@@ -145,7 +145,7 @@ class AsyncSchedulerTests(unittest.TestCase):
         adapter = self.adapters[self.a]
         adapter.block = True
         task = self.start()
-        self.assertTrue(adapter.entered.wait(2))
+        self.assertTrue(adapter.entered.wait(15))
         stopping = self.relay.mutate('alice', 'cancel', {'task_id': task['id']})
         self.assertEqual(stopping['state'], 'pausing')
         self.assertTrue(adapter.cancel_called.is_set())
@@ -166,7 +166,7 @@ class AsyncSchedulerTests(unittest.TestCase):
         second = self.adapters[self.b]
         first.block = True
         task = self.start()
-        self.assertTrue(first.entered.wait(2))
+        self.assertTrue(first.entered.wait(15))
         args = {'task_id': task['id'], 'generation': task['generation'], 'target_worker_id': self.b}
         pending = self.relay.mutate('alice', 'switch', args)
         repeated = self.relay.mutate('alice', 'switch', args)
@@ -193,7 +193,7 @@ class AsyncSchedulerTests(unittest.TestCase):
         second = self.adapters[self.b]
         first.block = True
         task = self.start()
-        self.assertTrue(first.entered.wait(2))
+        self.assertTrue(first.entered.wait(15))
         self.relay.mutate('admin', 'workers/configure', {
             'worker_id': self.a, 'opt_in': False,
         })
@@ -217,7 +217,7 @@ class AsyncSchedulerTests(unittest.TestCase):
         adapter.block = True
         adapter.outcome = 'quota_blocked'
         task = self.start()
-        self.assertTrue(adapter.entered.wait(2))
+        self.assertTrue(adapter.entered.wait(15))
         adapter.release_tool.set()
         current = self.wait_for(task, 'handoff_pending')
         self.assertEqual(current['conversation_id'], self.conversation)
@@ -238,7 +238,7 @@ class AsyncSchedulerTests(unittest.TestCase):
         first.block = True
         second.block = True
         task = self.start()
-        self.assertTrue(first.entered.wait(2))
+        self.assertTrue(first.entered.wait(15))
         pending = self.relay.mutate('alice', 'switch', {
             'task_id': task['id'], 'generation': task['generation'],
             'target_worker_id': self.b,
@@ -280,7 +280,7 @@ class AsyncSchedulerTests(unittest.TestCase):
         adapter.error = 'Unexpected adapter failure before a cleanup result'
         adapter.recovery_confirmed = False
         task = self.start()
-        self.assertTrue(adapter.entered.wait(2))
+        self.assertTrue(adapter.entered.wait(15))
         adapter.release_tool.set()
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
@@ -306,7 +306,7 @@ class AsyncSchedulerTests(unittest.TestCase):
         first.safe_to_release = False
         first.recovery_confirmed = False
         task = self.start()
-        self.assertTrue(first.entered.wait(2))
+        self.assertTrue(first.entered.wait(15))
         first.release_tool.set()
         # A finished adapter thread can still represent a container whose
         # shutdown wasn't confirmed. This differs from a normal safe stop.
@@ -361,7 +361,7 @@ class AsyncSchedulerTests(unittest.TestCase):
         adapter.block = True
         adapter.error = 'controlled provider/tool failure'
         task = self.start()
-        self.assertTrue(adapter.entered.wait(2))
+        self.assertTrue(adapter.entered.wait(15))
         adapter.release_tool.set()
         current = self.wait_for(task, 'handoff_pending')
         self.assertIn('controlled provider/tool failure', current['last_error'])

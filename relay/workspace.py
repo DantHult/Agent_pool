@@ -289,6 +289,8 @@ class Workspace:
             'PATH': host_path(),
             'GIT_CONFIG_NOSYSTEM': '1',
             'GIT_CONFIG_GLOBAL': null,
+            'GIT_TERMINAL_PROMPT': '0',
+            'GCM_INTERACTIVE': 'Never',
             'HOME': str(self.root),
             'SystemRoot': os.environ.get('SystemRoot', ''),
             'WINDIR': os.environ.get('WINDIR', ''),
@@ -362,7 +364,7 @@ class Workspace:
             result = subprocess.run([*launcher, *self._git_config_args(), *args],
                 pass_fds=(directory,),
                 env=self._git_env(),
-                capture_output=True, text=True, timeout=10, check=True, input=input)
+                capture_output=True, text=True, timeout=60, check=True, input=input)
             return result.stdout if raw else result.stdout.strip()
 
     def _git_config_args(self):
@@ -379,6 +381,7 @@ class Workspace:
             '-c', f'core.excludesFile={null}',
             '-c', 'user.name=Relay',
             '-c', 'user.email=relay@localhost',
+            '-c', 'commit.gpgsign=false',
         ]
 
     def _git_portable(self, project_path, *args, input=None, raw=False):
@@ -389,7 +392,7 @@ class Workspace:
         result = subprocess.run(
             [git, *self._git_config_args(), *args],
             cwd=str(project_path), env=self._git_env(),
-            capture_output=True, text=True, timeout=10, check=True, input=input)
+            capture_output=True, text=True, timeout=60, check=True, input=input)
         return result.stdout if raw else result.stdout.strip()
 
     def checkpoint(self, project, message):
@@ -432,7 +435,7 @@ class Workspace:
                         raise ValueError('Host tests require the trusted demo fixture')
                 self._atomic_write(directory, 'test_validator.py', TESTS.encode())
         result = subprocess.run([sys.executable,'-I','-c',"import sys,unittest; sys.path.insert(0,'.'); r=unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.discover('.',pattern='test_validator.py')); sys.exit(not r.wasSuccessful())"],
-            cwd=p, capture_output=True, text=True, timeout=10, env={'PATH': host_path()})
+            cwd=p, capture_output=True, text=True, timeout=60, env={'PATH': host_path()})
         return result.returncode, clean((result.stdout + result.stderr)[-12000:])
 
     def inspect(self, project):
