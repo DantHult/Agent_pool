@@ -79,7 +79,7 @@ class Relay:
             if w['state']=='quota_blocked':status='quota_blocked'
             elif w['state']=='busy':status='busy'
             elif w['state'] in ('paused','offline') or not w['opt_in']:status='paused' if w['state']!='offline' else 'unavailable'
-            profiles.append({'profile':profile,'status':status,'available':status=='available','authentication':health.get('authentication','unknown'),'worker_id':w['id'] if enrolled else None,'owner_name':self.user(user)['name'],'reason':health.get('reason','Unavailable'),'remaining_quota':None})
+            profiles.append({'profile':profile,'status':status,'available':status=='available','authentication':health.get('authentication','unknown'),'worker_id':w['id'] if enrolled else None,'owner_name':self.user(user)['name'],'reason':health.get('reason','Unavailable'),'remaining_quota':None,'assigned_projects':self.worker_assignments(user,w['id'])})
         return {'profiles':profiles,'execution_mode':'native','owner_id':user,'scope':'authenticated local owner; loopback only'}
     def enroll_native_profile(self,user,profile,project):
         self.write_access(user,project)
@@ -172,7 +172,7 @@ class Relay:
         self.ws.path(project)
         self.db.execute('INSERT INTO projects VALUES(?,?,?)',(project,clean(name),'orgdemo'))
         self.db.execute('INSERT INTO memberships VALUES(?,?,?)',(user,project,'engineer' if self.demo else 'admin'))
-        self.db.execute('INSERT INTO conversations VALUES(?,?)',(uid(),project))
+        self.db.execute('INSERT INTO conversations(id,project_id,title,created_at,updated_at) VALUES(?,?,?,?,?)',(uid(),project,clean(name),now(),now()))
         self.audit(user,'project_created',project=project)
         return {'id':project}
     def project(self,t): return self.one('SELECT project_id FROM conversations WHERE id=?',(t['conversation_id'],))['project_id']
@@ -192,6 +192,12 @@ class Relay:
         seq=self.db.execute('SELECT COALESCE(MAX(sequence),0)+1 FROM events WHERE conversation_id=?',(t['conversation_id'],)).fetchone()[0]
         project=self.project(t); org=self.one('SELECT organization_id FROM projects WHERE id=?',(project,))['organization_id']
         self.db.execute('INSERT INTO events VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(uid(),org,project,t['conversation_id'],t['id'],seq,now(),worker or t.get('worker_id'),kind,role,content,json.dumps(metadata)))
+        self.db.execute('UPDATE conversations SET updated_at=? WHERE id=?',(now(),t['conversation_id']))
+
+    def assert_no_human_writer(self,project):
+        if self.rows('SELECT 1 FROM human_workspace_locks WHERE project_id=?',(project,)):
+            from .ide import WorkspaceConflict
+            raise WorkspaceConflict('A human holds the project edit lock. Save drafts, checkpoint and release it before starting or handing off an agent.')
     def state(self,t,state):
         self.db.execute('UPDATE tasks SET state=? WHERE id=?',(state,t['id'])); t['state']=state
         self.event(t,'state',state)
@@ -243,6 +249,12 @@ class Relay:
         health=self.adapter(w).health()
         if not health.get('available'): return False,health.get('reason','Execution unavailable')
         return True,'Approved for this project'
+    def worker_assignments(self,user,worker):
+        visible=[]
+        for assignment in self.rows("SELECT p.id,p.name,t.id AS task_id,t.state FROM tasks t JOIN conversations c ON c.id=t.conversation_id JOIN projects p ON p.id=c.project_id WHERE t.worker_id=? AND t.state NOT IN ('completed','failed','cancelled')",(worker,)):
+            try:self.access(user,assignment['id']);visible.append(assignment)
+            except PermissionError:pass
+        return visible
     def public_worker(self,user,w,project=None):
         owner=self.one('SELECT name FROM organizations WHERE id=?',(w['owner_id'],))['name'] if w['owner_type']=='org' else self.user(w['owner_id'])['name']
         allowed=[r['project_id'] for r in self.rows('SELECT project_id FROM worker_projects WHERE worker_id=?',(w['id'],))]
@@ -256,6 +268,7 @@ class Relay:
         public={k:v for k,v in w.items() if k!='credential_ref'}
         health=self.adapter(w).health()
         public.update({'display_name':w['name'],'status':w['state'],'owner_name':owner,'opt_in':bool(w['opt_in']),'can_manage':managed,'permitted_project_ids':visible,'capacity':self.one('SELECT * FROM capacity_sources WHERE worker_id=?',(w['id'],)),'authorized':self.approval(w,project,user)[0] if project else False,'eligible':eligible,'eligibility_reason':reason,'health':health,'last_seen_at':now() if health.get('available') else None,'last_seen_source':'local adapter health check'})
+        public['assigned_projects']=self.worker_assignments(user,w['id'])
         return public
     def workers(self,user,project=None,mine=False):
         self.org_member(user)
@@ -328,6 +341,7 @@ class Relay:
 
     # Persistent working context and Git checkpoints, separately from the full transcript.
     def checkpoint(self,t,reason):
+        self.assert_no_human_writer(self.project(t))
         project=self.project(t); uncommitted=self.ws.status(project)
         commit=self.ws.checkpoint(project,reason)
         self.db.execute('INSERT INTO workspace_checkpoints VALUES(?,?,?,?,?,?,?,?,?)',(uid(),project,t['conversation_id'],t['id'],t['worker_id'],commit,now(),reason,uncommitted))
@@ -388,6 +402,7 @@ class Relay:
         return options[0] if options else None
     def assign(self,t,w,authorized_by,context=None):
         # Caller owns process lock; SQLite makes lease+assignment atomic.
+        self.assert_no_human_writer(self.project(t))
         approved,reason=self.eligibility(w,self.project(t),authorized_by)
         if not approved: raise PermissionError('Worker assignment no longer permitted: '+reason)
         self.db.execute('BEGIN IMMEDIATE')
@@ -413,6 +428,9 @@ class Relay:
             if not other_active and state!=w['state']: self._capacity(t['worker_id'],state)
     def submit(self,user,conversation,prompt,worker_id=None,execution_mode=None,pause_after_turn=False,native_phases=2):
         c=self.one('SELECT * FROM conversations WHERE id=?',(conversation,)); self.write_access(user,c['project_id'])
+        self.assert_no_human_writer(c['project_id'])
+        if self.rows("SELECT 1 FROM tasks t JOIN conversations c ON c.id=t.conversation_id WHERE c.project_id=? AND t.state NOT IN ('completed','failed','cancelled')",(c['project_id'],)):
+            raise ValueError('Finish or cancel the active task in this project before starting another conversation task')
         if native_phases not in (2,3):raise ValueError('native_phases must be 2 or 3')
         if not isinstance(pause_after_turn,bool): raise ValueError('pause_after_turn must be boolean')
         if not isinstance(prompt,str) or not prompt.strip() or len(prompt)>8000: raise ValueError('Prompt must contain 1–8000 characters')
@@ -605,6 +623,7 @@ class Relay:
     def switch(self,user,task_id,generation,reason,target=None,reason_code='manual_switch'):
         t=self.task(user,task_id)
         self.write_access(user,self.project(t))
+        self.assert_no_human_writer(self.project(t))
         if t['generation']!=generation: return t
         if reason_code not in ('manual_switch','task_pause','retry','simulated_limit'): raise ValueError('Invalid switch reason')
         if t['state'] not in ('running','queued','handoff_pending','pausing'): raise ValueError('Task cannot switch in this state')
@@ -618,6 +637,7 @@ class Relay:
         return self._request_handoff(user,t,target,reason_code,reason)
     def resume_task(self,user,t,generation):
         self.write_access(user,self.project(t))
+        self.assert_no_human_writer(self.project(t))
         if t['generation']!=generation:return t
         if t['state']!='handoff_pending' or t['id'] in self.jobs:raise ValueError('Resume requires a safely paused task')
         w=self._candidate(user,self.project(t),target=t['worker_id'],mode=t['execution_mode']) if t['worker_id'] else None
@@ -662,8 +682,9 @@ class Relay:
             'auth':{'mode':'local-owner' if self.local_owner_id else 'local_demo' if self.demo else 'invite','production_ready':not self.demo and not self.local_owner_id,'description':'Pinned local owner; loopback only' if self.local_owner_id else 'Seeded local identities' if self.demo else 'Invite-only Relay accounts; HTTPS required','native_enabled':self.native_enabled,'local_owner_id':self.local_owner_id},
             'personal_subscription':directory['personal_subscription'],
             'execution':{'mode':'mixed','connected':any(w['execution_mode'] in LIVE_MODES and w['health'].get('connected',False) for w in directory['workers']),'detail':'Native profiles use the local owner’s ChatGPT subscriptions and explicit handoffs. Simulated capacity is labeled; organization API capacity is shared by organization.'}}
-    def detail(self,user,project):
-        self.access(user,project); c=self.one('SELECT * FROM conversations WHERE project_id=?',(project,))
+    def detail(self,user,project,conversation=None):
+        self.access(user,project)
+        c=self.one('SELECT * FROM conversations WHERE project_id=? AND id=?',(project,conversation)) if conversation else self.one('SELECT * FROM conversations WHERE project_id=? ORDER BY rowid LIMIT 1',(project,))
         workspace=self.ws.inspect(project)
         latest=self.rows('SELECT * FROM tasks WHERE conversation_id=? ORDER BY rowid DESC LIMIT 1',(c['id'],))
         if latest and latest[0]['execution_mode'] in LIVE_MODES:

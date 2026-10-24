@@ -30,6 +30,10 @@ let registration = false;
 let liveSource = null;
 let liveTimer = null;
 let nativeProfiles = null;
+let selectedConversation = null;
+let conversations = [];
+let activityFrame = null;
+const activityView = new RelayActivity.View($('timeline'), workerName);
 
 const esc = value => String(value ?? '').replace(/[&<>"']/g, character => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
@@ -37,6 +41,7 @@ const esc = value => String(value ?? '').replace(/[&<>"']/g, character => ({
 const displayDate = value => value ? new Date(value).toLocaleString() : 'Not reported';
 
 async function api(path, body) {
+  const requestedVersion=viewVersion;
   const response = await fetch('/api/' + path, {
     method: body ? 'POST' : 'GET',
     headers: body ? {'Content-Type': 'application/json', ...(csrfToken ? {'X-Relay-CSRF': csrfToken} : {})} : {},
@@ -47,7 +52,7 @@ async function api(path, body) {
     const failure = new Error(data.error || 'Request failed');
     failure.status = response.status;
     failure.code = data.code;
-    if (response.status === 401 && authMode !== 'demo') showSignIn();
+    if (response.status === 401 && authMode !== 'demo' && requestedVersion===viewVersion) showSignIn();
     throw failure;
   }
   return data;
@@ -109,6 +114,9 @@ function invalidateView() {
   events = [];
   detail = null;
   nativeProfiles = null;
+  selectedConversation = null;
+  conversations = [];
+  activityView.reset(null);
   selectedStartWorker = '';
   selectedTarget = '';
   clearHistory();
@@ -116,6 +124,8 @@ function invalidateView() {
   $('artifactBody').textContent = '';
   $('handoffs').textContent = '';
   $('workers').textContent = '';
+  $('conversationList').textContent='';
+  $('taskObjective').textContent='Loading conversation…';$('taskObjectiveFull').textContent='';$('activeWorkerLabel').textContent='No worker selected';
 }
 
 function setControlsDisabled(disabled) {
@@ -123,6 +133,9 @@ function setControlsDisabled(disabled) {
   $('project').disabled = disabled;
   $('newProject').disabled = disabled || overview?.user.role === 'viewer';
   $('enroll').disabled = disabled;
+  $('inviteMember').disabled = disabled || !project || !detail;
+  $('manageMembers').disabled = disabled || !project || !detail;
+  $('newConversation').disabled = disabled || !project || !detail || !currentCanWrite();
 }
 
 async function login() {
@@ -130,7 +143,7 @@ async function login() {
   busy = true;
   loading = false;
   setControlsDisabled(true);
-  invalidateView();
+  RelayIDE.signOut();invalidateView();
   $('error').hidden = true;
   showNotice('');
   project = null;
@@ -151,6 +164,7 @@ async function load(force = false) {
   const version = viewVersion;
   const serial = ++refreshSerial;
   loading = true;
+  if (!detail) setControlsDisabled(true);
   try {
     const nextOverview = await api('overview');
     showWorkspaceIdentity(nextOverview);
@@ -162,13 +176,19 @@ async function load(force = false) {
       renderNativeProfiles(nextProject);
     }
     if (!nextProject) {
+      invalidateView();RelayIDE.signOut();loading=false;
       overview = nextOverview;
       project = null;
       $('project').innerHTML = '';
       $('timeline').innerHTML = '<div class="empty">No projects are authorized for this identity.</div>';
       return;
     }
-    const nextDetail = await api('projects/' + encodeURIComponent(nextProject));
+    const listed = await api('ide/conversations?' + new URLSearchParams({project_id:nextProject}));
+    if (version !== viewVersion || serial !== refreshSerial) return;
+    conversations = listed.conversations;
+    const remembered = sessionStorage.getItem('relay-conversation:' + nextOverview.user.id + ':' + nextProject);
+    const choice = [selectedConversation,remembered].find(id => conversations.some(item => item.id === id)) || conversations[0]?.id;
+    const nextDetail = await api('projects/' + encodeURIComponent(nextProject) + (choice ? '?conversation_id=' + encodeURIComponent(choice) : ''));
     if (version !== viewVersion || serial !== refreshSerial) return;
     const conversation = nextDetail.conversation.id;
     const nextEvents = lastConversation === conversation ? [...events] : [];
@@ -189,20 +209,21 @@ async function load(force = false) {
     overview = nextOverview;
     detail = nextDetail;
     project = nextProject;
-    events = nextEvents;
+    const merged = new Map([...nextEvents, ...events.filter(event => event.conversation_id === conversation)].map(event => [event.event_id || event.sequence,event]));
+    events = [...merged.values()].sort((a,b) => a.sequence-b.sequence);
+    selectedConversation = conversation;
+    sessionStorage.setItem('relay-conversation:' + nextOverview.user.id + ':' + nextProject, conversation);
     lastConversation = conversation;
     subscribe(conversation, nextEvents.length ? nextEvents[nextEvents.length - 1].sequence : 0);
     $('project').innerHTML = overview.projects.map(item =>
       `<option value="${esc(item.id)}">${esc(item.name)}</option>`).join('');
     $('project').value = project;
     $('user').value = overview.user.id;
-    const scroll = $('timeline').scrollTop;
-    const nearBottom = $('timeline').scrollHeight - $('timeline').clientHeight - scroll < 40;
     render();
-    $('timeline').scrollTop = nearBottom ? $('timeline').scrollHeight : scroll;
   } finally {
     if (version === viewVersion && serial === refreshSerial) {
       loading = false;
+      setControlsDisabled(busy);
       if (authMode === 'local-owner') renderNativeProfiles();
     }
   }
@@ -223,7 +244,7 @@ function renderWorker(worker, task) {
     ? '<select name="state" disabled><option value="unsupported">Unsupported</option></select>'
     : `<select name="state">${['available', 'paused', 'offline', 'quota_blocked'].map(value => `<option value="${value}" ${status === value || capacity.availability === value ? 'selected' : ''}>${value.replace('_', ' ')}</option>`).join('')}</select>`;
   const settings = canManage(worker) ? `<details class="worker-settings" data-settings="${esc(worker.id)}"><summary>Owner settings</summary><form data-worker-form="${esc(worker.id)}"><label>Availability${availabilityControl}</label><label class="checkbox-row"><input type="checkbox" name="opt_in" ${worker.opt_in ? 'checked' : ''}> Opt in to eligible assignments</label><fieldset><legend>Explicit project approvals</legend>${overview.projects.map(item => `<label class="checkbox-row"><input type="checkbox" name="project_ids" value="${esc(item.id)}" ${projects.includes(item.id) ? 'checked' : ''}> ${esc(item.name)}</label>`).join('')}</fieldset><div class="settings-actions"><button class="outline" type="submit">Save settings</button><button class="quiet danger" type="button" data-revoke="${esc(worker.id)}">Opt out & stop safely</button></div></form></details>` : '<div class="permission-note">Settings controlled by the worker owner or administrator</div>';
-  return `<article class="worker-entry ${active ? 'active' : ''}"><div class="worker"><span class="worker-icon">⌘</span><div><strong>${esc(worker.display_name || worker.name)}</strong><small>${esc(ownerName(worker))} · ${worker.owner_type === 'org' ? 'Organization owned' : 'User owned'}</small></div><span class="state">${esc(active ? 'active session' : status.replace('_', ' '))}</span></div><div class="worker-facts"><span class="pill ${mode === 'simulation' ? 'simulated' : mode === 'personal_supported' ? 'blocked' : 'api-mode'}">${esc(modeLabel)}</span><span class="eligibility ${eligible(worker) ? 'eligible' : ''}">${eligible(worker) ? '✓ Eligible' : '○ Not eligible'}</span><p>${esc(reason)}</p><dl><dt>Consent</dt><dd>${worker.opt_in ? 'Opted in' : 'Opted out'}</dd><dt>Capacity</dt><dd>${esc(scope)}</dd><dt>Observation</dt><dd>${esc(capacity.source || 'manual')} · ${esc(capacity.availability || status)}</dd><dt>Quota scope</dt><dd>${esc(capacity.quota_scope || 'Not reported')}</dd><dt>Last seen</dt><dd>${esc(displayDate(worker.last_seen_at))}</dd><dt>Capabilities</dt><dd>${esc(Object.keys(worker.health?.capabilities || {}).filter(key => worker.health.capabilities[key] === true).join(', ') || 'Not reported')}</dd><dt>Parallel tasks</dt><dd>${esc(worker.max_parallel_tasks || 1)}</dd>${capacity.reset_at ? `<dt>Reset reported</dt><dd>${esc(displayDate(capacity.reset_at))}</dd>` : ''}</dl>${worker.health?.reason ? `<p class="health-note">${esc(worker.health.reason)}</p>` : ''}</div>${settings}</article>`;
+  return `<article class="worker-entry ${active ? 'active' : ''}"><div class="worker"><span class="worker-icon">⌘</span><div><strong>${esc(worker.display_name || worker.name)}</strong><small>${esc(ownerName(worker))} · ${worker.owner_type === 'org' ? 'Organization owned' : 'User owned'}</small></div><span class="state">${esc(active ? task.state.replaceAll('_', ' ') : status.replaceAll('_', ' '))}</span></div><div class="worker-facts"><span class="pill ${mode === 'simulation' ? 'simulated' : mode === 'personal_supported' ? 'blocked' : 'api-mode'}">${esc(modeLabel)}</span><span class="eligibility ${eligible(worker) ? 'eligible' : ''}">${eligible(worker) ? '✓ Eligible' : '○ Not eligible'}</span><p>${esc(reason)}</p><dl><dt>Project</dt><dd>${esc((worker.assigned_projects || []).map(item => item.name + ' · ' + item.state.replaceAll('_', ' ')).join(', ') || 'No current assignment')}</dd><dt>Consent</dt><dd>${worker.opt_in ? 'Opted in' : 'Opted out'}</dd><dt>Capacity</dt><dd>${esc(scope)}</dd><dt>Observation</dt><dd>${esc(capacity.source || 'manual')} · ${esc(capacity.availability || status)}</dd><dt>Quota scope</dt><dd>${esc(capacity.quota_scope || 'Not reported')}</dd><dt>Last seen</dt><dd>${esc(displayDate(worker.last_seen_at))}</dd><dt>Capabilities</dt><dd>${esc(Object.keys(worker.health?.capabilities || {}).filter(key => worker.health.capabilities[key] === true).join(', ') || 'Not reported')}</dd><dt>Parallel tasks</dt><dd>${esc(worker.max_parallel_tasks || 1)}</dd>${capacity.reset_at ? `<dt>Reset reported</dt><dd>${esc(displayDate(capacity.reset_at))}</dd>` : ''}</dl>${worker.health?.reason ? `<p class="health-note">${esc(worker.health.reason)}</p>` : ''}</div>${settings}</article>`;
 }
 
 function renderWorkerSelectors(workers, task) {
@@ -269,7 +290,6 @@ function render() {
   if (!overview || !detail) return;
   const currentProject = overview.projects.find(item => item.id === project);
   $('projectName').textContent = currentProject?.name || project;
-  document.querySelector('.conversation div').innerHTML = esc(currentProject?.name || project) + '<small>One conversation. Every worker.</small>';
   $('conversationId').textContent = detail.conversation.id;
   $('authBadge').textContent = overview.auth?.mode === 'local_demo'
     ? '● Local demo login · not production authentication' : '● Signed in · ' + overview.user.name;
@@ -278,7 +298,8 @@ function render() {
   $('taskState').textContent = task?.state || detail.tasks[0]?.state || 'Ready';
   $('pauseAfterTurn').disabled = busy || !!task;
   if (authMode === 'local-owner') $('authBadge').textContent = '● NATIVE LOCAL · owner ' + overview.user.name;
-  $('timeline').innerHTML = events.length ? events.map(event => `<article class="event ${esc(event.event_type)} ${esc(event.role)}"><div class="event-head"><span>${esc(event.worker_id ? workerName(event.worker_id) : event.role === 'user' ? 'YOU' : 'RELAY')} · ${esc(event.event_type)} · ${esc(eventOrigin(event))}</span><time datetime="${esc(event.timestamp)}">${esc(displayDate(event.timestamp))}</time></div>${esc(event.content)}${eventFacts(event)}</article>`).join('') : '<div class="welcome"><div class="welcome-icon">⇄</div><h2>A fresh start. A continuous thread.</h2><p>Choose an approved worker and give it a task. Code, tests, and visible history stay with this project.</p><div class="steps"><span>01 Start a task</span><span>02 Save a checkpoint</span><span>03 Pass the context</span></div></div>';
+  renderConversation();
+  renderConversations();
   $('workers').innerHTML = workers.length ? workers.map(worker => renderWorker(worker, task)).join('') : '<div class="empty">No workers are visible for this project. Enroll your own worker or ask an owner to approve this project.</div>';
   const nativeWorkerCount = workers.filter(worker => worker.execution_mode === 'native').length;
   const hasOrgWorkers = workers.some(worker => worker.execution_mode === 'organization_api');
@@ -310,7 +331,7 @@ function render() {
     ? 'ORGANIZATION API · Shared organization quota · Unavailable work queues until runtime is ready'
     : selectedMode === 'simulation'
       ? 'SIMULATION · Predefined validator demo · No API credentials required'
-      : 'Automatic mode · Validator demo uses simulation; approved API tasks use organization funding. Unavailable work queues.';
+    : authMode==='local-owner' ? 'Choose a local worker in Agents to start your next task.' : 'Select a worker to see its execution mode.';
   renderArtifact();
   bindWorkerSettings();
   renderNativeProfiles();
@@ -325,6 +346,39 @@ function render() {
     ['switch', 'cancel', 'limit', 'continue'].forEach(id => $(id).disabled = true);
     document.querySelector('.send').disabled = true;
   }
+  if (authMode==='local-owner' && !selectedStartWorker) document.querySelector('.send').disabled=true;
+  RelayIDE.update({project,user:overview.user.id,conversation:detail.conversation.id,projectName:currentProject?.name || project,
+    worker:task?.worker_id ? workerName(task.worker_id) : detail.tasks[0]?.worker_id ? workerName(detail.tasks[0].worker_id) : '',
+    state:task?.state || detail.tasks[0]?.state,objective:task?.objective || detail.tasks[0]?.objective,checkpoint:detail.workspace.checkpoint,
+    selectedWorker:workers.find(worker => worker.id === selectedStartWorker)?.display_name || workers.find(worker => worker.id === selectedStartWorker)?.name}).catch(showError);
+}
+
+function renderConversation() {
+  if (!detail) return;
+  const state=activeTask()?.state || detail.tasks[0]?.state || 'ready';
+  activityView.render(events,detail.conversation.id,state);
+  const latest=activityView.model.groups.slice().reverse().find(group => group.kind==='operation' && !group.complete);
+  $('currentOperation').textContent=state==='running' ? latest ? latest.command || 'Receiving tool output' : 'Waiting for the next observable event' : state==='handoff_pending' ? 'Checkpoint saved · ready for explicit handoff' : state==='completed' ? 'Task completed' : state==='pausing' ? 'Stopping at a safe checkpoint…' : 'Waiting for your next task';
+  $('operationIndicator').classList.toggle('spinning',state==='running');
+  $('rawEventCount').textContent=events.length;
+}
+
+function renderConversations() {
+  $('conversationList').innerHTML=conversations.map(item => `<button class="conversation ${item.id===detail?.conversation.id ? 'selected' : ''}" data-conversation="${esc(item.id)}"><span>◉</span><div><strong>${esc(item.title)}</strong><small>${esc(item.latest_task ? workerName(item.latest_task.worker_id)+' · '+item.latest_task.state : 'No task yet')}<br>${esc(item.updated_at ? new Date(item.updated_at).toLocaleDateString() : '')} · ${esc(item.event_count)} events saved</small></div></button>`).join('');
+  document.querySelectorAll('[data-conversation]').forEach(button => button.onclick=() => selectConversation(button.dataset.conversation).catch(showError));
+}
+
+async function selectConversation(identity) {
+  if (busy || identity===detail?.conversation.id) return;
+  loading=false;invalidateView();selectedConversation=identity;
+  await load(true);
+}
+
+async function newConversation() {
+  if (!project || !currentCanWrite()) return;
+  const title=window.prompt('Conversation title');if (!title?.trim()) return;
+  const created=await api('ide/conversations',{project_id:project,title:title.trim()});
+  await selectConversation(created.id);
 }
 
 function bindWorkerSettings() {
@@ -454,7 +508,7 @@ document.querySelectorAll('[data-tab]').forEach(button => button.onclick = () =>
   renderArtifact();
 });
 $('more').onclick = async () => {
-  if (!detail || busy) return;
+  if (!detail || busy || $('more').disabled) return;
   const version = viewVersion;
   const conversation = detail.conversation.id;
   $('more').disabled = true;
@@ -463,7 +517,7 @@ $('more').onclick = async () => {
     if (version !== viewVersion) return;
     historyEvents.push(...page.events);
     historyAfter = page.next_after;
-    $('history').textContent = JSON.stringify(historyEvents, null, 2);
+    renderRawHistory();
     $('more').textContent = page.events.length === 100 ? 'Load next 100 events' : 'Check for more events';
   } catch (failure) {
     if (version === viewVersion) showError(failure);
@@ -471,6 +525,16 @@ $('more').onclick = async () => {
     $('more').disabled = false;
   }
 };
+
+function renderRawHistory() {
+  const text=$('eventFilter').value.toLowerCase(),type=$('eventTypeFilter').value;
+  const filtered=historyEvents.filter(event=>(!type || event.event_type===type) && (!text || JSON.stringify(event).toLowerCase().includes(text)));
+  $('history').textContent=filtered.map(event=>JSON.stringify(event,null,2)).join('\n\n');
+}
+$('eventFilter').oninput=renderRawHistory;
+$('eventTypeFilter').onchange=renderRawHistory;
+$('jumpLatest').onclick=()=>{$('timeline').scrollTop=$('timeline').scrollHeight;$('jumpLatest').hidden=true;};
+$('timeline').onscroll=()=>{$('jumpLatest').hidden=$('timeline').scrollHeight-$('timeline').clientHeight-$('timeline').scrollTop<100;};
 
 function renderEnrollmentMode() {
   const mode = $('workerMode').value;
@@ -521,7 +585,7 @@ function renderNativeProfiles(selectedProject = project) {
   $('localNativePanel').hidden = authMode !== 'local-owner';
   if (!nativeProfiles || authMode !== 'local-owner') return;
   $('localNativeOwner').textContent = 'Pinned owner: ' + (overview?.user.name || nativeProfiles.profiles[0]?.owner_name || 'Local owner');
-  $('localNativeProfiles').innerHTML = nativeProfiles.profiles.map(profile => `<article class="native-profile"><strong>Codex ${esc(profile.profile.toUpperCase())}</strong><span class="pill">${esc(profile.status)}</span><p>${esc(profile.reason)}</p><button class="outline" data-native-profile="${esc(profile.profile)}" ${busy || loading || !detail || !selectedProject || !profile.available ? 'disabled' : ''}>${activeTask() ? 'Prepare ' + esc(profile.profile.toUpperCase()) + ' for handoff' : 'Select ' + esc(profile.profile.toUpperCase()) + ' for this project'}</button></article>`).join('');
+  $('localNativeProfiles').innerHTML = nativeProfiles.profiles.map(profile => `<article class="native-profile"><strong>Codex ${esc(profile.profile.toUpperCase())}</strong><span class="pill">${esc(profile.status)}</span><p class="profile-project">${esc((profile.assigned_projects || []).map(item => item.name).join(', ') || 'No current project')} · ${esc(profile.owner_name || 'Local owner')}</p><p>${esc(profile.reason)}</p><button class="outline" data-native-profile="${esc(profile.profile)}" ${busy || loading || !detail || !selectedProject || !profile.available ? 'disabled' : ''}>${activeTask() ? 'Prepare ' + esc(profile.profile.toUpperCase()) + ' for handoff' : 'Select ' + esc(profile.profile.toUpperCase()) + ' for this project'}</button></article>`).join('');
   document.querySelectorAll('[data-native-profile]').forEach(button => button.onclick = async () => {
     if (busy || !selectedProject) return;
     busy = true;
@@ -560,6 +624,7 @@ function showWorkspaceIdentity(value) {
 }
 
 function showSignIn() {
+  RelayIDE.signOut();
   invalidateView();
   overview = null;
   csrfToken = '';
@@ -584,12 +649,21 @@ function subscribe(conversation, after) {
   const source = new EventSource(`/api/conversations/${encodeURIComponent(conversation)}/stream?after=${after}`);
   source.conversation = conversation;
   liveSource = source;
-  source.onmessage = () => {
-    if (liveTimer) return;
-    liveTimer = setTimeout(() => {
-      liveTimer = null;
-      if (!busy && !loading && lastConversation === conversation) load().catch(showError);
-    }, 500);
+  source.onopen=()=>{$('streamStatus').textContent='Live';};
+  source.onerror=()=>{$('streamStatus').textContent='Reconnecting';};
+  source.onmessage = message => {
+    if (lastConversation!==conversation) return;
+    let event;try {event=JSON.parse(message.data);} catch {return;}
+    if (event.conversation_id!==conversation) return;
+    if (!events.some(item=>item.event_id===event.event_id)) {
+      events.push(event);events.sort((a,b)=>a.sequence-b.sequence);
+      if (event.event_type==='state') {const task=detail?.tasks.find(item=>item.id===event.task_id);if (task) task.state=event.content;}
+    }
+    if (!activityFrame) activityFrame=requestAnimationFrame(()=>{activityFrame=null;renderConversation();});
+    if (!['agent_delta','runtime_output','tool_invocation','tool_output'].includes(event.event_type) && !liveTimer) liveTimer=setTimeout(()=>{
+      liveTimer=null;
+      if (!busy && !loading && lastConversation===conversation) load().catch(showError);
+    },750);
   };
   // EventSource reconnects with Last-Event-ID. Polling remains the fallback.
 }
@@ -614,7 +688,7 @@ $('accountForm').onsubmit = async event => {
   finally { button.disabled = false; }
 };
 $('logout').onclick = async () => {
-  try { await api('logout', {}); showSignIn(); }
+  try { await RelayIDE.flushDrafts();await api('logout', {}); showSignIn(); }
   catch (failure) { showError(failure); }
 };
 $('inviteMember').onclick = () => {
@@ -626,6 +700,7 @@ $('closeInvite').onclick = () => { $('inviteLink').value = ''; $('inviteDialog')
 $('inviteForm').onsubmit = async event => {
   event.preventDefault();
   try {
+    if (!project || !detail) throw new Error('Wait for an authorized project to finish loading before creating its invitation.');
     const invitation = await api('invitations', {email: $('inviteEmail').value, project_id: project, project_role: $('inviteRole').value});
     $('inviteLink').value = invitation.invitation_url;
   } catch (failure) { $('inviteError').textContent = failure.message; }
@@ -669,6 +744,7 @@ async function init() {
     catch (failure) { if (failure.status === 403) await login(); else showError(failure); }
   }
 }
+RelayIDE.connect({api,showError,showNotice,refresh:()=>load(true),canWrite:currentCanWrite,newConversation:()=>newConversation().catch(showError),loadHistory:()=>{if (!historyEvents.length) $('more').onclick();}});
 init().catch(showError);
 setInterval(() => {
   const editingWorker = document.activeElement?.closest('.worker-settings');

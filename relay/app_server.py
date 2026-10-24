@@ -65,11 +65,12 @@ class AppServerClient:
             if self.process.poll() is not None:raise AppServerError('Local App Server is not running')
             try:self.process.stdin.write(data);self.process.stdin.flush()
             except (OSError,ValueError):raise AppServerError('Unable to write to local App Server') from None
-    def request(self,method,params=None,timeout=15):
+    def request(self,method,params=None,timeout=15,sent=None):
         with self.guard:
             self.serial+=1;number=self.serial;pending=queue.Queue(maxsize=1);self.responses[number]=pending
         try:
             self.send({'id':number,'method':method,'params':params or {}})
+            if sent is not None:sent.set()
             try:message=pending.get(timeout=timeout)
             except queue.Empty:raise AppServerError('Local App Server request timed out: '+method) from None
             if message.get('error'):

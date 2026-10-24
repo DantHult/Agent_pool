@@ -23,7 +23,7 @@ from .codex_events import progress_from_message
 from .fs_lock import current_uid, host_path, null_device, try_exclusive_lock
 from .security import clean,scrub
 from .workspace import Workspace
-from .native_environment import RUNTIME_NAMES,hydrate,toolchain_signature,workspace_environment
+from .native_environment import RUNTIME_NAMES,create_shell_profile,hydrate,toolchain,toolchain_signature,workspace_environment
 
 PROFILE_IDS=('a','b','c')
 
@@ -107,6 +107,11 @@ class NativeSession:
             # loader used by real tasks, without a turn or model request.
             with tempfile.TemporaryDirectory(prefix='thread-probe-',dir=cwd) as directory:
                 working=Path(directory);(working/'.tmp').mkdir()
+                if toolchain():
+                    env=workspace_environment(working);create_shell_profile(working)
+                    result=self.connect().request('command/exec',{'command':['/bin/zsh','-lc','node --version && npm --version'],
+                        'cwd':str(working),'env':env,'permissionProfile':PERMISSION_NAME,'timeoutMs':10000})
+                    if result.get('exitCode')!=0:raise AppServerError('Approved native Node/npm runtime probe failed; inspect toolchain preparation')
                 if not self.connect().request('thread/start',thread_options(working)).get('thread',{}).get('id'):
                     raise AppServerError('App Server did not create a native probe thread')
             self.probed=True
@@ -143,7 +148,7 @@ def native_readiness(profiles=PROFILE_IDS):
                 session.auth()
             checks.append(('Profile '+profile+' authenticated with ChatGPT',True))
             identities.append(session.account_hash)
-        except (AppServerError,OSError) as exc:
+        except (AppServerError,OSError,ValueError) as exc:
             checks.append(('Profile '+profile+' ready',False));details.append(clean(str(exc)))
     if len(identities)==3:
         distinct=all(identities) and len(set(identities))==3

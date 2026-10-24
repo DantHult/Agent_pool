@@ -23,11 +23,12 @@ def main():
             page.locator('#accountEmail').fill('owner@relay.invalid');page.locator('#accountPassword').fill(PASSWORD)
             page.locator('#accountForm button[type=submit]').click()
             page.wait_for_function("() => document.querySelectorAll('[data-native-profile]').length===3")
+            page.locator('[data-pane=agents]').click()
             # Selecting immediately after initial profiles appear used to race
             # the first project load and discard the selected worker.
             page.locator('[data-native-profile=a]').click()
             page.wait_for_function("() => document.getElementById('startWorker').value!==''")
-            page.locator('#prompt').fill(OBJECTIVE);page.locator('#pauseAfterTurn').check();page.locator('.send').click()
+            page.locator('#prompt').fill(OBJECTIVE);page.locator('.run-options summary').click();page.locator('#pauseAfterTurn').check();page.locator('.run-options summary').click();page.locator('.send').click()
             page.wait_for_function("() => document.getElementById('taskState').textContent==='running'")
             assert 'NATIVE LOCAL' in page.locator('#connectionTitle').inner_text()
             assert 'simulated' not in page.locator('#connectionTitle').inner_text().lower()

@@ -25,3 +25,5 @@ local-native-data/
 native-dashboard-proof/
 # Accidental Portable Git extract from a Windows installer misfire.
 -y*/
+native-environment-proof/
+ide-proof/

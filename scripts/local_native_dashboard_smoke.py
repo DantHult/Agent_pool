@@ -46,6 +46,7 @@ def run(data,chrome,objective):
             page.locator('#accountForm button[type=submit]').click()
             page.wait_for_function("() => !document.body.classList.contains('signed-out')")
             page.wait_for_function("() => document.querySelectorAll('[data-native-profile]').length === 3")
+            page.locator('[data-pane=agents]').click()
             with server.relay.lock:profiles=server.relay.native_profiles(owner,project)['profiles']
             report.update({'project_id':project,'owner_authenticated':True,'stage':'profile-preflight'})
             for profile in ('a','b'):
@@ -57,7 +58,7 @@ def run(data,chrome,objective):
             report['distinct_accounts']=True;save()
             page.locator('[data-native-profile=a]').click()
             page.wait_for_function("() => document.getElementById('startWorker').value !== ''")
-            page.locator('#prompt').fill(objective);page.locator('#pauseAfterTurn').check();page.locator('#handoffPhases').select_option('2')
+            page.locator('#prompt').fill(objective);page.locator('.run-options summary').click();page.locator('#pauseAfterTurn').check();page.locator('#handoffPhases').select_option('2');page.locator('.run-options summary').click()
             report['stage']='native-A';save();page.locator('.send').click()
             print('REAL NATIVE A: owner submitted the objective through the dashboard.',flush=True)
             page.wait_for_function("() => document.getElementById('taskState').textContent === 'handoff_pending'",timeout=240000)
@@ -104,7 +105,7 @@ def run(data,chrome,objective):
                     if len(batch)<100:break
                     after=batch[-1]['sequence']
                 if restored_events!=events:raise RuntimeError('Persisted transcript changed after restart')
-            page.locator('[data-tab=checkpoints]').click();page.screenshot(path=str(directory/'native-dashboard-proof.png'),full_page=True)
+            page.locator('[data-pane=agents]').click();page.locator('.workspace-records summary').click();page.locator('[data-tab=checkpoints]').click();page.screenshot(path=str(directory/'native-dashboard-proof.png'),full_page=True)
             report.update({'live_verified':True,'stage':'verified','execution_runs':runs,'handoffs':handoffs,'checkpoint':detail['workspace']['checkpoint'],'restart_persistence':True,'browser_reload_persistence':True,'test_output':tests[-1]['content'],'contexts_verified':len(detail['contexts']),'event_count':len(events)})
             save();context.close();browser.close()
         print('PASS: REAL NATIVE LOCAL dashboard A → B, owner authentication, genuine coding/tests, checkpointed explicit handoff, browser reload and backend restart persistence.',flush=True)

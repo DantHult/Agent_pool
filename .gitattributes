@@ -1,0 +1,3 @@
+# Generated third-party bundles contain significant whitespace in template
+# literals. Preserve vendor content instead of applying source whitespace rules.
+static/vendor/monaco/** -whitespace

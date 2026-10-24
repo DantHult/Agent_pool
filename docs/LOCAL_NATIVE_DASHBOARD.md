@@ -102,3 +102,5 @@ PYTHONPATH=/private/tmp/relay-browser-tools python3 tests/browser_local_native.p
 ```
 
 **Observed PASS** after correcting an initial-load selection timing race. It uses real isolated Chrome with the test-only native peer, verifies initial profile selection is retained after loading, preserves NATIVE LOCAL labeling while busy, and exercises owner-requested Pause/Checkpoint. It is separate from the real native A → B proof above.
+
+For approved Node/npm, private Python environments, dependency preparation across handoffs and Real Codex Test environment diagnosis, see [Native development environments](NATIVE_ENVIRONMENTS.md). That guide distinguishes environment readiness from actual endpoint/build/browser verification.

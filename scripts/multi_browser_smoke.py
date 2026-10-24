@@ -49,8 +49,10 @@ def run(data,chrome):
                 tab.wait_for_function("() => !document.body.classList.contains('signed-out')")
                 members.append(tab)
             alex,sam,jordan=members
+            for tab in members:tab.locator('[data-pane=agents]').click()
+            alex.locator('.run-options summary').click()
             alex.locator('#startWorker').select_option(workers[0]);alex.locator('#prompt').fill(PROMPT)
-            alex.locator('#pauseAfterTurn').check();alex.locator('#handoffPhases').select_option('3');alex.locator('.send').click()
+            alex.locator('#pauseAfterTurn').check();alex.locator('#handoffPhases').select_option('3');alex.locator('.run-options summary').click();alex.locator('.send').click()
             sam.wait_for_function("() => document.getElementById('timeline').textContent.includes('validator.py written')")
             conversation=alex.locator('#conversationId').inner_text()
             sam.locator('#pause').click();sam.wait_for_function("() => document.getElementById('taskState').textContent==='handoff_pending'")
@@ -62,6 +64,7 @@ def run(data,chrome):
             for tab in members:
                 tab.reload();tab.wait_for_function("() => document.getElementById('taskState').textContent==='completed'")
                 assert tab.locator('#conversationId').inner_text()==conversation
+                tab.locator('#timeline .operation-card').evaluate_all('(nodes)=>nodes.forEach(node=>node.open=true)')
                 assert 'Ran 5 tests' in tab.locator('#timeline').inner_text()
             with server.relay.lock:
                 detail=server.relay.detail(admin_id,project);task=detail['tasks'][0]
@@ -84,10 +87,11 @@ def run(data,chrome):
             for tab in members:
                 tab.reload();tab.wait_for_function("() => document.getElementById('taskState').textContent==='completed'")
                 assert tab.locator('#conversationId').inner_text()==conversation
+                tab.locator('#timeline .operation-card').evaluate_all('(nodes)=>nodes.forEach(node=>node.open=true)')
                 assert 'Ran 5 tests' in tab.locator('#timeline').inner_text()
             with server.relay.lock:restored=server.relay.detail(admin_id,project)
             assert restored['execution_runs']==detail['execution_runs'] and restored['checkpoints']==detail['checkpoints']
-            alex.locator('[data-tab=checkpoints]').click();alex.screenshot(path=str(directory/'three-browser-proof.png'),full_page=True)
+            alex.locator('[data-pane=agents]').click();alex.locator('.workspace-records summary').click();alex.locator('[data-tab=checkpoints]').click();alex.screenshot(path=str(directory/'three-browser-proof.png'),full_page=True)
             report={'mode':'simulated-inference','browser':'real installed Chrome','isolated_browser_contexts':len(contexts),'authorized_humans':3,'unauthorized_account_blocked':True,'restart_persistence':True,'conversation_id':conversation,'task_id':task['id'],'project_id':project,'worker_ids':workers,'execution_runs':restored['execution_runs'],'checkpoint_ids':[c['git_commit'] for c in restored['checkpoints']],'generated_tests_passed':5,'real_multi_host_verified':False,'live_organization_api_verified':False}
             (directory/'multi-browser-report.json').write_text(json.dumps(report,indent=2))
             for context in contexts:context.close()

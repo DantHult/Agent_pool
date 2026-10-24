@@ -237,11 +237,13 @@ class Workspace:
         except OSError:
             pass
 
-    def _walk_path(self, directory, prefix=(), display=False, strict=False):
+    def _walk_path(self, directory, prefix=(), display=False, strict=False, excluded_names=()):
         directory = Path(directory)
         for child in sorted(directory.iterdir(), key=lambda item: item.name):
             name = child.name
             relative = prefix + (name,)
+            if name in excluded_names:
+                continue
             if relative == ('.git',) or relative[:2] == ('.relay', 'history'):
                 continue
             if display and name in ('__pycache__', '.venv', 'node_modules'):
@@ -251,7 +253,7 @@ class Workspace:
                     raise ValueError('Symlink in generated workspace; review before checkpoint')
                 continue
             if child.is_dir():
-                yield from self._walk_path(child, relative, display, strict)
+                yield from self._walk_path(child, relative, display, strict, excluded_names)
             elif child.is_file():
                 info = child.lstat()
                 if info.st_nlink == 1:
@@ -345,24 +347,23 @@ class Workspace:
         finally:
             os.close(gitfd)
 
-    def git(self, p, *args, input=None):
+    def git(self, p, *args, input=None, raw=False):
         project = Path(p).name
         if Path(p).parent != self.root: raise ValueError('Git path is outside managed workspaces')
         if not _USE_DIR_FD:
-            return self._git_portable(Path(p), *args, input=input)
+            return self._git_portable(Path(p), *args, input=input, raw=raw)
         with self._project_directory(project) as directory:
             self._validate_git(directory, initializing=bool(args and args[0] == 'init'))
             # A tiny isolated launcher fchdirs to the inherited fd before exec.
             # macOS /dev/fd cannot be used as a directory cwd; no preexec_fn is
             # needed, so this remains safe in the threaded HTTP server.
-            null = null_device()
             launcher = [sys.executable, '-I', '-c',
                 "import os,sys; os.fchdir(int(sys.argv[1])); os.execvpe('git',['git',*sys.argv[2:]],os.environ)", str(directory)]
             result = subprocess.run([*launcher, *self._git_config_args(), *args],
                 pass_fds=(directory,),
                 env=self._git_env(),
                 capture_output=True, text=True, timeout=10, check=True, input=input)
-            return result.stdout.strip()
+            return result.stdout if raw else result.stdout.strip()
 
     def _git_config_args(self):
         # Windows SSD/exFAT volumes may not record ownership; allow this managed worktree only.
@@ -380,7 +381,7 @@ class Workspace:
             '-c', 'user.email=relay@localhost',
         ]
 
-    def _git_portable(self, project_path, *args, input=None):
+    def _git_portable(self, project_path, *args, input=None, raw=False):
         self._validate_git_path(project_path, initializing=bool(args and args[0] == 'init'))
         git = which_git()
         if not git:
@@ -389,7 +390,7 @@ class Workspace:
             [git, *self._git_config_args(), *args],
             cwd=str(project_path), env=self._git_env(),
             capture_output=True, text=True, timeout=10, check=True, input=input)
-        return result.stdout.strip()
+        return result.stdout if raw else result.stdout.strip()
 
     def checkpoint(self, project, message):
         p = self.path(project)
@@ -536,7 +537,7 @@ class Workspace:
         secrets = [os.environ[name].encode() for name in ('RELAY_ORG_OPENAI_API_KEY','RELAY_CODEX_PROXY_TOKEN','OPENAI_API_KEY','CODEX_API_KEY') if os.environ.get(name)]
         total = 0; count = 0
         if not _USE_DIR_FD:
-            for parent, name, relative in self._walk_path(self._project_path(project), strict=True):
+            for parent, name, relative in self._walk_path(self._project_path(project), strict=True, excluded_names=excluded_names):
                 if clean(relative) != relative:
                     raise ValueError('Secret-containing workspace filename; rename it before checkpointing')
                 fd, info = self._open_nofollow(parent / name, writable=True)

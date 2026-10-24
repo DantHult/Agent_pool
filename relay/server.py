@@ -13,7 +13,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from .store import Relay
 from .auth import LocalDemoIdentityProvider
-from .accounts import InviteIdentityProvider,LoginRequired,csrf_token
+from .accounts import InviteIdentityProvider,LoginRequired,csrf_token,digest
 from .config import load_env_file
 from .fs_lock import current_uid, try_exclusive_lock
 from .security import reject_credentials,clean
@@ -36,7 +36,9 @@ class Handler(BaseHTTPRequestHandler):
         body=json.dumps(data).encode() if mime=='application/json' else data
         self.send_response(status);self.send_header('Content-Type',mime);self.send_header('Content-Length',str(len(body)))
         self.send_header('Cache-Control','no-store');self.send_header('X-Content-Type-Options','nosniff');self.send_header('Referrer-Policy','no-referrer')
-        self.send_header('Content-Security-Policy',"default-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'")
+        # Monaco lays out editor lines using dynamic inline styles. Scripts and
+        # editor workers remain same-origin; eval, CDNs and frames stay blocked.
+        self.send_header('Content-Security-Policy',"default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; worker-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'")
         if self.server.secure:self.send_header('Strict-Transport-Security','max-age=31536000')
         if cookie:self.send_header('Set-Cookie',cookie)
         for name,value in (extra or {}).items():self.send_header(name,value)
@@ -112,7 +114,12 @@ class Handler(BaseHTTPRequestHandler):
             if path=='/healthz':return self.reply(200,{'status':'ok'})
             if path=='/api/auth/config':return self.reply(200,{'mode':self.server.auth_mode,'secure':self.server.secure,'registration':'offline-owner-only' if self.server.auth_mode=='local-owner' else 'invite-only' if self.server.auth_mode=='invite' else 'demo'})
             if not path.startswith('/api/'):
-                names={'/':'index.html','/app.js':'app.js','/style.css':'style.css'}
+                names={'/':'index.html','/app.js':'app.js','/style.css':'style.css','/ide.js':'ide.js','/activity.js':'activity.js'}
+                if path.startswith('/vendor/'):
+                    asset=(STATIC/path.lstrip('/')).resolve()
+                    if not asset.is_relative_to((STATIC/'vendor').resolve()) or not asset.is_file():return self.reply(404,{'error':'Not found'})
+                    mime={'.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.ttf':'font/ttf','.json':'application/json; charset=utf-8'}.get(asset.suffix,'text/plain; charset=utf-8')
+                    return self.reply(200,asset.read_bytes(),mime)
                 if path not in names:return self.reply(404,{'error':'Not found'})
                 name=names[path];mime={'html':'text/html; charset=utf-8','js':'text/javascript; charset=utf-8','css':'text/css; charset=utf-8'}[name.split('.')[-1]]
                 return self.reply(200,(STATIC/name).read_bytes(),mime)
@@ -124,6 +131,12 @@ class Handler(BaseHTTPRequestHandler):
             if self.headers.get('Upgrade'):raise ValueError('WebSocket transport is not enabled; use event-stream or polling')
             with relay.lock:
                 if path=='/api/overview':result=relay.overview(user)
+                elif path=='/api/ide/state':result=self.server.ide.state(user,q.get('project_id',[''])[0],q.get('client_id',[''])[0],digest(self.token()))
+                elif path=='/api/ide/file':result=self.server.ide.read_file(user,q.get('project_id',[''])[0],q.get('path',[''])[0],q.get('create',['0'])[0]=='1')
+                elif path=='/api/ide/conversations':result=self.server.ide.conversations(user,q.get('project_id',[''])[0])
+                elif path=='/api/ide/console':
+                    if not self.server.ide.console:raise PermissionError('Console execution requires the pinned local owner')
+                    result=self.server.ide.console.poll(user,q.get('session_id',[''])[0],digest(self.token()))
                 elif path=='/api/native/profiles':result=relay.native_profiles(user,q.get('project_id',[None])[0])
                 elif path=='/api/workers':result=relay.workers(user,q.get('project_id',[None])[0],q.get('mine',['0'])[0]=='1')
                 elif re.fullmatch(r'/api/projects/[^/]+/(diff|download)',path):
@@ -134,7 +147,7 @@ class Handler(BaseHTTPRequestHandler):
                         if name not in files:raise ValueError('File is not available for download')
                         filename=re.sub(r'[^A-Za-z0-9_.-]','_',Path(name).name)
                         return self.reply(200,files[name].encode(),'text/plain; charset=utf-8',extra={'Content-Disposition':'attachment; filename="'+filename+'"'})
-                elif re.fullmatch(r'/api/projects/[^/]+',path):result=relay.detail(user,path.split('/')[-1])
+                elif re.fullmatch(r'/api/projects/[^/]+',path):result=relay.detail(user,path.split('/')[-1],q.get('conversation_id',[None])[0])
                 elif re.fullmatch(r'/api/tasks/[^/]+/result',path):result=relay.execution_result(user,path.split('/')[3])
                 elif re.fullmatch(r'/api/conversations/[^/]+/events',path):result=relay.events(user,path.split('/')[3],int(q.get('after',['0'])[0]),int(q.get('limit',['50'])[0]))
                 elif re.fullmatch(r'/api/artifacts/[^/]+',path):result=relay.artifact(user,path.split('/')[-1])
@@ -148,9 +161,11 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.guard(mutation=True)
             if not self.headers.get('Content-Type','').startswith('application/json') or self.headers.get('Transfer-Encoding'):raise ValueError('JSON with a content length is required')
+            path=urlparse(self.path).path
             length=int(self.headers.get('Content-Length','0'))
-            if not 1<=length<=16000:raise ValueError('Invalid request size')
-            data=json.loads(self.rfile.read(length));path=urlparse(self.path).path
+            maximum=1_200_000 if path in ('/api/ide/save','/api/ide/draft') else 16000
+            if not 1<=length<=maximum:raise ValueError('Invalid request size')
+            data=json.loads(self.rfile.read(length))
             if not path.startswith('/api/') or not isinstance(data,dict):raise ValueError('JSON object and API route required')
             method=path.removeprefix('/api/');provider=self.server.identity_provider;relay=self.server.relay
             if self.server.auth_mode=='local-owner' and (method=='auth/register' or method.startswith('invitations') or method=='membership'):raise PermissionError('Local-owner mode cannot register or delegate to other users')
@@ -166,9 +181,34 @@ class Handler(BaseHTTPRequestHandler):
                 token=provider.login(data['user_id']);return self.reply(200,{'ok':True},cookie=self.cookie(token))
             user=self.identity();self.csrf()
             if method in ('logout','auth/logout-all'):
+                if self.server.ide.console:self.server.ide.console.close_auth(digest(self.token()))
                 if method=='auth/logout-all' and self.server.auth_mode!='demo':provider.revoke_sessions(user)
                 else:provider.logout(self.token())
                 return self.reply(200,{'ok':True},cookie=self.cookie(''))
+            if method.startswith('ide/console/'):
+                console=self.server.ide.console
+                if not console:raise PermissionError('Console execution requires the pinned local owner')
+                operation=method.removeprefix('ide/console/');binding=digest(self.token())
+                if operation=='open':result=console.open(user,data,binding)
+                elif operation=='run':result=console.run(user,data,binding)
+                elif operation=='input':result=console.write(user,data,binding)
+                elif operation=='cancel':result=console.cancel(user,data,binding)
+                elif operation=='apply':result=console.apply(user,data,binding)
+                elif operation=='close':result=console.close_session(user,data['session_id'],binding)
+                else:raise ValueError('Unknown console action')
+                return self.reply(200,result)
+            if method.startswith('ide/'):
+                ide=self.server.ide;project=data['project_id'];binding=digest(self.token());client=data.get('client_id','')
+                with relay.lock:
+                    if method=='ide/lock':result=ide.acquire(user,project,client,binding,data.get('recover') is True)
+                    elif method=='ide/save':result=ide.save(user,project,client,binding,data['path'],data.get('version'),data['content'],data.get('conversation_id'))
+                    elif method=='ide/draft':result=ide.draft(user,project,client,binding,data['path'],data.get('version'),data['content'])
+                    elif method=='ide/discard':result=ide.discard(user,project,client,binding,data['path'])
+                    elif method=='ide/release':result=ide.release(user,project,client,binding,data.get('checkpoint') is True,data.get('conversation_id'))
+                    elif method=='ide/git':result=ide.git(user,project,client,binding,data['arguments'],data.get('conversation_id'))
+                    elif method=='ide/conversations':result=ide.create_conversation(user,project,data['title'])
+                    else:raise ValueError('Unknown editor action')
+                return self.reply(200,result)
             if self.server.auth_mode!='demo':
                 if method=='invitations':
                     result=provider.invite(user,data);result['invitation_url']=self.server.public_url+'/#invite='+result.pop('invitation_token')
@@ -200,6 +240,7 @@ class RelayServer(ThreadingHTTPServer):
         finally:self.request_slots.release()
     def server_close(self):
         self.closing=True;super().server_close()
+        if getattr(self,'ide',None) and self.ide.console:self.ide.console.close()
         if hasattr(self,'relay'):self.relay.close()
         from .native import close_native_sessions
         close_native_sessions()
@@ -264,6 +305,11 @@ def make_server(root,port=8000,auth_mode=None,origin=None,allow_http=False):
         if not 600<=ttl<=86400 or not 60<=idle<=ttl:raise ValueError('Session TTL must be 600–86400 seconds and idle limit 60 seconds up to TTL')
         server.identity_provider=InviteIdentityProvider(server.relay,ttl,idle,owner_id=owner_id) if mode!='demo' else LocalDemoIdentityProvider(server.relay.user)
         if mode=='demo':server.sessions=server.identity_provider.sessions
+        from .ide import ProjectIDE
+        server.ide=ProjectIDE(server.relay,mode=='local-owner')
+        if mode=='local-owner':
+            from .console import CommandConsole
+            server.ide.console=CommandConsole(server)
         metadata={'pid':os.getpid(),'url':server.public_url}
         # Keep legacy lock-file JSON for older readers; status JSON is the Windows-safe source.
         lock.seek(0);lock.truncate();json.dump(metadata,lock);lock.flush()

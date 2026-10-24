@@ -61,7 +61,22 @@ class NativeEnvironmentTests(unittest.TestCase):
         self.assertTrue(Path(variables['ZDOTDIR']).is_relative_to(self.workspace))
         self.assertEqual(variables['PIP_NO_INDEX'], '1')
         self.assertEqual(variables['NPM_CONFIG_IGNORE_SCRIPTS'], 'true')
+        self.assertEqual(variables['OPENSSL_CONF'], '/dev/null')
+        self.assertNotIn('NODE_TLS_REJECT_UNAUTHORIZED', variables)
         self.assertTrue(Path(variables['TMPDIR']).is_relative_to(self.workspace))
+
+    @unittest.skipUnless(Path('/bin/zsh').is_file(), 'Requires zsh login startup')
+    def test_login_shell_uses_private_python_after_system_path_helper(self):
+        binary = self.workspace / '.venv/bin/python3'
+        binary.parent.mkdir(parents=True)
+        binary.write_text('#!/bin/sh\nprintf private-python-runtime')
+        binary.chmod(0o755)
+        variables = env.workspace_environment(self.workspace)
+        env.create_shell_profile(self.workspace)
+        result = subprocess.run(['/bin/zsh', '-lc', 'python3'], env=variables, cwd=self.workspace,
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, 'private-python-runtime')
 
     def test_only_approved_runtime_is_readable_and_network_stays_disabled(self):
         runtime = self.approve()
@@ -79,6 +94,43 @@ class NativeEnvironmentTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'changed'):
             env.toolchain()
 
+    def test_workspace_cache_directories_cannot_follow_model_links(self):
+        outside = self.directory / 'outside'
+        outside.mkdir()
+        for component in ('.tmp', '.native'):
+            link = self.workspace / component
+            link.symlink_to(outside, target_is_directory=True)
+            with self.assertRaises(OSError):
+                env.workspace_environment(self.workspace)
+            link.unlink()
+        (self.workspace / '.native').mkdir()
+        (self.workspace / '.native/home').symlink_to(outside, target_is_directory=True)
+        with self.assertRaises(OSError):
+            env.workspace_environment(self.workspace)
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_shell_startup_profile_cannot_overwrite_a_link_or_existing_file(self):
+        env.workspace_environment(self.workspace)
+        outside = self.directory / 'outside-file'
+        outside.write_text('preserve')
+        profile = self.workspace / '.native/home/.zprofile'
+        profile.symlink_to(outside)
+        with self.assertRaises(FileExistsError):
+            env.create_shell_profile(self.workspace)
+        self.assertEqual(outside.read_text(), 'preserve')
+
+    def test_incomplete_tool_provision_does_not_break_python_only_tasks(self):
+        env.private_directory(env.root() / 'tools')
+        self.assertIsNone(env.toolchain())
+        self.assertEqual(env.toolchain_signature(), '')
+        self.assertTrue(env.hydrate(self.workspace)['ready'])
+
+    def test_supported_node_checks_exact_npm_engine_minimum(self):
+        for version in ('v22.22.0', 'v22.22.1', 'v24.14.9', 'v25.0.0', 'v24.22.1-malicious'):
+            self.assertFalse(env.supported_node(version), version)
+        for version in ('v22.22.2', 'v24.15.0', 'v24.100.0', 'v26.0.0'):
+            self.assertTrue(env.supported_node(version), version)
+
     def test_tool_link_cannot_escape_to_auth_home(self):
         runtime = self.approve()
         outside = self.directory / 'canary'
@@ -86,6 +138,15 @@ class NativeEnvironmentTests(unittest.TestCase):
         (runtime / 'bin/unsafe').symlink_to(outside)
         with self.assertRaisesRegex(ValueError, 'escapes'):
             env.toolchain()
+
+    def test_artifact_root_symlink_cannot_grant_an_external_directory(self):
+        external = self.directory / 'outside-tree'
+        external.mkdir()
+        (external / 'canary').write_text('nonsecret')
+        linked = self.directory / 'artifact'
+        linked.symlink_to(external, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, 'regular directory'):
+            env.tree_digest(linked)
 
     def test_missing_dependencies_are_reported_without_network_install(self):
         self.package()
@@ -103,6 +164,9 @@ class NativeEnvironmentTests(unittest.TestCase):
         for version in ('file:../secret', 'git+https://example.com/repo', 'https://example.com/a.tgz', 'npm:other@latest'):
             with self.assertRaises(ValueError):
                 env.validate_package(json.dumps({'dependencies': {'thing': version}}))
+        for key in ('overrides', 'workspaces', 'bundledDependencies', 'bundleDependencies'):
+            with self.assertRaises(ValueError):
+                env.validate_package(json.dumps({key: {'thing': 'file:../secret'}}))
 
     def test_lock_rejects_remote_and_local_artifacts(self):
         for entry in ({'resolved': 'https://example.com/a', 'integrity': 'sha512-fixture'}, {'link': True}, {'resolved': 'file:../x'}):

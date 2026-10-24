@@ -134,11 +134,32 @@ def migrate_accounts(db):
 
 
 def migrate_local_owner(db):
-    if db.execute('SELECT 1 FROM schema_migrations WHERE version=6').fetchone():return
+    if db.execute('SELECT 1 FROM schema_migrations WHERE version=6').fetchone():
+        migrate_ide(db);return
     db.execute('BEGIN IMMEDIATE')
     try:
         db.execute('CREATE TABLE local_owner_binding(singleton INTEGER PRIMARY KEY CHECK(singleton=1),user_id TEXT NOT NULL,os_uid INTEGER NOT NULL,created_at REAL NOT NULL)')
         db.execute('INSERT INTO schema_migrations VALUES(6,?)',(datetime.now(timezone.utc).isoformat(),))
+        db.execute('COMMIT')
+    except Exception:
+        db.execute('ROLLBACK');raise
+    migrate_ide(db)
+
+
+def migrate_ide(db):
+    if db.execute('SELECT 1 FROM schema_migrations WHERE version=7').fetchone():return
+    db.execute('BEGIN IMMEDIATE')
+    try:
+        # Preserve every existing ID. Conversations share the project's one
+        # authoritative workspace; execution remains serialized per project.
+        db.execute('ALTER TABLE conversations RENAME TO conversations_v6')
+        db.execute("CREATE TABLE conversations(id TEXT PRIMARY KEY,project_id TEXT NOT NULL,title TEXT NOT NULL DEFAULT 'New conversation',created_at TEXT,updated_at TEXT)")
+        db.execute("INSERT INTO conversations(id,project_id,title,created_at,updated_at) SELECT c.id,c.project_id,COALESCE(p.name,'Conversation'),COALESCE((SELECT MIN(timestamp) FROM events e WHERE e.conversation_id=c.id),?),COALESCE((SELECT MAX(timestamp) FROM events e WHERE e.conversation_id=c.id),?) FROM conversations_v6 c LEFT JOIN projects p ON p.id=c.project_id",(datetime.now(timezone.utc).isoformat(),)*2)
+        db.execute('DROP TABLE conversations_v6')
+        db.execute('CREATE INDEX conversations_project ON conversations(project_id)')
+        db.execute('CREATE TABLE human_workspace_locks(project_id TEXT PRIMARY KEY,user_id TEXT NOT NULL,client_id TEXT NOT NULL,session_hash TEXT NOT NULL,created_at TEXT NOT NULL)')
+        db.execute('CREATE TABLE editor_drafts(project_id TEXT,user_id TEXT,path TEXT,base_version TEXT,content TEXT NOT NULL,updated_at TEXT NOT NULL,PRIMARY KEY(project_id,user_id,path))')
+        db.execute('INSERT INTO schema_migrations VALUES(7,?)',(datetime.now(timezone.utc).isoformat(),))
         db.execute('COMMIT')
     except Exception:
         db.execute('ROLLBACK');raise

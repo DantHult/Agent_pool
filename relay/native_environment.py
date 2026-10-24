@@ -48,11 +48,14 @@ def digest(path):
 
 
 def tree_digest(path):
+    path = Path(path)
+    if path.is_symlink() or not path.is_dir():
+        raise ValueError('Approved artifact tree must be a regular directory')
     value = hashlib.sha256()
     for entry in sorted(Path(path).rglob('*')):
         name = str(entry.relative_to(path))
         if entry.is_symlink():
-            if not entry.resolve().is_relative_to(Path(path).resolve()):
+            if Path(os.readlink(entry)).is_absolute() or not entry.resolve().is_relative_to(path.resolve()):
                 raise ValueError('Dependency link escapes its approved bundle')
             content = 'link:' + os.readlink(entry)
         elif entry.is_file():
@@ -78,6 +81,11 @@ def toolchain():
     if not path.exists():
         return None
     private_directory(path)
+    if not (path / 'approved.json').exists():
+        # Interrupted provisioning must not break unrelated Python-only tasks.
+        return None
+    if (path / 'approved.json').is_symlink():
+        raise ValueError('Approved toolchain metadata must not be a symlink')
     info = json.loads((path / 'approved.json').read_text())
     if info.get('uid') != os.getuid() or info.get('digest') != tree_digest(path / 'runtime'):
         raise ValueError('Approved native toolchain changed; provision it again')
@@ -103,25 +111,63 @@ def clean_environment(home, runtime=None):
             'PIP_DISABLE_PIP_VERSION_CHECK': '1', 'NPM_CONFIG_USERCONFIG': '/dev/null',
             'NPM_CONFIG_GLOBALCONFIG': str(home / 'empty-global-npmrc'), 'NPM_CONFIG_CACHE': str(home / 'npm-cache'),
             'NPM_CONFIG_IGNORE_SCRIPTS': 'true', 'NPM_CONFIG_OFFLINE': 'true',
+            # Node's optional host OpenSSL config is outside the approved reads.
+            # Use library defaults; HTTPS certificate verification stays enabled.
+            'OPENSSL_CONF': '/dev/null',
             'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_CONFIG_NOSYSTEM': '1', 'LANG': 'en_US.UTF-8'}
 
 
 def workspace_environment(working):
     working = Path(working)
-    (working / '.tmp').mkdir(exist_ok=True)
+    # A retained clone is model-controlled. Never follow its directory links
+    # while the trusted owner creates caches or starts a preview.
+    descriptor = os.open(working, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for components in (('.tmp',), ('.native', 'home')):
+            current = os.dup(descriptor)
+            try:
+                for name in components:
+                    try:
+                        os.mkdir(name, mode=0o700, dir_fd=current)
+                    except FileExistsError:
+                        pass
+                    child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current)
+                    os.close(current)
+                    current = child
+            finally:
+                os.close(current)
+    finally:
+        os.close(descriptor)
     home = working / '.native/home'
-    home.mkdir(parents=True, exist_ok=True)
     env = clean_environment(home, toolchain())
     env['PATH'] = str(working / '.venv/bin') + ':' + ':'.join(env['PATH'].split(':')[1:])
+    env['RELAY_NATIVE_PATH'] = env['PATH']
     if (working / '.venv/pyvenv.cfg').is_file():
         env['VIRTUAL_ENV'] = str(working / '.venv')
     return env
 
 
+def create_shell_profile(workspace):
+    """Write only into a fresh clone; reject links and existing startup files."""
+    current = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for name in ('.native', 'home'):
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current)
+            os.close(current)
+            current = child
+        file = os.open('.zprofile', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=current)
+        try:
+            os.write(file, b'export PATH="$RELAY_NATIVE_PATH"\n')
+        finally:
+            os.close(file)
+    finally:
+        os.close(current)
+
+
 def run(command, cwd, env, timeout=180):
     # Do not forward arbitrary package-manager output, which may contain URLs or
     # local machine details. Callers report a fixed operation on failure.
-    result = subprocess.run(list(map(str, command)), cwd=cwd, env=env, capture_output=True, timeout=timeout)
+    result = subprocess.run(list(map(str, command)), cwd=cwd, env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout)
     if result.returncode:
         raise ValueError('Native dependency operation failed: ' + Path(str(command[0])).name + ' (exit ' + str(result.returncode) + ')')
     return result
@@ -144,7 +190,7 @@ def provision_node(source):
         home.mkdir()
         env = clean_environment(home)
         version = run([runtime / 'bin/node', '--version'], stage, env).stdout.decode().strip()
-        if not re.fullmatch(r'v(?:22\.(?:2[2-9]|[3-9]\d)\.\d+|24\.(?:1[5-9]|[2-9]\d)\.\d+|(?:2[6-9]|[3-9]\d)\.\d+\.\d+)', version):
+        if not supported_node(version):
             raise ValueError('Pinned npm requires a supported Node 22.22.2+, 24.15+, or 26+ runtime')
         archive = stage / 'npm.tgz'
         # Framework Python may ship without its optional CA bundle. Use the
@@ -166,6 +212,14 @@ def provision_node(source):
         write_json(target / 'approved.json', {'uid': os.getuid(), 'node_version': version, 'npm_version': NPM_VERSION,
                                             'digest': tree_digest(target / 'runtime')})
     return {'node': version, 'npm': NPM_VERSION}
+
+
+def supported_node(version):
+    match = re.fullmatch(r'v(\d+)\.(\d+)\.(\d+)', version)
+    if not match:
+        return False
+    major, minor, patch = map(int, match.groups())
+    return major >= 26 or (major == 24 and (minor, patch) >= (15, 0)) or (major == 22 and (minor, patch) >= (22, 2))
 
 
 def manifests(workspace):
@@ -204,8 +258,8 @@ def validate_requirements(text):
 
 def validate_package(text):
     package = json.loads(text)
-    if package.get('workspaces'):
-        raise ValueError('Workspace package installers require separate review')
+    if any(package.get(name) for name in ('workspaces', 'overrides', 'bundledDependencies', 'bundleDependencies')):
+        raise ValueError('Workspace, override and bundled dependency installers require separate review')
     for group in ('dependencies', 'devDependencies', 'optionalDependencies'):
         for name, version in package.get(group, {}).items():
             if not re.fullmatch(r'(?:@[a-z0-9._-]+/)?[a-z0-9._-]+', name) or not isinstance(version, str) or not re.fullmatch(r'[0-9xX*.^~<>=| -]+', version):
@@ -276,6 +330,8 @@ def prepare_dependencies(workspace):
 
 def verify_bundle(path):
     private_directory(path)
+    if (path / 'bundle.json').is_symlink():
+        raise ValueError('Dependency metadata must not be a symlink')
     info = json.loads((path / 'bundle.json').read_text())
     if info['digest'] != tree_digest(path / 'payload'):
         raise ValueError('Prepared dependency artifacts changed; prepare a new bundle')
@@ -287,6 +343,10 @@ def hydrate(workspace):
     workspace = Path(workspace)
     files = manifests(workspace)
     env = workspace_environment(workspace)
+    # macOS /etc/zprofile runs path_helper and prepends system Python paths.
+    # Restore the explicit tool order after that login-shell startup step.
+    # hydrate only receives a fresh clone with reserved paths rejected above.
+    create_shell_profile(workspace)
     key = bundle_key(files)
     bundle = root() / 'environments' / key
     # A lock generated by the previous turn may have become a checkpoint. Match

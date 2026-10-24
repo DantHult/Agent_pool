@@ -44,12 +44,14 @@ def check_javascript_core(source):
 
 
 def main():
-    script = ROOT / 'static/app.js'
+    scripts = [ROOT / 'static' / name for name in ('app.js','ide.js','activity.js')]
     markup = Identifiers()
     markup.feed((ROOT / 'static/index.html').read_text())
     if len(markup.values) != len(set(markup.values)):
         raise SystemExit('FAIL: duplicate static HTML IDs')
-    referenced = set(re.findall(r"\$\('([^']+)'\)", script.read_text()))
+    referenced = set()
+    for script in scripts:
+        referenced.update(re.findall(r"(?:\$|byId)\('([^']+)'\)",script.read_text()))
     # fileContent is created by the artifact viewer rather than static HTML.
     missing = referenced - set(markup.values) - {'fileContent'}
     if missing:
@@ -57,11 +59,12 @@ def main():
     print('PASS: HTML/JavaScript ID consistency')
     node = shutil.which('node')
     if node:
-        subprocess.run([node, '--check', str(script)], check=True)
+        for script in scripts:subprocess.run([node, '--check', str(script)], check=True)
         print('PASS: JavaScript syntax (Node)')
     elif sys.platform == 'darwin':
-        if not check_javascript_core(script.read_bytes()):
-            raise SystemExit('FAIL: JavaScript syntax (JavaScriptCore)')
+        for script in scripts:
+            if not check_javascript_core(script.read_bytes()):
+                raise SystemExit('FAIL: JavaScript syntax (JavaScriptCore): '+script.name)
         print('PASS: JavaScript syntax (JavaScriptCore)')
     else:
         print('SKIP: JavaScript syntax; Node or macOS JavaScriptCore is required')
