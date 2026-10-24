@@ -48,7 +48,7 @@ class LocalNativeDashboardTests(unittest.TestCase):
     def enroll(self,profile):return self.client.post('native/profiles/enroll',{'profile':profile,'project_id':self.project})['id']
     def submit(self,worker):return self.client.post('prompt',{'conversation_id':self.conversation,'worker_id':worker,'execution_mode':'native','prompt':OBJECTIVE,'pause_after_turn':True})
     def wait(self,task,state):
-        deadline=time.monotonic()+10
+        deadline=time.monotonic()+60
         while time.monotonic()<deadline:
             with self.server.relay.lock:
                 current=self.server.relay.task(self.owner,task['id'])

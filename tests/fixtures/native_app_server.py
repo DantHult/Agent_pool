@@ -38,7 +38,9 @@ def execute(params):
         (working/'test_native_tools.py').write_text("import unittest\nfrom native_tools import normalize\nclass NativeTests(unittest.TestCase):\n def test_spaces(self): self.assertEqual(normalize(' A   B '),'a b')\n def test_empty(self): self.assertEqual(normalize(''),'')\n")
         notify('item/started',{'threadId':thread,'item':{'id':'tests','type':'commandExecution','command':'python3 -m unittest test_native_tools'}})
         cmd=[sys.executable,'-I','-c',"import sys,unittest;sys.path.insert(0,'.');r=unittest.TextTestRunner().run(unittest.defaultTestLoader.discover('.',pattern='test_native_tools.py'));sys.exit(not r.wasSuccessful())"]
-        result=subprocess.run(cmd,cwd=working,capture_output=True,text=True);tests=[result.stdout+result.stderr]
+        # Do not inherit the App Server stdin pipe. On Windows that handle stays
+        # open in the parent reader and the child blocks before the tests run.
+        result=subprocess.run(cmd,cwd=working,capture_output=True,text=True,stdin=subprocess.DEVNULL,timeout=60);tests=[result.stdout+result.stderr]
         notify('item/completed',{'threadId':thread,'item':{'id':'tests','type':'commandExecution','aggregatedOutput':tests[0],'exitCode':result.returncode}})
     progress={'summary':'TEST-ONLY native RPC fixture phase '+profile,'completed_work':['Updated native_tools.py'],
               'pending_steps':['Finish remaining code and tests'] if profile!='c' and not scenario.get('complete') else [],'test_results':tests,'errors':[],'limitations':['Mock protocol peer; no real Codex inference'] ,'decisions':['Use normalized whitespace']}
