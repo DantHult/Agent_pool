@@ -107,6 +107,7 @@ class Relay:
         return bool(self.rows("SELECT 1 FROM organization_memberships WHERE organization_id=? AND user_id=? AND role='admin'",(org,user)))
     def access(self,user,project):
         p=self.one('SELECT * FROM projects WHERE id=?',(project,))
+        if p.get('deleted_at'):raise PermissionError('This project was deleted')
         self.org_member(user,p['organization_id'])
         if not self.is_admin(user,p['organization_id']) and not self.rows('SELECT 1 FROM memberships WHERE user_id=? AND project_id=?',(user,project)):
             raise PermissionError('Project membership required')
@@ -191,11 +192,53 @@ class Relay:
         if not isinstance(name,str) or not name.strip() or len(name)>100: raise ValueError('Project name must contain 1–100 characters')
         project=project or uid()
         self.ws.path(project)
-        self.db.execute('INSERT INTO projects VALUES(?,?,?)',(project,clean(name),'orgdemo'))
+        self.db.execute('INSERT INTO projects(id,name,organization_id) VALUES(?,?,?)',(project,clean(name),'orgdemo'))
         self.db.execute('INSERT INTO memberships VALUES(?,?,?)',(user,project,'engineer' if self.demo else 'admin'))
         self.db.execute('INSERT INTO conversations(id,project_id,title,created_at,updated_at) VALUES(?,?,?,?,?)',(uid(),project,clean(name),now(),now()))
         self.audit(user,'project_created',project=project)
         return {'id':project}
+    def delete_project(self,user,data):
+        """Remove a project from Relay after its administrator confirms by name.
+
+        Its workspace, agents' private clones and stored outputs are deleted.
+        Events and audit rows are append-only, so its history stays in the
+        database, unreachable through Relay. Nothing runs while it is deleted.
+        """
+        from .ide import WorkspaceConflict
+        project=data['project_id'];p=self.write_access(user,project)
+        if not self.is_admin(user,p['organization_id']) and self.one('SELECT role FROM memberships WHERE user_id=? AND project_id=?',(user,project))['role']!='admin':
+            raise PermissionError('Only a project administrator can delete this project')
+        if data.get('confirm_name')!=p['name']:raise ValueError('Type the project name exactly to confirm deletion')
+        unfinished=self.rows("SELECT t.* FROM tasks t JOIN conversations c ON c.id=t.conversation_id WHERE c.project_id=? AND t.state NOT IN ('completed','failed','cancelled')",(project,))
+        if self.rows('SELECT 1 FROM workspace_leases WHERE project_id=?',(project,)) or any(t['state'] not in ('queued','handoff_pending') or t['id'] in self.jobs for t in unfinished):
+            raise WorkspaceConflict('An agent is working in this project. Stop it and wait for its checkpoint before deleting the project.')
+        commands=getattr(self,'human_commands',None)
+        if commands and commands(project):raise WorkspaceConflict('Close the open command session for this project before deleting it')
+        if self.rows('SELECT 1 FROM human_workspace_locks WHERE project_id=? AND user_id!=?',(project,user)):
+            raise WorkspaceConflict('Someone else is editing this project. They must finish before it can be deleted.')
+        # Queued and paused tasks cannot outlive their project.
+        for t in unfinished:
+            self.state(t,'cancelled');self.event(t,'stop','Cancelled because '+user+' deleted the project');self._release(t,'cancelled')
+        clones=self.rows("SELECT DISTINCT json_extract(metadata,'$.native_profile') AS profile,json_extract(metadata,'$.workspace_id') AS identity FROM events WHERE project_id=? AND event_type='session_started'",(project,))
+        artifacts=[row['artifact'] for row in self.rows("SELECT json_extract(metadata,'$.artifact_id') AS artifact FROM events WHERE project_id=? AND json_extract(metadata,'$.artifact_id') IS NOT NULL",(project,))]
+        self.db.execute('UPDATE projects SET deleted_at=? WHERE id=?',(now(),project))
+        for table in ('worker_projects','editor_drafts','human_workspace_locks'):
+            self.db.execute(f'DELETE FROM {table} WHERE project_id=?',(project,))
+        self.db.execute('UPDATE invitations SET revoked_at=? WHERE project_id=? AND accepted_at IS NULL AND revoked_at IS NULL',(time.time(),project))
+        self.audit(user,'project_deleted',project=project,metadata={'name':p['name'],'cancelled_tasks':[t['id'] for t in unfinished]})
+        # Files go last: the project is already unreachable if removal fails.
+        from .native import remove_private_workspace
+        leftover=[]
+        try:self.ws.remove(project)
+        except OSError:leftover.append(str(self.ws.root/project))
+        removed=0
+        for row in clones:
+            try:removed+=remove_private_workspace(row['profile'],row['identity'])
+            except OSError:leftover.append(str(row['identity']))
+        for artifact in artifacts:
+            path=self.root/'artifacts'/artifact if isinstance(artifact,str) and artifact.isalnum() else None
+            if path and path.is_file():path.unlink()
+        return {'deleted':True,'project_id':project,'cancelled_tasks':len(unfinished),'private_clones_removed':removed,'files_not_removed':leftover}
     def project(self,t): return self.one('SELECT project_id FROM conversations WHERE id=?',(t['conversation_id'],))['project_id']
     def task(self,user,task_id):
         t=self.one('SELECT * FROM tasks WHERE id=?',(task_id,)); self.access(user,self.project(t)); return t
@@ -767,14 +810,14 @@ class Relay:
 
     def overview(self,user,light=False):
         u=self.user(user); self.org_member(user)
-        projects=self.rows("SELECT * FROM projects WHERE organization_id='orgdemo'") if self.is_admin(user) else self.rows('SELECT p.* FROM projects p JOIN memberships m ON m.project_id=p.id WHERE m.user_id=?',(user,))
+        projects=self.rows("SELECT * FROM projects WHERE organization_id='orgdemo' AND deleted_at IS NULL") if self.is_admin(user) else self.rows('SELECT p.* FROM projects p JOIN memberships m ON m.project_id=p.id WHERE m.user_id=? AND p.deleted_at IS NULL',(user,))
         directory={'workers':[],'personal_subscription':{'supported':False,'reason':PERSONAL_UNSUPPORTED_REASON}} if light else self.workers(user)
         people=self.rows('SELECT id,name,role FROM users') if self.demo else self.rows('SELECT u.id,u.name,u.role FROM users u JOIN accounts a ON a.user_id=u.id WHERE a.disabled=0')
         for p in projects:
             p['role']='admin' if self.is_admin(user) else self.one('SELECT role FROM memberships WHERE user_id=? AND project_id=?',(user,p['id']))['role']
             p['can_write']=p['role']!='viewer' and self.org_member(user)['role']!='viewer'
         return {'user':u,'users':people,'organizations':self.rows('SELECT * FROM organizations'),'projects':projects,'workers':directory['workers'],
-            'features':{'agent_management':True,'explorer_operations':True,'checkpoint_reviews':True,'automatic_workflow':True,'recent_history':True,'development_terminal':True,'live_agents':True,'editor_leases':True},
+            'features':{'agent_management':True,'explorer_operations':True,'checkpoint_reviews':True,'automatic_workflow':True,'recent_history':True,'development_terminal':True,'live_agents':True,'editor_leases':True,'handoff_export':True},
             'auth':{'mode':'local-owner' if self.local_owner_id else 'local_demo' if self.demo else 'invite','production_ready':not self.demo and not self.local_owner_id,'description':'Pinned local owner; loopback only' if self.local_owner_id else 'Seeded local identities' if self.demo else 'Invite-only Relay accounts; HTTPS required','native_enabled':self.native_enabled,'local_owner_id':self.local_owner_id},
             'personal_subscription':directory['personal_subscription'],
             'execution':{'mode':'mixed','connected':any(w['execution_mode'] in LIVE_MODES and w['health'].get('connected',False) for w in directory['workers']),'detail':'Native profiles use the local owner’s ChatGPT subscriptions and explicit handoffs. Simulated capacity is labeled; organization API capacity is shared by organization.'}}
@@ -843,6 +886,7 @@ class Relay:
                     self.manage(user,self.one('SELECT * FROM workers WHERE id=?',(data.get('worker_id') or cached['id'],)))
                 return cached
             if method=='projects': result=self.create_project(user,data['name'])
+            elif method=='projects/delete': result=self.delete_project(user,data)
             elif method=='prompt': result=self.submit(user,data['conversation_id'],data['prompt'],data.get('worker_id'),data.get('execution_mode'),data.get('pause_after_turn',False),data.get('native_phases',2))
             elif method in ('switch','limit'):
                 result=self.switch(user,data['task_id'],int(data['generation']),'Simulated usage limit' if method=='limit' else 'Manual worker switch',data.get('target_worker_id'),'simulated_limit' if method=='limit' else data.get('reason_code','manual_switch'))

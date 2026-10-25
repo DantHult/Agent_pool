@@ -27,6 +27,18 @@ def execute(params):
     if scenario.get('approval'):
         send({'id':900,'method':'item/commandExecution/requestApproval','params':{'threadId':thread,'command':'read outside workspace'}})
         send({'id':901,'method':'account/chatgptAuthTokens/refresh','params':{}})
+    if scenario.get('review'):
+        # Call Relay's dynamic tools the way a model would during its turn.
+        replies=home/'approval-replies.jsonl'
+        def tool(number,name,arguments):
+            send({'id':number,'method':'item/tool/call','params':{'threadId':thread,'turnId':turn,'callId':'call-'+str(number),'tool':name,'arguments':arguments}})
+            deadline=time.monotonic()+60
+            while time.monotonic()<deadline:
+                for line in (replies.read_text().splitlines() if replies.exists() else []):
+                    if json.loads(line).get('id')==number:return json.loads(line)
+                time.sleep(.05)
+        server="python3 -c \"import http.server,os;http.server.ThreadingHTTPServer(('127.0.0.1',int(os.environ['PORT'])),http.server.SimpleHTTPRequestHandler).serve_forever()\""
+        (home/'tool-results.json').write_text(json.dumps([tool(960,'run_app',{'command':server}),tool(961,'http_request',{'path':'/'})]))
     if scenario.get('quota') or scenario.get('quota_after') and turn_count>scenario['quota_after'] or scenario.get('quota_once') and not quota_hit:
         quota_hit=True
         notify('error',{'threadId':thread,'error':{'message':'Native usage limit reached','codexErrorInfo':'UsageLimitExceeded'}})
@@ -80,6 +92,7 @@ for line in sys.stdin:
     elif method=='thread/start':
         assert started and params['permissions']=='relay-native' and 'sandbox' not in params
         cwd=params['cwd'];thread='mock-'+profile+'-'+uuid.uuid4().hex;reply(number,{'thread':{'id':thread}})
+        (home/'dynamic-tools.json').write_text(json.dumps([tool['name'] for tool in params.get('dynamicTools') or []]))
     elif method=='turn/start':
         assert params['cwd']==cwd and params['runtimeWorkspaceRoots']==[cwd]
         turn_count+=1;turn='turn-'+uuid.uuid4().hex;turn_cancel.clear();reply(number,{'turn':{'id':turn,'status':'inProgress'}})

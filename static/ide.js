@@ -50,7 +50,7 @@
     activePane = name;
     document.querySelectorAll('[data-pane]').forEach(button => button.classList.toggle('active', button.dataset.pane === name));
     document.querySelectorAll('.sidebar-pane').forEach(panel => panel.hidden = panel.id !== 'pane-' + name);
-    byId('sidebarTitle').textContent = {explorer:'EXPLORER',agents:'AGENTS',conversations:'CONVERSATIONS',source:'SOURCE CONTROL'}[name];
+    byId('sidebarTitle').textContent = {explorer:'EXPLORER',projects:'PROJECTS',agents:'AGENTS',conversations:'CONVERSATIONS',source:'SOURCE CONTROL'}[name];
     document.querySelector('.ide-shell').classList.add('sidebar-mobile-open');
     if (window.innerWidth<=950) document.querySelector('.ide-shell').classList.remove('agent-mobile-open');
   }

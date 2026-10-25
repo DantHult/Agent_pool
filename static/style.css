@@ -21,3 +21,7 @@ dialog{color:var(--text);background:#1c2531;border:1px solid #3d4c5e;border-radi
 
 /* A command-entry terminal, backed by restricted argv execution (no PTY). */
 #consoleOutput{cursor:text}#commandForm{background:#121c25;min-height:43px;cursor:text}#commandForm:focus-within{box-shadow:inset 3px 0 #9ddab8}#commandInput{caret-color:#c1f4d4;color:#e0f2e7;font-size:13px;outline:none}#commandInput[readonly]{opacity:.7}#terminalPrompt{font:13px monospace;white-space:nowrap}#stdinForm{font-size:10px} .agent-live-summary{display:flex;gap:6px;align-items:center;margin:6px 0}.agent-live-summary strong{flex:1;font-size:11px;overflow-wrap:anywhere}.agent-details{margin:8px 0}.agent-details>summary{cursor:pointer;color:#a5b9ca} .agent-runtime-error{color:#e7ac9a;white-space:pre-wrap;overflow-wrap:anywhere}
+/* Destructive confirmation (project deletion). */
+.primary.danger{background:#5b3535;border-color:#7a4a4a;color:#f3d6d6}.primary.danger:hover:not(:disabled){background:#713f3f}
+#projectList .conversation-actions{margin-top:-2px}
+.conversation-actions{flex-wrap:wrap}

@@ -88,12 +88,18 @@ def ensure_port_available(port):
 
 
 def preview_policy(workspace, backend_port=8000, frontend_port=5173, runtime=None):
+    return sandbox_policy(workspace, ports(backend_port, frontend_port), runtime)
+
+
+def sandbox_policy(workspace, selected, runtime=None):
+    """Seatbelt profile for project code that may use only the given loopback ports."""
     workspace = private_workspace(workspace)
     approved = toolchain()
     if runtime is not None and Path(runtime).resolve() != approved:
         raise ValueError('Preview runtime must be the approved toolchain')
     runtime = approved
-    selected = ports(backend_port, frontend_port)
+    if not 1 <= len(selected) <= 2 or len(set(selected)) != len(selected) or any(type(port) is not int or not 1024 <= port <= 65535 for port in selected):
+        raise ValueError('Select one or two distinct unprivileged loopback ports')
     python = Path(sys.base_prefix).resolve()
     if python in (Path('/'), Path.home().resolve()) or python.is_relative_to(root()):
         raise ValueError('Unsafe Python runtime scope')
@@ -132,6 +138,38 @@ def preview_policy(workspace, backend_port=8000, frontend_port=5173, runtime=Non
                       '(allow network-inbound (local ip ' + address + '))',
                       '(allow network-outbound (remote ip ' + address + '))'))
     return '\n'.join(lines) + '\n'
+
+
+def stop_group(child):
+    """Stop a sandboxed process and every descendant in its process group."""
+    if child is None:
+        return
+    # Always signal the whole process group, even if its direct child exited.
+    if hasattr(os, 'killpg'):
+        try:
+            os.killpg(child.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        finally:
+            # A parent may exit while a descendant ignores SIGTERM. Reaping the
+            # direct process alone must not leave a project server running.
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        child.wait(timeout=5)
+        return
+    try:
+        if child.poll() is None:
+            child.terminate()
+        child.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        child.wait(timeout=5)
 
 
 class Preview:
@@ -200,35 +238,7 @@ class Preview:
                                        '--port', str(self.frontend_port), '--strictPort'], self.workspace / 'frontend')
 
     def stop(self, name):
-        child = self.processes.pop(name, None)
-        if child is None:
-            return
-        # Always signal the whole process group, even if its direct child exited.
-        if hasattr(os, 'killpg'):
-            try:
-                os.killpg(child.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                child.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
-            finally:
-                # A parent may exit while a descendant ignores SIGTERM. Reaping the
-                # direct process alone must not leave a project server running.
-                try:
-                    os.killpg(child.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            child.wait(timeout=5)
-            return
-        try:
-            if child.poll() is None:
-                child.terminate()
-            child.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            child.kill()
-            child.wait(timeout=5)
+        stop_group(self.processes.pop(name, None))
 
     def stop_backend(self):
         self.stop('backend')

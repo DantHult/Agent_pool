@@ -98,3 +98,16 @@ These fixtures check PATH, reserved paths, artifact integrity, dependency isolat
 The original source checkpoint remained `87c05901d849149d1e545884eab20cc6ecd4b618`. This proves actual development runtime execution and dependency continuation; `model_execution` and `saved_conversation_resumed` are explicitly false. A new authenticated Codex turn on the saved task remains a separate owner action after reloading the updated server.
 
 The idle local-owner server was then gracefully reloaded at `http://127.0.0.1:9000` with the same data directory. `native-environment-proof/server-reload-report.json` confirms unchanged conversations/messages/events, task state/generations, contexts, checkpoints, handoffs, assignments, execution runs, workers, grants, memberships, owner binding and session metadata. All three existing profiles passed actual App Server initialization, sandbox/runtime/thread probes and ChatGPT authentication; distinct-account validation passed without displaying identities. The saved web task remains at its existing `handoff_pending` boundary; no model turn was replayed automatically.
+
+## App review tools for agents
+
+A native agent's shell has no network, so it cannot start a server and open it. Each native task is therefore offered Relay tools (Codex dynamic tools, answered by Relay through `item/tool/call`):
+
+| Tool | What it does |
+| --- | --- |
+| `run_app` | Starts a command from the agent's private worktree under a separate Seatbelt profile that may listen only on its assigned `127.0.0.1` port(s). `PORT`/`HOST` are set; a hard-coded port can be requested. |
+| `http_request` | Sends an HTTP request to the app and returns status, headers and body. |
+| `view_page` | Renders a page in headless Chrome over a private DevTools pipe and returns visible text, console messages, uncaught errors, failed requests and a screenshot. |
+| `app_logs`, `stop_app` | Shows the app's output; stops its whole process group. |
+
+The app sandbox reuses the preview policy: reads only system paths, the Python runtime, the approved toolchain and the worktree (never `.git`, `.relay` or `.env` files); network only on the assigned ports. Ports already in use, including Relay's, are refused before any project code runs. Seatbelt's port rule cannot distinguish loopback from LAN peers, so while an app runs Relay also holds the all-interfaces addresses (`0.0.0.0`/`::`) on its ports: a server bound to all interfaces fails with "address in use" (the tool explains how to bind `127.0.0.1`), and nothing is reachable through the machine's network address. Servers bound to `127.0.0.1` with address reuse (the default for Python's HTTP servers, Node, Django and Flask) work normally. Chrome uses a fresh temporary profile and a closed proxy that only the app's ports bypass, so page scripts cannot reach other local services or the Internet; external fonts and embeds are expected to fail. The app is stopped when the task ends. Codex's own network settings were not loosened: its permission profiles offer either no network or full network, with no loopback-only option. Tool calls appear in the task's activity as `tool_invocation`/`tool_output` events on the `app_review` channel. Requires macOS; `view_page` additionally needs Google Chrome (or `RELAY_REVIEW_BROWSER`).

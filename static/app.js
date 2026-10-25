@@ -177,7 +177,7 @@ async function load(force = false) {
     if(version!==viewVersion || serial!==refreshSerial)return;
     showWorkspaceIdentity(nextOverview);
     const nextProject=nextOverview.projects.some(item=>item.id===project)?project:nextOverview.projects[0]?.id;
-    if(!nextProject){invalidateView();RelayIDE.signOut();overview=nextOverview;project=null;$('project').innerHTML='';$('timeline').innerHTML='<div class="empty">No authorized projects.</div>';return;}
+    if(!nextProject){invalidateView();RelayIDE.signOut();overview=nextOverview;project=null;$('project').innerHTML='';$('timeline').innerHTML='<div class="empty">No authorized projects.</div>';renderProjects();return;}
     const [listed,taskList]=await Promise.all([
       api('ide/conversations?'+new URLSearchParams({project_id:nextProject})),
       nextOverview.features?.agent_management?api('tasks?'+new URLSearchParams({project_id:nextProject})):Promise.resolve({tasks:[]})
@@ -460,7 +460,8 @@ function renderConversation() {
 }
 
 function renderConversations() {
-  $('conversationList').innerHTML=conversations.filter(item=>!item.archived_at || $('showArchived').checked || item.id===detail?.conversation.id).map(item => `<div class="conversation-row"><button class="conversation ${item.id===detail?.conversation.id ? 'selected' : ''}" data-conversation="${esc(item.id)}"><span>◉</span><div><strong>${esc(item.title)}${item.archived_at?' · Archived':''}</strong><small>${esc(item.latest_task ? workerName(item.latest_task.worker_id || item.latest_task.requested_worker_id)+' · '+item.latest_task.state : 'No task yet')}<br>${esc(item.updated_at ? new Date(item.updated_at).toLocaleDateString() : '')} · ${esc(item.event_count)} events saved<br>${esc((item.participants || []).map(worker=>worker.name).join(', ') || 'No agent participants yet')}</small></div></button><div class="conversation-actions"><button data-rename-conversation="${esc(item.id)}" ${!currentCanWrite()?'disabled':''}>Rename</button><button data-archive-conversation="${esc(item.id)}" ${!currentCanWrite()?'disabled':''}>${item.archived_at?'Restore':'Archive'}</button></div></div>`).join('');
+  renderProjects();
+  $('conversationList').innerHTML=conversations.filter(item=>!item.archived_at || $('showArchived').checked || item.id===detail?.conversation.id).map(item => `<div class="conversation-row"><button class="conversation ${item.id===detail?.conversation.id ? 'selected' : ''}" data-conversation="${esc(item.id)}"><span>◉</span><div><strong>${esc(item.title)}${item.archived_at?' · Archived':''}</strong><small>${esc(item.latest_task ? workerName(item.latest_task.worker_id || item.latest_task.requested_worker_id)+' · '+item.latest_task.state : 'No task yet')}<br>${esc(item.updated_at ? new Date(item.updated_at).toLocaleDateString() : '')} · ${esc(item.event_count)} events saved<br>${esc((item.participants || []).map(worker=>worker.name).join(', ') || 'No agent participants yet')}</small></div></button><div class="conversation-actions"><button data-rename-conversation="${esc(item.id)}" ${!currentCanWrite()?'disabled':''}>Rename</button><button data-archive-conversation="${esc(item.id)}" ${!currentCanWrite()?'disabled':''}>${item.archived_at?'Restore':'Archive'}</button>${overview.features?.handoff_export?`<button data-copy-handoff="${esc(item.id)}" title="Copy a HANDOFF.md of this conversation's work, to continue it with another agent">Copy HANDOFF.md</button><button data-download-handoff="${esc(item.id)}" title="Save this conversation's HANDOFF.md">Download</button>`:''}</div></div>`).join('');
   document.querySelectorAll('[data-conversation]').forEach(button => button.onclick=() => selectConversation(button.dataset.conversation).catch(showError));
   document.querySelectorAll('[data-rename-conversation]').forEach(button=>button.onclick=async()=>{
     const item=conversations.find(row=>row.id===button.dataset.renameConversation),title=window.prompt('Conversation title',item.title);if(!title?.trim())return;
@@ -640,6 +641,68 @@ $('project').onchange = async () => {
   await load(true).catch(showError);
 };
 $('user').onchange = login;
+
+// A portable HANDOFF.md lets any agent, inside Relay or not, continue a conversation's work.
+function saveHandoff(handoff) {
+  const url = URL.createObjectURL(new Blob([handoff.content], {type: 'text/markdown'}));
+  const link = document.createElement('a'); link.href = url; link.download = handoff.filename; link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+document.addEventListener('click', async event => {
+  const button = event.target.closest('[data-copy-handoff],[data-download-handoff]');
+  if (!button) return;
+  const id = button.dataset.copyHandoff || button.dataset.downloadHandoff;
+  const handoff = api('conversations/' + encodeURIComponent(id) + '/handoff');
+  try {
+    if (button.dataset.downloadHandoff) { saveHandoff(await handoff); showNotice('HANDOFF.md downloaded.'); return; }
+    try {
+      // Safari only allows clipboard writes inside the click, so hand it a promise.
+      if (window.ClipboardItem && navigator.clipboard?.write) await navigator.clipboard.write([new ClipboardItem({'text/plain': handoff.then(value => new Blob([value.content], {type: 'text/plain'}))})]);
+      else await navigator.clipboard.writeText((await handoff).content);
+      showNotice('HANDOFF.md copied. Paste it into your agent, or save it in the project folder for your agent to read.');
+    } catch (failure) {
+      saveHandoff(await handoff);  // rethrows a real request failure
+      showNotice('Clipboard access was blocked, so HANDOFF.md was downloaded instead.');
+    }
+  } catch (failure) { showError(failure); }
+});
+
+function renderProjects() {
+  $('projectList').innerHTML = (overview?.projects || []).map(item => `<div class="conversation-row"><button class="conversation ${item.id === project ? 'selected' : ''}" data-open-project="${esc(item.id)}"><span>▱</span><div><strong>${esc(item.name)}</strong><small>${item.id === project ? 'Open now · ' : ''}${esc(item.role === 'admin' ? 'Administrator' : item.role)}</small></div></button>${item.role === 'admin' ? `<div class="conversation-actions"><button class="danger" data-delete-project="${esc(item.id)}">Delete</button></div>` : ''}</div>`).join('') || '<div class="empty">No projects yet.</div>';
+}
+let deletingProject = null;
+document.addEventListener('click', event => {
+  const open = event.target.closest('[data-open-project]');
+  if (open && open.dataset.openProject !== project && !busy) { $('project').value = open.dataset.openProject; $('project').dispatchEvent(new Event('change')); }
+  const remove = event.target.closest('[data-delete-project]');
+  if (remove && !busy) openDeleteProject(remove.dataset.deleteProject);
+});
+function openDeleteProject(id) {
+  deletingProject = overview?.projects.find(item => item.id === id);
+  if (!deletingProject) return;
+  $('deleteProjectExpected').textContent = deletingProject.name;
+  $('deleteProjectSummary').textContent = 'This permanently deletes the files of "' + deletingProject.name + '", its saved drafts and the agents\' private copies of it. Queued or paused tasks are cancelled. Its activity history stays in Relay\'s database but can no longer be opened.';
+  $('deleteProjectName').value = ''; $('deleteProjectError').textContent = ''; $('confirmDeleteProject').disabled = true;
+  $('deleteProjectDialog').showModal(); $('deleteProjectName').focus();
+}
+$('deleteProjectName').oninput = () => { $('confirmDeleteProject').disabled = $('deleteProjectName').value !== deletingProject?.name; };
+$('cancelDeleteProject').onclick = () => $('deleteProjectDialog').close();
+$('deleteProjectForm').onsubmit = async event => {
+  event.preventDefault();
+  if (!deletingProject || busy) return;
+  const target = deletingProject;
+  busy = true; $('confirmDeleteProject').disabled = true;
+  try {
+    const result = await api('projects/delete', {project_id: target.id, confirm_name: $('deleteProjectName').value, request_id: crypto.randomUUID()});
+    $('deleteProjectDialog').close(); deletingProject = null;
+    if (target.id === project) { project = overview.projects.find(item => item.id !== target.id)?.id || null; loading = false; invalidateView(); }
+    await load(true);
+    showNotice('Deleted "' + target.name + '".' + (result.cancelled_tasks ? ' Cancelled ' + result.cancelled_tasks + ' unfinished task' + (result.cancelled_tasks === 1 ? '' : 's') + '.' : '') +
+      (result.files_not_removed?.length ? ' Some files could not be removed: ' + result.files_not_removed.join(', ') : ''));
+  } catch (failure) { $('deleteProjectError').textContent = failure.message; $('confirmDeleteProject').disabled = false; }
+  finally { busy = false; if (detail) render(); }
+};
+$('newProjectPane').onclick = () => $('newProject').click();
 $('newProject').onclick = async () => {
   if (busy) return;
   const name = window.prompt('Project name');

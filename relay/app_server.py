@@ -22,6 +22,8 @@ class AppServerClient:
                                       cwd=cwd,env=env,start_new_session=True,bufsize=0)
         self.responses={};self.notifications=queue.Queue(maxsize=4096)
         self.guard=threading.Lock();self.write_guard=threading.Lock();self.serial=0;self.closed=False
+        # Set by the adapter while a task offers Relay's own tools (item/tool/call).
+        self.tool_handler=None
         self.reader=threading.Thread(target=self._read,daemon=True);self.reader.start()
         self.stderr_reader=threading.Thread(target=self._discard_stderr,daemon=True);self.stderr_reader.start()
     def _discard_stderr(self):
@@ -47,6 +49,9 @@ class AppServerClient:
                         self.send({'id':message['id'],'result':{'decision':'decline'}})
                     elif method=='item/tool/requestUserInput':
                         self.send({'id':message['id'],'result':{'answers':{}}})
+                    elif method=='item/tool/call' and self.tool_handler:
+                        # Tools can take seconds; never block this reader.
+                        threading.Thread(target=self._call_tool,args=(self.tool_handler,message),daemon=True).start()
                     else:self.send({'id':message['id'],'error':{'code':-32601,'message':'Relay does not grant this capability'}})
                 elif 'method' in message:
                     method=message.get('method','')
@@ -59,6 +64,11 @@ class AppServerClient:
                 for pending in self.responses.values():
                     try:pending.put_nowait({'error':{'message':'Local App Server disconnected'}})
                     except queue.Full:pass
+    def _call_tool(self,handler,message):
+        try:result=handler(message.get('params') or {})
+        except Exception as exc:result={'contentItems':[{'type':'inputText','text':'Relay tool failed: '+clean(str(exc))[:500]}],'success':False}
+        try:self.send({'id':message['id'],'result':result})
+        except AppServerError:pass
     def send(self,message):
         data=(json.dumps(message,separators=(',',':'))+'\n').encode()
         with self.write_guard:

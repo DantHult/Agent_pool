@@ -42,6 +42,7 @@ def migrate(db):
         migrate_live(db)
         migrate_management(db)
         migrate_reservation_leases(db)
+        migrate_project_deletion(db)
         return
     timestamp=datetime.now(timezone.utc).isoformat()
     db.execute('BEGIN IMMEDIATE')
@@ -81,6 +82,7 @@ def migrate(db):
     migrate_live(db)
     migrate_management(db)
     migrate_reservation_leases(db)
+    migrate_project_deletion(db)
 
 
 def migrate_live(db):
@@ -194,6 +196,19 @@ def migrate_reservation_leases(db):
         db.execute('ALTER TABLE human_workspace_locks ADD COLUMN heartbeat_at REAL')
         db.execute('ALTER TABLE human_workspace_locks ADD COLUMN label TEXT')
         db.execute('INSERT INTO schema_migrations VALUES(9,?)',(datetime.now(timezone.utc).isoformat(),))
+        db.execute('COMMIT')
+    except Exception:
+        db.execute('ROLLBACK');raise
+
+
+def migrate_project_deletion(db):
+    if db.execute('SELECT 1 FROM schema_migrations WHERE version=10').fetchone():return
+    db.execute('BEGIN IMMEDIATE')
+    try:
+        # A deleted project keeps its row so append-only events and audit
+        # entries still name a real project; Relay refuses all access to it.
+        db.execute('ALTER TABLE projects ADD COLUMN deleted_at TEXT')
+        db.execute('INSERT INTO schema_migrations VALUES(10,?)',(datetime.now(timezone.utc).isoformat(),))
         db.execute('COMMIT')
     except Exception:
         db.execute('ROLLBACK');raise

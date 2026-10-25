@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from .store import Relay
+from .handoff import export_handoff
 from .auth import LocalDemoIdentityProvider
 from .accounts import InviteIdentityProvider,LoginRequired,csrf_token,digest
 from .config import load_env_file
@@ -156,6 +157,7 @@ class Handler(BaseHTTPRequestHandler):
                         return self.reply(200,files[name].encode(),'text/plain; charset=utf-8',extra={'Content-Disposition':'attachment; filename="'+filename+'"'})
                 elif re.fullmatch(r'/api/projects/[^/]+',path):result=relay.detail(user,path.split('/')[-1],q.get('conversation_id',[None])[0],q.get('light',['0'])[0]=='1')
                 elif re.fullmatch(r'/api/tasks/[^/]+/result',path):result=relay.execution_result(user,path.split('/')[3])
+                elif re.fullmatch(r'/api/conversations/[^/]+/handoff',path):result=export_handoff(relay,user,path.split('/')[3])
                 elif re.fullmatch(r'/api/conversations/[^/]+/events',path):result=relay.events(user,path.split('/')[3],int(q.get('after',['0'])[0]),int(q.get('limit',['50'])[0]),int(q['before'][0]) if 'before' in q else None,q.get('recent',['0'])[0]=='1')
                 elif re.fullmatch(r'/api/artifacts/[^/]+',path):result=relay.artifact(user,path.split('/')[-1])
                 elif path=='/api/organization/members':

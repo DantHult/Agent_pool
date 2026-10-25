@@ -1,5 +1,6 @@
 """Only fixed, trusted demo files and commands are executed."""
 import os
+import shutil
 import subprocess
 import sys
 import json
@@ -28,6 +29,17 @@ class ValidatorTests(unittest.TestCase):
 
 # POSIX dir_fd + O_NOFOLLOW TOCTOU defenses; Windows uses path-based checks with O_NOFOLLOW opens.
 _USE_DIR_FD = os.name != 'nt' and hasattr(os, 'O_DIRECTORY') and hasattr(os, 'O_NOFOLLOW')
+
+
+def remove_tree(path):
+    """rmtree that also clears read-only files (Git objects on Windows)."""
+    def retry(function, name, _):
+        os.chmod(name, stat.S_IWRITE)
+        function(name)
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=retry)
+    else:
+        shutil.rmtree(path, onerror=retry)
 
 
 class Workspace:
@@ -316,6 +328,16 @@ class Workspace:
                 self._atomic_write(fd, '.gitignore', b'__pycache__/\n.relay/history/\n')
             self.checkpoint(project, 'Initialize demo')
         return p
+
+    def remove(self, project):
+        """Permanently delete one project's workspace directory."""
+        if not isinstance(project, str) or not project.isalnum():
+            raise ValueError('Invalid project ID')
+        target = self.root / project
+        if target.is_symlink():
+            target.unlink()  # never follow it out of the workspace root
+        elif target.is_dir():
+            remove_tree(target)
 
     def _path_portable(self, project):
         p = self._project_path(project)

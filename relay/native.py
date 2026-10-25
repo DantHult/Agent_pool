@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import tempfile
@@ -20,7 +21,7 @@ from .app_server import AppServerClient,AppServerError,PERMISSION_NAME,sandbox_p
 from .codex_events import progress_from_message
 from .fs_lock import current_uid, host_path, null_device, try_exclusive_lock, which_git
 from .security import clean,scrub
-from .workspace import Workspace
+from .workspace import Workspace, remove_tree
 from .native_environment import RUNTIME_NAMES,create_shell_profile,hydrate,toolchain,toolchain_signature,workspace_environment
 
 PROFILE_IDS=('a','b','c')
@@ -42,9 +43,24 @@ def initialize_profiles():
             if path.is_symlink():raise ValueError('Native directories must not be symlinks')
             path.mkdir(parents=True,exist_ok=True);path.chmod(0o700)
 
-def thread_options(working):
+def remove_private_workspace(profile, identity):
+    """Delete one task's private clone of a project, if it still exists."""
+    if profile not in PROFILE_IDS or not isinstance(identity, str) or not re.fullmatch('[0-9a-f]{32}', identity):return False
+    target=profile_paths(profile)[1]/identity
+    if target.is_symlink() or not target.is_dir():return False
+    remove_tree(target);return True
+
+# Offered with Relay's app review tools; the shell itself still has no network.
+REVIEW_INSTRUCTIONS=('To review an app you build, call run_app to start it (your shell cannot open ports; servers must listen on 127.0.0.1 using $HOST and $PORT), then use http_request and view_page '
+                     '(visible text, console messages, JavaScript errors and a screenshot) and app_logs; call stop_app when done. '
+                     'Do not report blocked only because your shell cannot start a server. If the app cannot run even with these tools, list that under limitations. ')
+
+def thread_options(working,tools=False):
     params={'cwd':str(working),'runtimeWorkspaceRoots':[str(working)],'permissions':PERMISSION_NAME,'approvalPolicy':'never','ephemeral':True,
             'config':{'shell_environment_policy.set':workspace_environment(working)}}
+    if tools:
+        from .app_review import TOOLS
+        params['dynamicTools']=TOOLS
     if os.environ.get('RELAY_NATIVE_MODEL'):params['model']=os.environ['RELAY_NATIVE_MODEL']
     return params
 
@@ -374,13 +390,17 @@ class NativeCodexAdapter:
         if not session.lock.acquire(timeout=PROBE_WAIT_SECONDS):
             session.executing=False
             return ExecutionResult('failed','Native profile is busy',error_category='worker_busy')
+        review=None
         try:
             session.auth();client=session.connect();client.drain()
             working,expected=self._prepare(workspace)
+            from . import app_review
+            if app_review.available():
+                review=app_review.AppReview(working,emit);client.tool_handler=review.handle
             environment=json.loads((working/'.native/environment.json').read_text())
             emit('native_environment',environment['message'],environment)
             session.permissions(working)
-            native=client.request('thread/start',thread_options(working))['thread']['id']
+            native=client.request('thread/start',thread_options(working,bool(review)))['thread']['id']
             emit('session_started','Started a fresh native Codex thread',{'native_thread_id':native,'native_profile':self.profile,'workspace_id':working.name})
             phases=int(task.get('native_phases',2));index=int(task.get('execution_phase',0))
             boundary=bool(task.get('pause_after_turn')) and index<phases-1
@@ -388,6 +408,7 @@ class NativeCodexAdapter:
             text=('Work only in the current private workspace. Read .relay/HANDOFF.md and relevant .relay/history. Never read or request authentication credentials. '
                   'Git checkpoints are managed by Relay; do not modify .git or .relay. Use python/python3 from PATH and the approved node/npm on PATH. '
                   'Read .native/environment.json for dependency readiness. Package downloads are disabled; do not retry network installation. '
+                  +(REVIEW_INSTRUCTIONS if review else '')+
                   'Stay within the original authorization. Report completion_state=continue with concrete pending_steps only when useful authorized work remains. '
                   'Report blocked for missing dependencies or genuine obstacles, needs_authorization for out-of-scope permissions, uncertain for ambiguous completion. '
                   'Report completed only when all acceptance criteria are met and include concrete acceptance_evidence, completed_work and actual test_results. '+phase+'\n\nOriginal request:\n'+task['objective']+'\n\nWorking context:\n'+json.dumps(context)[:30000])
@@ -442,12 +463,12 @@ class NativeCodexAdapter:
                     raise ValueError('Continuation checkpoint was not acknowledged; no turn replayed')
                 expected=self._align(workspace,working);saved_context=saved
                 if context_restart:
-                    native=client.request('thread/start',thread_options(working))['thread']['id']
+                    native=client.request('thread/start',thread_options(working,bool(review)))['thread']['id']
                     emit('session_started','Context boundary: new thread on the same native profile, with saved checkpoint and instructions',{'native_thread_id':native,'native_profile':self.profile,'workspace_id':working.name})
                 turn_index+=1
                 text=('Continue the same original authorized objective below. Inspect the saved context and files; preserve completed work. '
                       'The previous turn ended at an intermediate checkpoint, not task completion. Do remaining steps and actual tests. '
-                      'Stop with blocked or needs_authorization when appropriate. Do not request routine permission already granted.\nOriginal request:\n'+task['objective']+'\nSaved progress:\n'+json.dumps(saved)[:30000])
+                      'Stop with blocked or needs_authorization when appropriate. Do not request routine permission already granted. '+(REVIEW_INSTRUCTIONS if review else '')+'\nOriginal request:\n'+task['objective']+'\nSaved progress:\n'+json.dumps(saved)[:30000])
                 emit('continuation','Continuing the unfinished objective on the same worker and native thread',{'native_thread_id':native,'turn_index':turn_index,'checkpoint':expected})
             result.duration_ms=int((time.monotonic()-started)*1000)
             return result
@@ -459,5 +480,10 @@ class NativeCodexAdapter:
             except (OSError,subprocess.SubprocessError):safe=False
             return ExecutionResult('failed','Native execution failed: '+detail+'. Private work retained for review.',native,safe_to_release=safe,error_category='native_runtime_error',duration_ms=int((time.monotonic()-started)*1000))
         finally:
+            if review:
+                # The app never outlives the task that started it.
+                client.tool_handler=None
+                try:review.close()
+                except (OSError,subprocess.SubprocessError):pass
             self._active.pop(task['id'],None);session.executing=False;session.lock.release()
     resume=start
