@@ -62,7 +62,7 @@ This means `npm install` and Python package downloads cannot fetch new dependenc
 
 Changes made by a command initially exist only in its private snapshot. **Apply & checkpoint** checks the original Git HEAD and a digest of all captured project source and permissions. It refuses to apply if saved project files changed, an editor draft exists, the reservation changed, or execution has not confirmed completion. Successful publication creates a canonical checkpoint and updates a paused task's versioned working context. It closes that console snapshot. Closing a console without applying leaves canonical files untouched; retained private work is not automatically replayed or published after a restart.
 
-Git in the command snapshot is read-only. Use the constrained **Source Control** API for canonical Git writes:
+Git inside the private command runner remains inspection-only. The development terminal now recognizes typed Git commands and routes supported writes to the same constrained canonical API as **Source Control**; see [TERMINAL_AND_STARTUP.md](TERMINAL_AND_STARTUP.md). Supported canonical operations:
 
 | Operation | Supported arguments |
 | --- | --- |

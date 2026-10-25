@@ -35,6 +35,7 @@ let conversations = [];
 let projectTasks = [];
 let assignmentTarget = '';
 let activityFrame = null;
+let hasOlderActivity=false, activityLoading=false, workersLoading=false, workerTimer=null, artifactLoading=false;
 const activityView = new RelayActivity.View($('timeline'), workerName);
 
 const esc = value => String(value ?? '').replace(/[&<>"']/g, character => ({
@@ -119,6 +120,7 @@ function invalidateView() {
   selectedConversation = null;
   conversations = [];
   projectTasks = [];
+  hasOlderActivity=false;activityLoading=false;workersLoading=false;artifactLoading=false;clearTimeout(workerTimer);
   activityView.reset(null);
   selectedStartWorker = '';
   selectedTarget = '';
@@ -165,74 +167,87 @@ async function login() {
 
 async function load(force = false) {
   if (loading && !force) return;
-  const version = viewVersion;
-  const serial = ++refreshSerial;
-  loading = true;
-  if (!detail) setControlsDisabled(true);
+  const version=viewVersion,serial=++refreshSerial;
+  loading=true;if(!detail)setControlsDisabled(true);
   try {
-    const nextOverview = await api('overview');
+    const nextOverview=await api('overview?light=1');
+    if(version!==viewVersion || serial!==refreshSerial)return;
     showWorkspaceIdentity(nextOverview);
-    if (version !== viewVersion || serial !== refreshSerial) return;
-    const nextProject = nextOverview.projects.some(item => item.id === project)
-      ? project : nextOverview.projects[0]?.id;
-    if (authMode === 'local-owner') {
-      nativeProfiles = await api('native/profiles' + (nextProject ? '?project_id=' + encodeURIComponent(nextProject) : ''));
-      renderNativeProfiles(nextProject);
+    const nextProject=nextOverview.projects.some(item=>item.id===project)?project:nextOverview.projects[0]?.id;
+    if(!nextProject){invalidateView();RelayIDE.signOut();overview=nextOverview;project=null;$('project').innerHTML='';$('timeline').innerHTML='<div class="empty">No authorized projects.</div>';return;}
+    const [listed,taskList]=await Promise.all([
+      api('ide/conversations?'+new URLSearchParams({project_id:nextProject})),
+      nextOverview.features?.agent_management?api('tasks?'+new URLSearchParams({project_id:nextProject})):Promise.resolve({tasks:[]})
+    ]);
+    if(version!==viewVersion || serial!==refreshSerial)return;
+    conversations=listed.conversations;projectTasks=taskList.tasks;
+    const remembered=sessionStorage.getItem('relay-conversation:'+nextOverview.user.id+':'+nextProject);
+    const choice=[selectedConversation,remembered].find(id=>conversations.some(item=>item.id===id)) || conversations.find(item=>!item.archived_at)?.id || conversations[0]?.id;
+    const nextDetail=await api('projects/'+encodeURIComponent(nextProject)+'?'+new URLSearchParams({conversation_id:choice || '',light:'1'}));
+    if(version!==viewVersion || serial!==refreshSerial)return;
+    const conversation=nextDetail.conversation.id,changed=lastConversation!==conversation;
+    if(changed){clearHistory();events=[];hasOlderActivity=false;activityLoading=true;activityView.reset(conversation);selectedStartWorker='';selectedTarget='';}
+    nextDetail.workers=detail?.conversation.id===conversation?detail.workers:[];nextDetail.workersLoaded=detail?.conversation.id===conversation && detail.workersLoaded;
+    if(!changed && detail && !detail.light && detail.workspace.checkpoint===nextDetail.workspace.checkpoint)Object.assign(nextDetail,{light:false,workspace:detail.workspace,contexts:detail.contexts,handoffs:detail.handoffs,execution_runs:detail.execution_runs,assignments:detail.assignments});
+    overview=nextOverview;detail=nextDetail;project=nextProject;selectedConversation=conversation;lastConversation=conversation;
+    sessionStorage.setItem('relay-conversation:'+overview.user.id+':'+project,conversation);
+    const options=overview.projects.map(item=>`<option value="${esc(item.id)}">${esc(item.name)}</option>`).join('');
+    if($('project').innerHTML!==options)$('project').innerHTML=options;
+    $('project').value=project;$('user').value=overview.user.id;
+    render(); // Files/editor no longer wait for provider probes or event history.
+    loadActivity(conversation,version,changed).catch(showError);
+    if(changed || !workersLoading) {
+      clearTimeout(workerTimer);
+      workerTimer=setTimeout(()=>loadWorkers(version,project).catch(showError),changed?150:0);
     }
-    if (!nextProject) {
-      invalidateView();RelayIDE.signOut();loading=false;
-      overview = nextOverview;
-      project = null;
-      $('project').innerHTML = '';
-      $('timeline').innerHTML = '<div class="empty">No projects are authorized for this identity.</div>';
-      return;
-    }
-    const listed = await api('ide/conversations?' + new URLSearchParams({project_id:nextProject}));
-    const tasks = nextOverview.features?.agent_management ? await api('tasks?' + new URLSearchParams({project_id:nextProject})) : {tasks:[]};
-    if (version !== viewVersion || serial !== refreshSerial) return;
-    conversations = listed.conversations;
-    projectTasks = tasks.tasks;
-    const remembered = sessionStorage.getItem('relay-conversation:' + nextOverview.user.id + ':' + nextProject);
-    const choice = [selectedConversation,remembered].find(id => conversations.some(item => item.id === id)) || conversations.find(item=>!item.archived_at)?.id || conversations[0]?.id;
-    const nextDetail = await api('projects/' + encodeURIComponent(nextProject) + (choice ? '?conversation_id=' + encodeURIComponent(choice) : ''));
-    if (version !== viewVersion || serial !== refreshSerial) return;
-    const conversation = nextDetail.conversation.id;
-    const nextEvents = lastConversation === conversation ? [...events] : [];
-    let after = nextEvents.length ? nextEvents[nextEvents.length - 1].sequence : 0;
-    while (true) {
-      const page = await api(`conversations/${encodeURIComponent(conversation)}/events?after=${after}&limit=100`);
-      if (version !== viewVersion || serial !== refreshSerial) return;
-      nextEvents.push(...page.events);
-      if (page.events.length < 100) break;
-      after = page.next_after;
-    }
-    if (version !== viewVersion || serial !== refreshSerial) return;
-    if (lastConversation !== conversation) {
-      clearHistory();
-      selectedStartWorker = '';
-      selectedTarget = '';
-    }
-    overview = nextOverview;
-    detail = nextDetail;
-    project = nextProject;
-    const merged = new Map([...nextEvents, ...events.filter(event => event.conversation_id === conversation)].map(event => [event.event_id || event.sequence,event]));
-    events = [...merged.values()].sort((a,b) => a.sequence-b.sequence);
-    selectedConversation = conversation;
-    sessionStorage.setItem('relay-conversation:' + nextOverview.user.id + ':' + nextProject, conversation);
-    lastConversation = conversation;
-    subscribe(conversation, nextEvents.length ? nextEvents[nextEvents.length - 1].sequence : 0);
-    $('project').innerHTML = overview.projects.map(item =>
-      `<option value="${esc(item.id)}">${esc(item.name)}</option>`).join('');
-    $('project').value = project;
-    $('user').value = overview.user.id;
-    render();
   } finally {
-    if (version === viewVersion && serial === refreshSerial) {
-      loading = false;
-      setControlsDisabled(busy);
-      if (authMode === 'local-owner') renderNativeProfiles();
-    }
+    if(version===viewVersion && serial===refreshSerial){loading=false;setControlsDisabled(busy);}
   }
+}
+
+async function loadActivity(conversation,version,changed) {
+  if(activityLoading && !changed)return;
+  activityLoading=true;
+  try {
+    let after=events.at(-1)?.sequence || 0;
+    const recent=changed && overview.features?.recent_history;
+    let page=await api(`conversations/${encodeURIComponent(conversation)}/events?limit=100&${recent?'recent=1':'after='+after}`);
+    while(true) {
+      if(version!==viewVersion || lastConversation!==conversation)return;
+      if(recent)hasOlderActivity=page.has_older===true;
+      const merged=new Map([...events,...page.events].map(event=>[event.event_id,event]));events=[...merged.values()].sort((a,b)=>a.sequence-b.sequence);
+      renderConversation();after=events.at(-1)?.sequence || after;subscribe(conversation,after);
+      if(recent || page.events.length<100)break;
+      await new Promise(resolve=>setTimeout(resolve,0));
+      page=await api(`conversations/${encodeURIComponent(conversation)}/events?limit=100&after=${after}`);
+    }
+  }finally{if(version===viewVersion){activityLoading=false;renderConversation();}}
+}
+
+async function loadWorkers(version,selectedProject) {
+  if(version!==viewVersion || project!==selectedProject || workersLoading)return;
+  // Wait for the editor's lightweight workspace request before optional probes.
+  if(!RelayIDE.getState()){workerTimer=setTimeout(()=>loadWorkers(version,selectedProject).catch(showError),100);return;}
+  workersLoading=true;
+  try {
+    const [directory,profiles]=await Promise.all([
+      api('workers?'+new URLSearchParams({project_id:selectedProject,cached:'1'})),
+      authMode==='local-owner'?api('native/profiles?'+new URLSearchParams({project_id:selectedProject,cached:'1'})):Promise.resolve(null)
+    ]);
+    if(version!==viewVersion || project!==selectedProject)return;
+    detail.workers=directory.workers;detail.workersLoaded=true;overview.workers=directory.workers;nativeProfiles=profiles;render();
+    if(directory.workers.some(worker=>worker.health?.status==='checking') || profiles?.profiles.some(profile=>profile.status==='checking'))workerTimer=setTimeout(()=>loadWorkers(version,selectedProject).catch(showError),500);
+  }finally{workersLoading=false;}
+}
+
+async function loadArtifacts() {
+  if(!detail?.light || artifactLoading)return;
+  const version=viewVersion,selectedProject=project,conversation=detail.conversation.id;artifactLoading=true;
+  try {
+    const full=await api('projects/'+encodeURIComponent(project)+'?'+new URLSearchParams({conversation_id:conversation}));
+    if(version!==viewVersion || project!==selectedProject || detail.conversation.id!==conversation)return;
+    detail={...full,workers:detail.workers};renderArtifact();
+  }catch(error){showError(error);}finally{artifactLoading=false;}
 }
 
 function renderWorker(worker, task) {
@@ -256,12 +271,12 @@ function renderWorker(worker, task) {
 function renderWorkerSelectors(workers, task) {
   const startOptions = workers.filter(worker => worker.execution_mode !== 'personal_supported' &&
     (eligible(worker) || (['organization_api', 'native'].includes(worker.execution_mode) && worker.authorized === true)));
-  if (!startOptions.some(worker => worker.id === selectedStartWorker)) selectedStartWorker = '';
+  // Explicit selection can precede the deferred directory response. Keep its identity.
   $('startWorker').innerHTML = '<option value="">Choose an eligible worker automatically</option>' + startOptions.map(worker =>
     `<option value="${esc(worker.id)}">${esc(worker.display_name || worker.name)} · ${esc(executionModes[worker.execution_mode] || worker.execution_mode)}${eligible(worker) ? '' : ' · queued until runtime ready'}</option>`).join('');
   $('startWorker').value = selectedStartWorker;
   const targetOptions = workers.filter(worker => eligible(worker) && worker.id !== task?.worker_id && (!task || worker.execution_mode === task.execution_mode));
-  if (!targetOptions.some(worker => worker.id === selectedTarget)) selectedTarget = '';
+  // A freshly enrolled handoff target may not be in the cached directory yet.
   const targetPlaceholder = task?.execution_mode === 'native' ? 'Choose the next local profile explicitly' : 'Choose approved alternate automatically';
   $('switchTarget').innerHTML = `<option value="">${targetPlaceholder}</option>` + targetOptions.map(worker =>
     `<option value="${esc(worker.id)}">${esc(worker.display_name || worker.name)}</option>`).join('');
@@ -287,7 +302,7 @@ function renderWorkerActions(worker) {
 
 async function openTask(identity,conversationId,projectId=project) {
   if(busy)return;
-  if(projectId!==project){project=projectId;loading=false;invalidateView();selectedConversation=conversationId;await load(true);}
+  if(projectId!==project){await RelayIDE.leaveProject(true);project=projectId;loading=false;invalidateView();selectedConversation=conversationId;await load(true);}
   else await selectConversation(conversationId);
   if(identity)RelayIDE.pane('agents');
 }
@@ -365,7 +380,8 @@ function render() {
   renderConversation();
   renderConversations();
   document.body.classList.toggle('management-ready',!!overview.features?.agent_management);
-  $('workers').innerHTML = workers.length ? workers.map(worker => renderWorker(worker, task)).join('') : '<div class="empty">No workers are visible for this project. Enroll your own worker or ask an owner to approve this project.</div>';
+  const workerMarkup=workers.length?workers.map(worker=>renderWorker(worker,task)).join(''):(detail.workersLoaded?'<div class="empty">No enrolled workers. Use Add Agent to enroll a supported profile.</div>':'<div class="empty">Loading authorized worker readiness…</div>');
+  if($('workers').innerHTML!==workerMarkup)$('workers').innerHTML=workerMarkup;
   const nativeWorkerCount = workers.filter(worker => worker.execution_mode === 'native').length;
   const hasOrgWorkers = workers.some(worker => worker.execution_mode === 'organization_api');
   const liveNative = workers.filter(worker => worker.execution_mode === 'native' && worker.health?.available).length;
@@ -418,14 +434,16 @@ function render() {
   if (authMode==='local-owner' && !selectedStartWorker) document.querySelector('.send').disabled=true;
   RelayIDE.update({project,user:overview.user.id,conversation:detail.conversation.id,projectName:currentProject?.name || project,
     worker:task?.worker_id ? workerName(task.worker_id) : detail.tasks[0]?.worker_id ? workerName(detail.tasks[0].worker_id) : '',
-    automaticWorkflow:!!overview.features?.automatic_workflow,managementAvailable:!!overview.features?.agent_management,checkpoints:detail.checkpoints,state:task?.state || detail.tasks[0]?.state,objective:task?.objective || detail.tasks[0]?.objective,checkpoint:detail.workspace.checkpoint,
+    developmentTerminal:!!overview.features?.development_terminal,automaticWorkflow:!!overview.features?.automatic_workflow,managementAvailable:!!overview.features?.agent_management,checkpoints:detail.checkpoints,state:task?.state || detail.tasks[0]?.state,objective:task?.objective || detail.tasks[0]?.objective,checkpoint:detail.workspace.checkpoint,
     selectedWorker:workers.find(worker => worker.id === selectedStartWorker)?.display_name || workers.find(worker => worker.id === selectedStartWorker)?.name}).catch(showError);
 }
 
 function renderConversation() {
   if (!detail) return;
   const state=activeTask()?.state || detail.tasks[0]?.state || 'ready';
-  activityView.render(events,detail.conversation.id,state);
+  if(activityLoading && !events.length)$('timeline').innerHTML='<div class="agent-empty">Loading recent conversation activity…</div>';
+  else activityView.render(events,detail.conversation.id,state);
+  $('loadOlderActivity').hidden=!hasOlderActivity;
   const latest=activityView.model.groups.slice().reverse().find(group => group.kind==='operation' && !group.complete);
   $('currentOperation').textContent=state==='running' ? latest ? latest.command || 'Receiving tool output' : 'Waiting for the next observable event' : state==='handoff_pending' ? 'Checkpoint saved · ready for explicit handoff' : state==='completed' ? 'Task completed' : state==='pausing' ? 'Stopping at a safe checkpoint…' : 'Waiting for your next task';
   $('operationIndicator').classList.toggle('spinning',state==='running');
@@ -493,6 +511,7 @@ function bindWorkerSettings() {
 
 function renderArtifact() {
   if (!detail) return;
+  if(detail.light && document.querySelector('.workspace-records').open){$('artifactBody').textContent='Loading saved workspace records…';loadArtifacts();return;}
   const workspace = detail.workspace;
   const context = detail.contexts?.[0];
   if (tab === 'context') {
@@ -566,7 +585,7 @@ $('demo').onclick = () => action('demo', {project_id: project}, 'Handoff demo re
 $('project').onchange = async () => {
   if (busy) return;
   const next=$('project').value;
-  try{await RelayIDE.leaveProject();}catch(error){$('project').value=project;showError(error);return;}
+  try{await RelayIDE.leaveProject(true);}catch(error){$('project').value=project;showError(error);return;}
   project = next;
   loading = false;
   invalidateView();
@@ -582,7 +601,7 @@ $('newProject').onclick = async () => {
   busy = true;
   setControlsDisabled(true);
   try {
-    await RelayIDE.leaveProject();
+    await RelayIDE.leaveProject(true);
     const created = await api('projects', {name, request_id: crypto.randomUUID()});
     project = created.id;
     loading = false;
@@ -591,6 +610,7 @@ $('newProject').onclick = async () => {
   } catch (failure) {
     showError(failure);
   } finally {
+    await RelayIDE.finishTransition().catch(showError);
     busy = false;
     setControlsDisabled(false);
     if (detail) render();
@@ -625,9 +645,21 @@ function renderRawHistory() {
   const filtered=historyEvents.filter(event=>(!type || event.event_type===type) && (!text || JSON.stringify(event).toLowerCase().includes(text)));
   $('history').textContent=filtered.map(event=>JSON.stringify(event,null,2)).join('\n\n');
 }
+$('loadOlderActivity').onclick=async()=>{
+  if(activityLoading || !detail || !events.length)return;
+  const version=viewVersion,conversation=detail.conversation.id,before=events[0].sequence;
+  $('loadOlderActivity').disabled=true;
+  try {
+    const page=await api(`conversations/${encodeURIComponent(conversation)}/events?limit=100&before=${before}`);
+    if(version!==viewVersion)return;
+    const merged=new Map([...page.events,...events].map(event=>[event.event_id,event]));events=[...merged.values()].sort((a,b)=>a.sequence-b.sequence);
+    hasOlderActivity=page.has_older===true;activityView.showOlder=true;renderConversation();
+  }catch(error){showError(error);}finally{$('loadOlderActivity').disabled=false;}
+};
+document.querySelector('.workspace-records').addEventListener('toggle',()=>{if(document.querySelector('.workspace-records').open)loadArtifacts();});
 $('eventFilter').oninput=renderRawHistory;
 $('eventTypeFilter').onchange=renderRawHistory;
-$('jumpLatest').onclick=()=>{$('timeline').scrollTop=$('timeline').scrollHeight;$('jumpLatest').hidden=true;};
+$('jumpLatest').onclick=()=>{activityView.windowEnd=null;renderConversation();$('timeline').scrollTop=$('timeline').scrollHeight;$('jumpLatest').hidden=true;};
 $('timeline').onscroll=()=>{$('jumpLatest').hidden=$('timeline').scrollHeight-$('timeline').clientHeight-$('timeline').scrollTop<100;};
 
 function renderEnrollmentMode() {
@@ -692,6 +724,7 @@ function renderNativeProfiles(selectedProject = project) {
     busy = true;
     try {
       const worker = await api('native/profiles/enroll', {profile: button.dataset.nativeProfile, project_id: selectedProject});
+      detail.workers=[...projectWorkers().filter(item=>item.id!==worker.id),worker];overview.workers=detail.workers;
       if (activeTask()) selectedTarget = worker.id;
       else selectedStartWorker = worker.id;
       await load(true);
@@ -760,7 +793,11 @@ function subscribe(conversation, after) {
     if (event.conversation_id!==conversation) return;
     if (!events.some(item=>item.event_id===event.event_id)) {
       events.push(event);events.sort((a,b)=>a.sequence-b.sequence);
-      if (event.event_type==='state') {const task=detail?.tasks.find(item=>item.id===event.task_id);if (task) task.state=event.content;}
+      const task=detail?.tasks.find(item=>item.id===event.task_id),meta=RelayActivity.metadata(event);
+      if(task){
+        if(Number.isInteger(meta.generation) && meta.generation>=task.generation){task.generation=meta.generation;if(event.worker_id)task.worker_id=event.worker_id;}
+        if(event.event_type==='state')task.state=event.content;
+      }
     }
     if (!activityFrame) activityFrame=requestAnimationFrame(()=>{activityFrame=null;renderConversation();});
     if (!['agent_delta','runtime_output','tool_invocation','tool_output'].includes(event.event_type) && !liveTimer) liveTimer=setTimeout(()=>{

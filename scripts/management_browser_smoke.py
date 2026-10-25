@@ -169,12 +169,13 @@ def main():
             async_calls=[]
             def old_overview(route):
                 response=route.fetch();data=response.json();data.pop('features',None);route.fulfill(response=response,json=data)
-            page.route('**/api/overview',old_overview)
+            page.route('**/api/overview*',old_overview)
             page.on('request',lambda request:async_calls.append(request.url) if '/api/tasks?' in request.url else None)
             page.reload();page.wait_for_function('() => !!window.RelayIDE?.getState()')
             assert page.locator('#newFolder').is_disabled()
+            assert page.locator('#runFile').is_disabled()
             assert not async_calls
-            page.unroute('**/api/overview',old_overview)
+            page.unroute('**/api/overview*',old_overview)
             report['checks'].append('Older running backend remains readable; new endpoint controls are disabled until restart')
 
             before=case.client.get('tasks?project_id='+case.project)['tasks']

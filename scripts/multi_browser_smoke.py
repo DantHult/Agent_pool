@@ -65,7 +65,7 @@ def run(data,chrome):
                 tab.reload();tab.wait_for_function("() => document.getElementById('taskState').textContent==='completed'")
                 assert tab.locator('#conversationId').inner_text()==conversation
                 tab.locator('#timeline .operation-card').evaluate_all('(nodes)=>nodes.forEach(node=>node.open=true)')
-                assert 'Ran 5 tests' in tab.locator('#timeline').inner_text()
+                tab.wait_for_function('() => document.getElementById("timeline").textContent.includes("Ran 5 tests")')
             with server.relay.lock:
                 detail=server.relay.detail(admin_id,project);task=detail['tasks'][0]
                 assert len(detail['execution_runs'])==3 and not server.relay.rows('SELECT * FROM workspace_leases')
@@ -88,7 +88,7 @@ def run(data,chrome):
                 tab.reload();tab.wait_for_function("() => document.getElementById('taskState').textContent==='completed'")
                 assert tab.locator('#conversationId').inner_text()==conversation
                 tab.locator('#timeline .operation-card').evaluate_all('(nodes)=>nodes.forEach(node=>node.open=true)')
-                assert 'Ran 5 tests' in tab.locator('#timeline').inner_text()
+                tab.wait_for_function('() => document.getElementById("timeline").textContent.includes("Ran 5 tests")')
             with server.relay.lock:restored=server.relay.detail(admin_id,project)
             assert restored['execution_runs']==detail['execution_runs'] and restored['checkpoints']==detail['checkpoints']
             alex.locator('[data-pane=agents]').click();alex.locator('.workspace-records summary').click();alex.locator('[data-tab=checkpoints]').click();alex.screenshot(path=str(directory/'three-browser-proof.png'),full_page=True)

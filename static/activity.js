@@ -106,22 +106,26 @@
     return group.meta.console_id ? 'Your command' : 'Running command';
   }
   class View {
-    constructor(container, names) { this.container = container; this.names = names; this.nodes = new Map(); this.model = new Projection(); this.limit = 180; this.conversation = null; this.consumed=0;this.lastSeen=null; }
-    reset(conversation) { this.conversation = conversation; this.model = new Projection(); this.nodes.clear(); this.container.replaceChildren();this.consumed=0;this.lastSeen=null; }
+    constructor(container, names) { this.container = container; this.names = names; this.nodes = new Map(); this.model = new Projection(); this.limit = 180; this.conversation = null; this.consumed=0;this.lastSeen=null;this.windowEnd=null;this.showOlder=false; }
+    reset(conversation) { this.conversation = conversation; this.model = new Projection(); this.nodes.clear(); this.container.replaceChildren();this.consumed=0;this.lastSeen=null;this.windowEnd=null; }
     render(events, conversation, state) {
       if (conversation !== this.conversation) this.reset(conversation);
       const nearBottom = this.container.scrollHeight - this.container.clientHeight - this.container.scrollTop < 100;
+      const previousCount=this.model.groups.length;
       if (this.consumed && events[this.consumed-1]?.event_id!==this.lastSeen) {this.model=new Projection();this.consumed=0;}
       const groups = this.model.append(events.slice(this.consumed));
+      if(this.showOlder){this.windowEnd=Math.max(1,groups.length-previousCount);this.showOlder=false;}
       this.consumed=events.length;this.lastSeen=events.at(-1)?.event_id;
       if (!groups.length) { this.container.innerHTML = '<div class="agent-empty"><span class="agent-empty-mark">⇄</span><h2>Build something together.</h2><p>Select a worker and describe your task.<br>Your files, progress and context stay here.</p></div>'; return; }
       this.container.querySelector('.agent-empty')?.remove();
-      const visible = groups.slice(-this.limit);
+      const end=this.windowEnd===null?groups.length:Math.min(this.windowEnd,groups.length),start=Math.max(0,end-this.limit);
+      const visible = groups.slice(start,end);
       const visibleKeys = new Set(visible.map(group => group.key));
       for (const [key, node] of this.nodes) if (!visibleKeys.has(key)) { node.remove(); this.nodes.delete(key); }
-      if (groups.length > this.limit && !this.container.querySelector('.earlier-messages')) {
+      this.container.querySelector('.earlier-messages')?.remove();this.container.querySelector('.newer-messages')?.remove();
+      if (start>0) {
         const earlier = document.createElement('button'); earlier.className = 'earlier-messages'; earlier.textContent = 'Show earlier activity';
-        earlier.onclick = () => { this.limit += 180; earlier.remove(); this.render(events, conversation, state); };
+        earlier.onclick = () => { this.windowEnd=start;this.render(events, conversation, state); };
         this.container.prepend(earlier);
       }
       let previous = this.container.querySelector('.earlier-messages');
@@ -138,6 +142,7 @@
         if (previous ? previous.nextSibling !== node : this.container.firstChild !== node) this.container.insertBefore(node, previous ? previous.nextSibling : this.container.firstChild);
         previous = node;
       }
+      if(end<groups.length){const newer=document.createElement('button');newer.className='newer-messages';newer.textContent='Show newer activity';newer.onclick=()=>{this.windowEnd=end+this.limit>=groups.length?null:end+this.limit;this.render(events,conversation,state);};this.container.append(newer);}
       if (nearBottom) this.container.scrollTop = this.container.scrollHeight;
       const jump = document.getElementById('jumpLatest');
       if (jump) jump.hidden = nearBottom;

@@ -7,6 +7,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 from pathlib import Path
 import sys
 import tempfile
@@ -29,7 +30,8 @@ class NativeAdapterTests(unittest.TestCase):
         self.tmp=tempfile.TemporaryDirectory();self.root=Path(self.tmp.name)
         self.env=patch.dict(os.environ,{'RELAY_ENABLE_NATIVE':'1','RELAY_NATIVE_ROOT':str(self.root/'native'),'RELAY_NATIVE_OWNER':'alice','RELAY_ORG_OPENAI_API_KEY':'private-org-must-not-forward','OPENAI_API_KEY':'private-api-must-not-forward','CODEX_API_KEY':'private-codex-must-not-forward'})
         self.env.start();self.platform=patch('relay.native.platform.system',return_value='Darwin');self.platform.start()
-        self.cli=patch('relay.native.shutil.which',return_value='/mock/codex');self.cli.start()
+        which=shutil.which
+        self.cli=patch('relay.native.shutil.which',side_effect=lambda command,*a,**kw:'/mock/codex' if command==os.environ.get('RELAY_CODEX_BIN','codex') else which(command,*a,**kw));self.cli.start()
         self.transport=patch('relay.native.AppServerClient',MockNativeClient);self.transport.start()
         initialize_profiles();self.relay=Relay(self.root/'data');self.conversation=self.relay.detail('alice','demo')['conversation']['id'];self.workers=[]
         for profile in ('a','b','c'):

@@ -201,3 +201,5 @@ The browser workspace now includes a local Monaco editor, structured live agent 
 The [IDE and agent management guide](docs/IDE_MANAGEMENT.md) covers file/folder operations, direct chosen-agent assignment, persistent manual queues, agent enrollment/removal, conversation archive/restore, checkpoint review, the UI control audit and reproducible checks. Project writes remain serialized; parallel task-branch integration is unavailable.
 
 Supported local-owner IDE features are available immediately: source files open for editing, Git reserves the project automatically, Run prepares its approved sandbox, and agent dispatch saves/checkpoints/releases human work. No read-only mode or manual activation buttons remain. Local-owner startup defaults to native execution. See the [default workflow and verification guide](docs/DEFAULT_WORKFLOW.md).
+
+[Startup and terminal guide](docs/TERMINAL_AND_STARTUP.md): recent-history startup, Run File/F5 for Python and Node, streamed approved commands, typed canonical Git add/commit/branch operations, performance measurements and actual execution proof. Remote pushes remain unavailable.

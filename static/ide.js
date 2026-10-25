@@ -14,7 +14,8 @@
   let managementAvailable = false;
   let workflowAvailable = false, acquiring = null, transitioning = false, autoFailed = false, commandStarting = false;
   let refreshPromise = null;
-  let consoleVersion = 0;
+  let consoleVersion = 0, treeSignature = null;
+  let terminalEntries=[],activeEntry=null,lastTerminalResult=null,terminalAvailable=false;
   const language = name => ({py:'python',js:'javascript',jsx:'javascript',mjs:'javascript',ts:'typescript',tsx:'typescript',html:'html',css:'css',scss:'css',json:'javascript',md:'markdown',yml:'yaml',yaml:'yaml',sh:'shell',sql:'sql',diff:'diff'}[name.split('.').pop()] || 'plaintext');
   const bufferKey = name => [user, project, name].join(':');
   const mine = () => state?.lock?.kind === 'human' && state.lock.mine;
@@ -84,6 +85,7 @@
     monaco.editor.defineTheme('relay', {base:'vs-dark',inherit:true,rules:[{token:'comment',foreground:'718879'},{token:'keyword',foreground:'b59fdb'},{token:'string',foreground:'b9ce9b'},{token:'number',foreground:'d4b283'}],colors:{'editor.background':'#11161e','editor.foreground':'#d2dce7','editorLineNumber.foreground':'#435368','editorLineNumber.activeForeground':'#adc3bd','editorCursor.foreground':'#9ddab8','editor.selectionBackground':'#2a4a50','editor.lineHighlightBackground':'#18212c','editorIndentGuide.background1':'#26313e','editorWidget.background':'#1b2531','focusBorder':'#729c83'}});
     editor = monaco.editor.create(byId('monacoEditor'), {model:null,theme:'relay',fontFamily:'"SFMono-Regular",Consolas,"Liberation Mono",monospace',fontSize:13,lineHeight:22,minimap:{enabled:false},automaticLayout:true,scrollBeyondLastLine:false,padding:{top:15,bottom:15},readOnly:true,renderWhitespace:'selection',tabSize:4,wordWrap:'off',smoothScrolling:false,overviewRulerBorder:false,stickyScroll:{enabled:true},accessibilitySupport:'auto'});
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => saveCurrent().catch(notifyError));
+    editor.addCommand(monaco.KeyCode.F5, () => {if(!byId('runFile').disabled)byId('runFile').click();});
     editor.onDidChangeCursorPosition(event => { byId('editorPosition').textContent = 'Ln ' + event.position.lineNumber + ', Col ' + event.position.column + '  ·  UTF-8'; });
     ready = true;
     for (const buffer of buffers.values()) makeModel(buffer);
@@ -225,11 +227,14 @@
     catch(error){transitioning=false;updateEditing();bottom('console',!!consoleSession);throw error;}
   }
   async function finishTransition(){try{await refresh(true);}finally{transitioning=false;updateEditing();}}
-  async function leaveProject() {
-    await flushDrafts();
-    if(!mine() || consoleSession && !consoleSession.closed || [...buffers.values()].some(buffer=>buffer.project===project && buffer.dirty))return;
-    transitioning=true;updateEditing();
-    try{await finishReservation();}finally{transitioning=false;}
+  async function leaveProject(changingProject=false) {
+    if(changingProject){transitioning=true;updateEditing();}
+    try {
+      await flushDrafts();
+      if(!mine() || consoleSession && !consoleSession.closed || [...buffers.values()].some(buffer=>buffer.project===project && buffer.dirty))return;
+      transitioning=true;updateEditing();await finishReservation();
+    }catch(error){transitioning=false;updateEditing();throw error;}
+    finally{if(!changingProject)transitioning=false;}
   }
   byId('viewWriter').onclick=()=>bridge?.openTask(state?.active_project_task);
   byId('discardDraft').onclick = guard(async () => {
@@ -290,6 +295,12 @@
   }
   byId('renameEntry').onclick=guard(()=>changeEntry('rename',activeBuffer()?.path));
   byId('deleteEntry').onclick=guard(()=>changeEntry('delete',activeBuffer()?.path));
+  function updateRunControls() {
+    const buffer=activeBuffer();
+    byId('runFile').disabled=!terminalAvailable || !buffer || buffer.virtual || buffer.readonly || !runnable(buffer.path) || !state?.console_available || !canReserve() || commandStarting || consoleSession?.state==='running';
+    byId('stopFile').disabled=consoleSession?.state!=='running';
+    byId('runFile').title=!terminalAvailable?'Restart Relay to load the Run File backend':!buffer || !runnable(buffer.path)?'Run File supports .py, .js, .mjs and .cjs; use an approved project script for other types':!state?.console_available?(state?.console_unavailable_reason || 'The native command sandbox is unavailable'):'Run current file (F5). Pending edits are saved with conflict checks.';
+  }
   byId('fileTree').addEventListener('contextmenu',event=>{
     const row=event.target.closest('[data-open-file], [data-folder] > summary');
     if(!row)return;event.preventDefault();
@@ -297,13 +308,15 @@
     const menu=byId('fileContextMenu');byId('fileContextPath').textContent=selectedEntry;
     const folder=row.tagName==='SUMMARY';
     menu.querySelector('[data-file-action="open"]').disabled=folder;
-    menu.querySelectorAll('[data-file-action]:not([data-file-action="open"])').forEach(button=>button.disabled=!managementAvailable || state?.editor_writable===false || !bridge.canWrite() || state?.lock?.kind==='agent');
+    menu.querySelector('[data-file-action="run"]').disabled=!terminalAvailable || folder || !runnable(selectedEntry) || !state.console_available || !canReserve();
+    menu.querySelectorAll('[data-file-action]:not([data-file-action="open"]):not([data-file-action="run"])').forEach(button=>button.disabled=!managementAvailable || state?.editor_writable===false || !bridge.canWrite() || state?.lock?.kind==='agent');
     menu.style.left=Math.min(event.clientX,window.innerWidth-250)+'px';menu.style.top=Math.min(event.clientY,window.innerHeight-230)+'px';menu.hidden=false;
     menu.querySelector('button:not(:disabled)')?.focus();
   });
   document.querySelectorAll('[data-file-action]').forEach(button=>button.onclick=guard(async()=>{
     byId('fileContextMenu').hidden=true;const action=button.dataset.fileAction,path=selectedEntry;
     if(action==='open')return openFile(path);
+    if(action==='run')return executeCommand('', '', path);
     const prefix=(state.folders || []).includes(path)?path+'/':path.includes('/')?path.slice(0,path.lastIndexOf('/')+1):'';
     if(action==='new-folder')return newFolder(prefix);
     if(action==='new-file'){
@@ -321,6 +334,7 @@
     editor?.updateOptions({readOnly:!writable});
     byId('editorFallback').readOnly = !writable;
     byId('saveFile').disabled = !writable || !buffer?.dirty;
+    updateRunControls();
     byId('discardDraft').disabled = !mine() || !buffer?.dirty;
     byId('saveState').textContent = buffer?.dirty ? buffer.syncedText===buffer.text ? 'Draft retained' : 'Saving draft…' : buffer?.virtual ? 'Recorded view' : buffer?.readonly ? 'Protected file' : writable && buffer ? 'Saved' : acquiring ? 'Preparing workspace…' : state?.lock?.kind==='agent' ? 'Agent writing' : state?.lock && !mine() ? 'Another editor is active' : bridge?.canWrite()===false ? 'Project permission required' : state?.editor_writable===false ? 'Secure writes unavailable on this platform' : 'Ready';
     byId('recoverLock').hidden = !(state?.lock?.kind === 'human' && state.lock.recoverable && !state.lock.mine);
@@ -343,6 +357,8 @@
   function renderTree() {
     if (!state) return;
     const query = byId('fileFilter').value.toLowerCase();
+    const signature=JSON.stringify([project,state.files,state.folders,state.changes,state.drafts?.map(d=>d.path),[...buffers.values()].filter(b=>b.project===project && b.dirty).map(b=>b.path),activeBuffer()?.path,query]);
+    if(signature===treeSignature)return;treeSignature=signature;
     const root = {folders:new Map(),files:[]};
     for(const path of state.folders || []) {
       if(query && !path.toLowerCase().includes(query))continue;
@@ -420,7 +436,8 @@
     const result=await api('ide/git',{...context(),arguments:arguments_});
     if (at!==generation) return;
     bottom('console');
-    byId('consoleOutput').textContent='$ git ' + arguments_.join(' ') + '\n\n' + (result.output || '(no output)') + '\n\nExit ' + result.exit_code;
+    const entry=terminalEntry('git '+arguments_.join(' '),'','authoritative project Git');entry.output=result.output || '(no output)';entry.exit=result.exit_code;renderTerminal();
+    lastTerminalResult={kind:'git',...result};
     if (arguments_[0]==='diff' || arguments_[0]==='log') virtualFile(arguments_[0]==='diff' ? 'Working tree.diff' : 'Git history',result.output || 'No changes.');
     if (result.exit_code!==0) notice('Git exited with code ' + result.exit_code + '. Inspect its output.');
     else if (arguments_[0]==='commit') byId('commitMessage').value='';
@@ -448,13 +465,16 @@
   function consoleKey() { return 'relay-console:' + user + ':' + project; }
   function renderConsole() {
     const item=consoleSession;
-    byId('consoleState').textContent=commandStarting ? 'Preparing command…' : item ? item.state + (item.exit_code!=null ? ' · exit ' + item.exit_code + ' · ' + (item.duration_ms/1000).toFixed(1) + 's' : '') : state?.console_available ? 'Ready · enter an approved command' : 'Command sandbox unavailable for this session';
+    byId('consoleState').textContent=commandStarting ? 'Preparing command…' : lastTerminalResult?.kind==='rejected' ? 'Command rejected' : lastTerminalResult?.kind==='git' ? 'finished · exit '+lastTerminalResult.exit_code+(lastTerminalResult.duration_ms!=null?' · '+lastTerminalResult.duration_ms+' ms':'') : item ? item.state + (item.exit_code!=null ? ' · exit ' + item.exit_code + ' · ' + (item.duration_ms/1000).toFixed(1) + 's' : '') : state?.console_available ? 'Ready · enter an approved command' : state?.terminal_available ? 'Ready · project Git available' : 'Command sandbox unavailable for this session';
     byId('closeConsole').disabled=!item || item.closed || commandStarting;
-    const canRun=!!state?.console_available && canReserve() && !transitioning && !commandStarting && (!item || item.closed || ['ready','finished'].includes(item.state));
+    const canRun=!!(state?.terminal_available || state?.console_available) && bridge?.canWrite()!==false && !transitioning && !commandStarting && (!item || item.closed || ['ready','finished'].includes(item.state));
     byId('commandInput').disabled=byId('runCommand').disabled=!canRun;
     byId('applyConsole').disabled=!item || item.closed || commandStarting || !['ready','finished'].includes(item.state);
     byId('cancelCommand').disabled=item?.state!=='running';
     byId('stdinForm').hidden=item?.state!=='running';
+    byId('stopFile').disabled=item?.state!=='running';
+    byId('terminalCwd').textContent='Project / '+((item?.state==='running'?activeEntry?.cwd:byId('commandCwd').value) || '.');
+    updateRunControls();
   }
   function startConsolePoll() {
     clearTimeout(consoleTimer);
@@ -467,10 +487,10 @@
         if (version!==consoleVersion || at!==generation || consoleSession?.id!==identity) return;
         const changed=result.output!==consoleSession.output || result.command!==consoleSession.command;
         consoleSession=result;
-        if (changed) {
-          const output=byId('consoleOutput'), follow=output.scrollHeight-output.clientHeight-output.scrollTop<80;
-          output.textContent=(result.command ? '$ ' + result.command + '\n\n' : '') + (result.output || result.error || 'Isolated environment ready. Enter an approved development command.');
-          if (follow) output.scrollTop=output.scrollHeight;
+        if (changed || !activeEntry || activeEntry.exit!==result.exit_code || activeEntry.duration!==result.duration_ms) {
+          if(!activeEntry || activeEntry.session!==identity)activeEntry=terminalEntry(result.command || 'Restored command',byId('commandCwd').value,'isolated command workspace');
+          activeEntry.session=identity;activeEntry.output=result.output || result.error || '';activeEntry.exit=result.exit_code;activeEntry.duration=result.duration_ms;
+          renderTerminal();
         }
         renderConsole();
       } catch (error) {
@@ -494,7 +514,7 @@
     sessionStorage.setItem(key,result.id);
     if (at!==generation) throw new Error('Project changed while preparing its command environment.');
     consoleSession=result;
-    byId('consoleOutput').textContent='Preparing a private project snapshot and approved runtime…';
+    byId('consoleState').textContent='Preparing isolated project environment…';
     renderConsole();
     const deadline=Date.now()+30000;
     while(consoleSession.state==='preparing' && Date.now()<deadline) {
@@ -505,24 +525,54 @@
     }
     if(!['ready','finished'].includes(consoleSession.state)){startConsolePoll();throw new Error(consoleSession.error || 'The command environment is still preparing. Wait briefly and try again.');}
   }
-  byId('commandForm').onsubmit=guard(async event=>{
-    event.preventDefault();
+  const runnable=path=>/\.(py|js|mjs|cjs)$/i.test(path || '');
+  function terminalEntry(command,cwd,scope) {
+    const entry={command,cwd,scope,output:'',exit:null,offset:0};terminalEntries.push(entry);
+    if(terminalEntries.length>100)terminalEntries.shift();
+    return entry;
+  }
+  function renderTerminal(force=false) {
+    const output=byId('consoleOutput'),follow=force || output.scrollHeight-output.clientHeight-output.scrollTop<80;
+    let text=terminalEntries.map(entry=>'$ '+entry.command+'\n'+(entry.cwd?'cwd: '+entry.cwd+' · ':'')+(entry.scope || '')+'\n\n'+entry.output.slice(entry.offset || 0)+(entry.exit!=null?'\n\nExit '+entry.exit+(entry.duration!=null?' · '+entry.duration+' ms':''):'')).join('\n\n');
+    if(text.length>1000000)text='[Older visible output omitted; recorded events remain available]\n'+text.slice(-1000000);
+    output.textContent=text;if(follow)output.scrollTop=output.scrollHeight;
+  }
+  async function executeCommand(command,cwd,file=null) {
     if(commandStarting)return;
-    const command=byId('commandInput').value.trim(); if (!command) return;
-    commandStarting=true;consoleVersion++;clearTimeout(consoleTimer);renderConsole();
+    if(!file && !command?.trim())return;
+    const at=generation,target=context();
+    commandStarting=true;lastTerminalResult=null;consoleVersion++;clearTimeout(consoleTimer);renderConsole();updateEditing();bottom('console');
+    const entry=terminalEntry(file?'Run '+file:command,cwd,'Preparing approved command');activeEntry=entry;renderTerminal(true);
     try {
-    const selectedProject=project,selectedCwd=byId('commandCwd').value;
-    byId('runCommand').disabled=true;
-    await ensureConsole();
-    if(selectedProject!==project)throw new Error('Project changed before command execution. Enter the command in the intended project.');
-    const identity=consoleSession.id;
-    const at=generation;
-    consoleSession={...consoleSession,state:'starting',exit_code:null};renderConsole();
-    try {const result=await api('ide/console/run',{session_id:identity,command,cwd:selectedCwd});if(at!==generation)return;consoleSession=result;}
-    catch(error){startConsolePoll();throw error;}
-    commandHistory.push(command); historyPosition=commandHistory.length; byId('commandInput').value='';
-    byId('consoleOutput').textContent='$ ' + command + '\n'; renderConsole(); startConsolePoll();
-    }finally{commandStarting=false;renderConsole();}
+      await saveAll();
+      const plan=terminalAvailable?await api(file?'ide/run-file':'ide/terminal',{...target,command,cwd,path:file}):file?(()=>{throw new Error('Restart Relay to enable Run File.');})():{kind:'sandbox',command,cwd};
+      if(at!==generation)return;
+      entry.command=plan.command;entry.cwd=plan.cwd;
+      commandHistory.push(plan.command);historyPosition=commandHistory.length;byId('commandInput').value='';
+      if(plan.kind==='git') {
+        entry.scope='authoritative project Git';entry.output=plan.output || '(no output)';entry.exit=plan.exit_code;entry.duration=plan.duration_ms;lastTerminalResult=plan;
+        await refresh(true);await bridge.refresh();
+      }else {
+        entry.scope='isolated command workspace';await ensureConsole();
+        if(at!==generation)return;
+        const identity=consoleSession.id;entry.session=identity;
+        consoleSession={...consoleSession,state:'starting',exit_code:null};renderConsole();
+        const result=await api('ide/console/run',{session_id:identity,command:plan.command,cwd:plan.cwd});
+        if(at!==generation)return;consoleSession=result;startConsolePoll();
+      }
+      renderTerminal(true);
+    }catch(error){entry.output='Command rejected: '+error.message;entry.scope='Execution error';lastTerminalResult={kind:'rejected'};renderTerminal(true);if(consoleSession && ['running','starting','preparing','reconnecting'].includes(consoleSession.state))startConsolePoll();throw error;}
+    finally{commandStarting=false;renderConsole();updateEditing();}
+  }
+  byId('commandForm').onsubmit=guard(async event=>{event.preventDefault();await executeCommand(byId('commandInput').value.trim(),byId('commandCwd').value);});
+  byId('runFile').onclick=guard(()=>executeCommand('', '', activeBuffer()?.path));
+  byId('stopFile').onclick=guard(()=>api('ide/console/cancel',{session_id:consoleSession.id}));
+  byId('clearTerminal').onclick=()=>{terminalEntries=[];activeEntry=null;if(consoleSession?.state==='running'){activeEntry=terminalEntry(consoleSession.command,'','Continuing command output');activeEntry.session=consoleSession.id;activeEntry.offset=consoleSession.output?.length || 0;}renderTerminal();};
+  byId('copyTerminal').onclick=guard(async()=>{await navigator.clipboard.writeText(byId('consoleOutput').textContent);notice('Visible terminal output copied.');});
+  byId('commandCwd').onchange=renderConsole;
+  document.addEventListener('keydown',event=>{
+    if(event.key==='F5' && activeBuffer() && !byId('runFile').disabled){event.preventDefault();byId('runFile').click();}
+    if(event.ctrlKey && event.key.toLowerCase()==='c' && consoleSession?.state==='running' && event.target.closest('#consolePane') && !window.getSelection()?.toString()) {event.preventDefault();byId('cancelCommand').click();}
   });
   byId('commandInput').onkeydown=event=>{
     if (event.key==='ArrowUp' || event.key==='ArrowDown') { event.preventDefault(); historyPosition=Math.max(0,Math.min(commandHistory.length,historyPosition+(event.key==='ArrowUp' ? -1 : 1))); byId('commandInput').value=commandHistory[historyPosition] || ''; }
@@ -568,12 +618,12 @@
   async function update(value) {
     if (!bridge) return;
     managementAvailable=value.managementAvailable===true;
-    workflowAvailable=value.automaticWorkflow===true;
+    workflowAvailable=value.automaticWorkflow===true;terminalAvailable=value.developmentTerminal===true;
     const changed=project!==value.project || user!==value.user;
     if (changed) {
       generation++;clearTimeout(consoleTimer);project=value.project;user=value.user;state=null;refreshAt=0;opened=[];current=null;consoleSession=null;refreshing=false;autoFailed=false;acquiring=null;transitioning=false;refreshPromise=null;
       byId('editorWelcome').hidden=false;byId('monacoEditor').hidden=true;byId('editorFallback').hidden=true;renderTabs();
-      commandHistory=[];historyPosition=0;
+      commandHistory=[];historyPosition=0;terminalEntries=[];activeEntry=null;lastTerminalResult=null;
     }
     conversation=value.conversation;
     byId('statusProject').textContent=value.projectName;
@@ -600,7 +650,7 @@
       for (const path of restore.slice(0,12)) await openFile(path).catch(()=>{});
       for (const draft of state?.drafts || []) await openFile(draft.path,true).catch(()=>{});
       const identity=sessionStorage.getItem(consoleKey());
-      if (identity) {consoleSession={id:identity,state:'reconnecting'};renderConsole();startConsolePoll();}
+      if (identity) {consoleSession={id:identity,state:'reconnecting'};bottom('console');renderConsole();startConsolePoll();}
     }
     ensureEditor();
   }

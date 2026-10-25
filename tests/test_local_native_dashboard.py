@@ -5,6 +5,7 @@ actual native profiles and records its own genuine-execution evidence.
 """
 import json
 import os
+import shutil
 from pathlib import Path
 import tempfile
 import threading
@@ -30,7 +31,8 @@ class LocalNativeDashboardTests(unittest.TestCase):
         self.tmp=tempfile.TemporaryDirectory();self.root=Path(self.tmp.name);self.server=None
         self.env=patch.dict(os.environ,{'RELAY_ENABLE_NATIVE':'1','RELAY_NATIVE_ROOT':str(self.root/'profiles-root'),'RELAY_PUBLIC_URL':'','RELAY_ORG_OPENAI_API_KEY':'TEST-ONLY-ORG-SECRET-MUST-NOT-LEAK'})
         self.env.start();self.platform=patch('relay.native.platform.system',return_value='Darwin');self.platform.start()
-        self.cli=patch('relay.native.shutil.which',return_value='/mock/codex');self.cli.start()
+        which=shutil.which
+        self.cli=patch('relay.native.shutil.which',side_effect=lambda command,*a,**kw:'/mock/codex' if command==os.environ.get('RELAY_CODEX_BIN','codex') else which(command,*a,**kw));self.cli.start()
         self.transport=patch('relay.native.AppServerClient',MockNativeClient);self.transport.start()
         initialize_profiles();home,_=profile_paths('b');(home/'scenario.json').write_text('{"complete":true}')
         relay=Relay(self.root/'data',demo=False)

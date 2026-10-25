@@ -170,7 +170,7 @@ class ProjectIDE:
         self.relay.audit(user, 'editor_lock_released', project=project, metadata={'checkpoint': checkpoint, 'automatic': True})
         return {'released': True, 'checkpoint': checkpoint}
 
-    def _read(self, project, name, missing=False):
+    def _read(self, project, name, missing=False, limit=MAX_TEXT):
         parts = file_path(name)
         if not workspace_api._USE_DIR_FD:
             files = self.relay.ws.inspect(project)['files']
@@ -182,7 +182,7 @@ class ProjectIDE:
             try:
                 with self.relay.ws._directory(root, parts[:-1]) as parent:
                     with self.relay.ws._file(parent, parts[-1]) as descriptor:
-                        data = self.relay.ws._read(descriptor, MAX_TEXT)
+                        data = self.relay.ws._read(descriptor, limit)
             except FileNotFoundError:
                 if missing:
                     return None
@@ -344,6 +344,7 @@ class ProjectIDE:
         return {'files': files, 'folders': self.files.folders(project) if workspace_api._USE_DIR_FD else [], 'editor_writable': workspace_api._USE_DIR_FD, 'changes': self.changes(project), 'branch': self.relay.ws.git(workspace, 'rev-parse', '--abbrev-ref', 'HEAD'),
                 'checkpoint': self.relay.ws.git(workspace, 'rev-parse', 'HEAD'), 'lock': lock, 'drafts': drafts, 'active_project_task': tasks[0] if tasks else None,
                 'console_available': console_available,
+                'terminal_available': bool(console_owner and workspace_api._USE_DIR_FD),
                 'console_unavailable_reason': None if console_available else 'The native command sandbox requires macOS and the Codex CLI on the server PATH' if console_owner else 'Command execution requires the authenticated local owner',
                 'console_limitation': 'Restricted approved-command console in a private clone; no general shell or PTY. Git writes use the constrained project Git API.'}
 
@@ -375,11 +376,19 @@ class ProjectIDE:
             if self.relay.rows('SELECT 1 FROM editor_drafts WHERE project_id=?', (project,)):
                 raise WorkspaceConflict('Save or discard drafts before changing Git')
             if command == 'add' and values:
-                names = [entry['path'] for entry in self.changes(project)] if values == ['.'] else values
+                changes=self.changes(project)
+                names=[]
+                for requested in values:
+                    if requested!='.':file_path(requested,write=True)
+                    names.extend(entry['path'] for entry in changes if requested=='.' or entry['path']==requested or entry['path'].startswith(requested+'/'))
+                names=list(dict.fromkeys(names))
                 if not names:
                     return {'output': 'No source changes to stage.', 'exit_code': 0}
                 for name in names:
                     file_path(name, write=True)
+                    # Expand directories into eligible paths so protected
+                    # descendants cannot enter the index through git add DIR.
+                    self._read(project,name,missing=True,limit=self.relay.ws.MAX_FILE_BYTES)
                 args = ['--literal-pathspecs', 'add', '-A', '--', *names]
             elif command == 'unstage' and values:
                 names = [entry['path'] for entry in self.changes(project) if entry['staged']] if values == ['.'] else values

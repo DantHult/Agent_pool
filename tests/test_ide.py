@@ -367,6 +367,15 @@ class RealConsoleTests(unittest.TestCase):
         done=self.wait(replacement['id'],{'finished'})
         self.assertEqual(done['exit_code'],0);self.assertIn('73',done['output'])
         self.assertTrue(self.client.get('ide/console?session_id='+first)['closed'])
+        # A confirmed stopped transport must be replaced on the next explicit
+        # Run. Never reuse it or replay the interrupted command automatically.
+        self.server.ide.console.sessions[replacement['id']]['client'].close()
+        recovered=self.client.post('ide/console/ensure',ctx)
+        self.assertNotEqual(recovered['id'],replacement['id'])
+        self.wait(recovered['id'],{'ready'})
+        self.client.post('ide/console/run',{'session_id':recovered['id'],'command':"python3 -c 'print(\"recovered-command\")'"})
+        final=self.wait(recovered['id'],{'finished'})
+        self.assertEqual(final['exit_code'],0);self.assertIn('recovered-command',final['output'])
 
     def test_sensitive_files_git_metadata_network_and_shell_denied(self):
         canary=self.root/'nonsecret-canary';canary.write_text('must-not-read')

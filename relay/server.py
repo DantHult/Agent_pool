@@ -131,7 +131,7 @@ class Handler(BaseHTTPRequestHandler):
             if re.fullmatch(r'/api/conversations/[^/]+/stream',path):return self.stream(user,path.split('/')[3],int(q.get('after',[self.headers.get('Last-Event-ID','0')])[0]))
             if self.headers.get('Upgrade'):raise ValueError('WebSocket transport is not enabled; use event-stream or polling')
             with relay.lock:
-                if path=='/api/overview':result=relay.overview(user)
+                if path=='/api/overview':result=relay.overview(user,q.get('light',['0'])[0]=='1')
                 elif path=='/api/ide/state':result=self.server.ide.state(user,q.get('project_id',[''])[0],q.get('client_id',[''])[0],digest(self.token()))
                 elif path=='/api/ide/file':result=self.server.ide.read_file(user,q.get('project_id',[''])[0],q.get('path',[''])[0],q.get('create',['0'])[0]=='1')
                 elif path=='/api/ide/entry':
@@ -143,8 +143,8 @@ class Handler(BaseHTTPRequestHandler):
                 elif path=='/api/ide/console':
                     if not self.server.ide.console:raise PermissionError('Console execution requires the pinned local owner')
                     result=self.server.ide.console.poll(user,q.get('session_id',[''])[0],digest(self.token()))
-                elif path=='/api/native/profiles':result=relay.native_profiles(user,q.get('project_id',[None])[0])
-                elif path=='/api/workers':result=relay.workers(user,q.get('project_id',[None])[0],q.get('mine',['0'])[0]=='1')
+                elif path=='/api/native/profiles':result=relay.native_profiles(user,q.get('project_id',[None])[0],q.get('cached',['0'])[0]=='1')
+                elif path=='/api/workers':result=relay.workers(user,q.get('project_id',[None])[0],q.get('mine',['0'])[0]=='1',q.get('cached',['0'])[0]=='1')
                 elif re.fullmatch(r'/api/projects/[^/]+/(diff|download)',path):
                     project=path.split('/')[3];relay.access(user,project);detail=relay.detail(user,project)
                     if path.endswith('/diff'):result={'diff':detail['workspace'].get('task_diff',detail['workspace'].get('diff',''))}
@@ -153,9 +153,9 @@ class Handler(BaseHTTPRequestHandler):
                         if name not in files:raise ValueError('File is not available for download')
                         filename=re.sub(r'[^A-Za-z0-9_.-]','_',Path(name).name)
                         return self.reply(200,files[name].encode(),'text/plain; charset=utf-8',extra={'Content-Disposition':'attachment; filename="'+filename+'"'})
-                elif re.fullmatch(r'/api/projects/[^/]+',path):result=relay.detail(user,path.split('/')[-1],q.get('conversation_id',[None])[0])
+                elif re.fullmatch(r'/api/projects/[^/]+',path):result=relay.detail(user,path.split('/')[-1],q.get('conversation_id',[None])[0],q.get('light',['0'])[0]=='1')
                 elif re.fullmatch(r'/api/tasks/[^/]+/result',path):result=relay.execution_result(user,path.split('/')[3])
-                elif re.fullmatch(r'/api/conversations/[^/]+/events',path):result=relay.events(user,path.split('/')[3],int(q.get('after',['0'])[0]),int(q.get('limit',['50'])[0]))
+                elif re.fullmatch(r'/api/conversations/[^/]+/events',path):result=relay.events(user,path.split('/')[3],int(q.get('after',['0'])[0]),int(q.get('limit',['50'])[0]),int(q['before'][0]) if 'before' in q else None,q.get('recent',['0'])[0]=='1')
                 elif re.fullmatch(r'/api/artifacts/[^/]+',path):result=relay.artifact(user,path.split('/')[-1])
                 elif path=='/api/organization/members':
                     if not relay.is_admin(user):raise PermissionError('Administrator required')
@@ -215,6 +215,8 @@ class Handler(BaseHTTPRequestHandler):
                     elif method=='ide/discard':result=ide.discard(user,project,client,binding,data['path'])
                     elif method=='ide/release':result=ide.release(user,project,client,binding,data.get('checkpoint') is True,data.get('conversation_id'))
                     elif method=='ide/git':result=ide.git(user,project,client,binding,data['arguments'],data.get('conversation_id'))
+                    elif method=='ide/terminal':result=self.server.terminal.dispatch(user,data,binding)
+                    elif method=='ide/run-file':result=self.server.terminal.file(user,data,binding)
                     elif method=='ide/conversations':result=ide.create_conversation(user,project,data['title'])
                     elif method=='ide/conversations/update':result=ide.update_conversation(user,project,data['conversation_id'],data)
                     elif method=='ide/files':
@@ -323,6 +325,8 @@ def make_server(root,port=8000,auth_mode=None,origin=None,allow_http=False):
         if mode=='local-owner':
             from .console import CommandConsole
             server.ide.console=CommandConsole(server)
+        from .terminal import DevelopmentTerminal
+        server.terminal=DevelopmentTerminal(server)
         metadata={'pid':os.getpid(),'url':server.public_url}
         # Keep legacy lock-file JSON for older readers; status JSON is the Windows-safe source.
         lock.seek(0);lock.truncate();json.dump(metadata,lock);lock.flush()

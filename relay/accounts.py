@@ -5,7 +5,6 @@ hashed tables; none are exposed by project, event, export or worker APIs.
 """
 import hashlib
 import hmac
-import os
 import re
 import secrets
 import sqlite3

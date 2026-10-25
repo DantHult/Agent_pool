@@ -36,6 +36,8 @@ class Relay:
         self.jobs={}
         self.unsafe_tasks=set()
         self.closing=False
+        self.health_cache={}
+        self.health_jobs={}
         try:
             migrate(self.db)
             if not demo:
@@ -66,7 +68,7 @@ class Relay:
     def native_actor(self):
         from .native import native_owner
         return self.local_owner_id or native_owner()
-    def native_profiles(self,user,project=None):
+    def native_profiles(self,user,project=None,cached=False):
         if not self.local_owner_id or not self.native_enabled or user!=self.local_owner_id:raise PermissionError('Native profiles require the pinned local-owner session')
         if project:self.access(user,project)
         from .native import PROFILE_IDS
@@ -77,7 +79,7 @@ class Relay:
             if w['owner_id']!=user:
                 profiles.append({'profile':profile,'status':'unavailable','available':False,'reason':'This profile belongs to a different worker owner; use a dedicated local-owner data directory'})
                 continue
-            health=self.adapter(w).health();status=health.get('status','unavailable')
+            health=self.worker_health(w,cached);status=health.get('status','unavailable')
             if w['state']=='quota_blocked':status='quota_blocked'
             elif w['state']=='busy':status='busy'
             elif w['state'] in ('paused','offline') or not w['opt_in']:status='paused' if w['state']!='offline' else 'unavailable'
@@ -185,6 +187,7 @@ class Relay:
     def event(self,t,kind,content,role='system',metadata=None,worker=None):
         content=clean(content); metadata=scrub(metadata or {})
         metadata['execution_mode']=t.get('execution_mode','simulation')
+        if isinstance(t.get('generation'),int):metadata['generation']=t['generation']
         metadata.setdefault('origin','human' if role=='user' else 'relay')
         if len(content)>12000:
             artifact=uid(); (self.root/'artifacts').mkdir(exist_ok=True)
@@ -243,13 +246,32 @@ class Relay:
             try: self.write_access(user,project)
             except PermissionError: return False,'Project membership required'
         return True,'Approved for this project'
-    def eligibility(self,w,project,user=None):
+    def worker_health(self,w,cached=False):
+        key=(w['id'],w['execution_mode'],w.get('native_profile'),w.get('state'),bool(w.get('opt_in')))
+        if not cached:
+            health=self.adapter(w).health()
+            self.health_cache[key]=(time.monotonic(),health)
+            return health
+        prior=self.health_cache.get(key)
+        if prior and time.monotonic()-prior[0]<(0.5 if prior[1].get('status')=='busy' else 5):return prior[1]
+        if key not in self.health_jobs and not self.closing:
+            adapter=self.adapter(dict(w))
+            def probe():
+                try:health=adapter.health()
+                except Exception:health={'available':False,'status':'unavailable','reason':'Execution readiness check failed; inspect setup before retrying'}
+                with self.lock:
+                    self.health_cache[key]=(time.monotonic(),health)
+                    self.health_jobs.pop(key,None)
+            job=threading.Thread(target=probe,name='relay-health',daemon=True)
+            self.health_jobs[key]=job;job.start()
+        return {'available':False,'connected':False,'status':'checking','reason':'Checking authentication, runtime and sandbox readiness in the background'}
+    def eligibility(self,w,project,user=None,health=None):
         approved,reason=self.approval(w,project,user)
         if not approved: return False,reason
         if w['state']!='available': return False,'Capacity is '+w['state']
         if self.db.execute("SELECT COUNT(*) FROM assignments WHERE worker_id=? AND status='active'",(w['id'],)).fetchone()[0]>=w['max_parallel_tasks']:
             return False,'Worker concurrency limit reached'
-        health=self.adapter(w).health()
+        health=self.adapter(w).health() if health is None else health
         if not health.get('available'): return False,health.get('reason','Execution unavailable')
         return True,'Approved for this project'
     def worker_assignments(self,user,worker):
@@ -258,7 +280,7 @@ class Relay:
             try:self.access(user,assignment['id']);visible.append(assignment)
             except PermissionError:pass
         return visible
-    def public_worker(self,user,w,project=None):
+    def public_worker(self,user,w,project=None,cached=False):
         owner=self.one('SELECT name FROM organizations WHERE id=?',(w['owner_id'],))['name'] if w['owner_type']=='org' else self.user(w['owner_id'])['name']
         allowed=[r['project_id'] for r in self.rows('SELECT project_id FROM worker_projects WHERE worker_id=?',(w['id'],))]
         # Never reveal grants to projects the reader cannot inspect.
@@ -267,9 +289,9 @@ class Relay:
             try: self.access(user,pid); visible.append(pid)
             except PermissionError: pass
         managed=self.is_admin(user,w['organization_id']) or (w['owner_type']=='user' and w['owner_id']==user)
-        eligible,reason=self.eligibility(w,project,user) if project else (False,'Select a project to check eligibility')
+        health=self.worker_health(w,cached)
+        eligible,reason=self.eligibility(w,project,user,health) if project else (False,'Select a project to check eligibility')
         public={k:v for k,v in w.items() if k!='credential_ref'}
-        health=self.adapter(w).health()
         public.update({'display_name':w['name'],'status':w['state'],'owner_name':owner,'opt_in':bool(w['opt_in']),'can_manage':managed,'permitted_project_ids':visible,'capacity':self.one('SELECT * FROM capacity_sources WHERE worker_id=?',(w['id'],)),'authorized':self.approval(w,project,user)[0] if project else False,'eligible':eligible,'eligibility_reason':reason,'health':health,'last_seen_at':now() if health.get('available') else None,'last_seen_source':'local adapter health check'})
         public['assigned_projects']=self.worker_assignments(user,w['id'])
         public['observation']=self.management.observation(user,w['id'])
@@ -282,7 +304,7 @@ class Relay:
         if not public['observation']['current_task'] and w['state']=='available' and not health.get('available'):
             public['status']=health.get('status','unavailable')
         return public
-    def workers(self,user,project=None,mine=False):
+    def workers(self,user,project=None,mine=False,cached=False):
         self.org_member(user)
         if project: self.access(user,project)
         all_workers=self.rows("SELECT * FROM workers WHERE organization_id='orgdemo' AND removed_at IS NULL ORDER BY id")
@@ -292,7 +314,7 @@ class Relay:
             owner=w['owner_type']=='user' and w['owner_id']==user
             shared=bool(self.rows('SELECT 1 FROM worker_projects w JOIN memberships m ON m.project_id=w.project_id WHERE w.worker_id=? AND m.user_id=?',(w['id'],user)))
             if mine and not owner and not (w['owner_type']=='org' and self.is_admin(user)): continue
-            if owner or shared or self.is_admin(user): selected.append(self.public_worker(user,w,project))
+            if owner or shared or self.is_admin(user): selected.append(self.public_worker(user,w,project,cached))
         return {'workers':selected,'personal_subscription':{'supported':False,'reason':PERSONAL_UNSUPPORTED_REASON}}
     def enroll(self,user,data):
         self.org_member(user); mode=data.get('execution_mode','simulation'); owner_type=data.get('owner_type','user')
@@ -692,22 +714,28 @@ class Relay:
         self._execute(t,w,True,self._latest_context(t))
         return self.one('SELECT * FROM tasks WHERE id=?',(t['id'],))
 
-    def overview(self,user):
+    def overview(self,user,light=False):
         u=self.user(user); self.org_member(user)
         projects=self.rows("SELECT * FROM projects WHERE organization_id='orgdemo'") if self.is_admin(user) else self.rows('SELECT p.* FROM projects p JOIN memberships m ON m.project_id=p.id WHERE m.user_id=?',(user,))
-        directory=self.workers(user)
+        directory={'workers':[],'personal_subscription':{'supported':False,'reason':PERSONAL_UNSUPPORTED_REASON}} if light else self.workers(user)
         people=self.rows('SELECT id,name,role FROM users') if self.demo else self.rows('SELECT u.id,u.name,u.role FROM users u JOIN accounts a ON a.user_id=u.id WHERE a.disabled=0')
         for p in projects:
             p['role']='admin' if self.is_admin(user) else self.one('SELECT role FROM memberships WHERE user_id=? AND project_id=?',(user,p['id']))['role']
             p['can_write']=p['role']!='viewer' and self.org_member(user)['role']!='viewer'
         return {'user':u,'users':people,'organizations':self.rows('SELECT * FROM organizations'),'projects':projects,'workers':directory['workers'],
-            'features':{'agent_management':True,'explorer_operations':True,'checkpoint_reviews':True,'automatic_workflow':True},
+            'features':{'agent_management':True,'explorer_operations':True,'checkpoint_reviews':True,'automatic_workflow':True,'recent_history':True,'development_terminal':True},
             'auth':{'mode':'local-owner' if self.local_owner_id else 'local_demo' if self.demo else 'invite','production_ready':not self.demo and not self.local_owner_id,'description':'Pinned local owner; loopback only' if self.local_owner_id else 'Seeded local identities' if self.demo else 'Invite-only Relay accounts; HTTPS required','native_enabled':self.native_enabled,'local_owner_id':self.local_owner_id},
             'personal_subscription':directory['personal_subscription'],
             'execution':{'mode':'mixed','connected':any(w['execution_mode'] in LIVE_MODES and w['health'].get('connected',False) for w in directory['workers']),'detail':'Native profiles use the local owner’s ChatGPT subscriptions and explicit handoffs. Simulated capacity is labeled; organization API capacity is shared by organization.'}}
-    def detail(self,user,project,conversation=None):
+    def detail(self,user,project,conversation=None,light=False):
         self.access(user,project)
         c=self.one('SELECT * FROM conversations WHERE project_id=? AND id=?',(project,conversation)) if conversation else self.one('SELECT * FROM conversations WHERE project_id=? ORDER BY rowid LIMIT 1',(project,))
+        if light:
+            return {'light':True,'conversation':c,'tasks':self.rows('SELECT * FROM tasks WHERE conversation_id=? ORDER BY rowid DESC LIMIT 100',(c['id'],)),
+                'workspace':{'files':{},'diff':'','checkpoint':self.ws.git(self.ws.path(project),'rev-parse','HEAD')},'contexts':[],
+                'handoffs':list(reversed(self.rows('SELECT h.* FROM handoffs h JOIN tasks t ON t.id=h.task_id WHERE t.conversation_id=? ORDER BY h.rowid DESC LIMIT 50',(c['id'],)))),
+                'checkpoints':self.rows('SELECT * FROM workspace_checkpoints WHERE project_id=? ORDER BY rowid DESC LIMIT 100',(project,)),
+                'execution_runs':[],'assignments':[],'memberships':self.rows('SELECT * FROM memberships WHERE project_id=?',(project,)),'workers':[]}
         workspace=self.ws.inspect(project)
         latest=self.rows('SELECT * FROM tasks WHERE conversation_id=? ORDER BY rowid DESC LIMIT 1',(c['id'],))
         if latest and latest[0]['execution_mode'] in LIVE_MODES:
@@ -721,8 +749,15 @@ class Relay:
             'execution_runs':self.rows('SELECT * FROM execution_runs WHERE task_id IN (SELECT id FROM tasks WHERE conversation_id=?) ORDER BY rowid',(c['id'],)),
             'assignments':self.rows('SELECT a.* FROM assignments a JOIN tasks t ON t.id=a.task_id WHERE t.conversation_id=? ORDER BY a.rowid',(c['id'],)),
             'memberships':self.rows('SELECT * FROM memberships WHERE project_id=?',(project,)), 'workers':self.workers(user,project)['workers']}
-    def events(self,user,conversation,after=0,limit=50):
+    def events(self,user,conversation,after=0,limit=50,before=None,recent=False):
         c=self.one('SELECT * FROM conversations WHERE id=?',(conversation,)); self.access(user,c['project_id'])
+        if recent or before is not None:
+            if before is not None and before<1:raise ValueError('Invalid history cursor')
+            rows=self.rows('SELECT * FROM events WHERE conversation_id=? AND sequence<? ORDER BY sequence DESC LIMIT ?',(conversation,before if before is not None else 9223372036854775807,min(max(limit,1),100)))
+            rows.reverse()
+            first=rows[0]['sequence'] if rows else before
+            return {'events':rows,'next_after':rows[-1]['sequence'] if rows else after,'before':first,
+                'has_older':bool(rows and self.rows('SELECT 1 FROM events WHERE conversation_id=? AND sequence<? LIMIT 1',(conversation,first)))}
         rows=self.rows('SELECT * FROM events WHERE conversation_id=? AND sequence>? ORDER BY sequence LIMIT ?',(conversation,max(0,after),min(max(limit,1),100)))
         return {'events':rows,'next_after':rows[-1]['sequence'] if rows else after}
     def credential_reference(self,user,worker):
@@ -785,9 +820,11 @@ class Relay:
         with self.lock:
             self.closing=True
             jobs=list(self.jobs.values())
+            health_jobs=list(self.health_jobs.values())
             for task_id,job in list(self.jobs.items()): job['cancel'].set(); job['adapter'].cancel(task_id)
         for job in jobs:
             if job['thread']: job['thread'].join(timeout=15)
+        for job in health_jobs:job.join(timeout=5)
         if any(job['thread'] and job['thread'].is_alive() for job in jobs):
             raise RuntimeError('A task is still stopping. The workspace lock must remain held until shutdown completes.')
         self.db.close()

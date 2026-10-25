@@ -123,6 +123,13 @@ class CommandConsole:
                 if item['client_id']!=client:raise WorkspaceConflict('Another editor owns this command workspace')
                 if item['state']=='preparing':return self.view(item)
                 if item['state'] not in ('ready','finished'):raise WorkspaceConflict('Stop the command or close its failed session before running another command')
+                transport=item['client']
+                if transport is None or transport.closed or transport.process.poll() is not None:
+                    # Cancellation may have required closing the transport.
+                    # Preserve unpublished edits; rebuild only a clean snapshot
+                    # for this new explicit Run, never replay the old command.
+                    self.finish_clean(user,project,client=data['client_id'],session_hash=session_hash)
+                    continue
                 _, _, fingerprint = snapshot(self.relay, project)
                 if fingerprint==item['fingerprint']:return self.view(item)
                 self.finish_clean(user, project, client, session_hash)
@@ -226,7 +233,7 @@ class CommandConsole:
                 result.update(client.request('command/exec', {'command': argv, 'cwd': str(item['working']),
                     # A cwd inside a subdirectory must not change the permission
                     # root. Start in the snapshot and use a trusted exec launcher.
-                    'env': workspace_environment(item['working']), 'permissionProfile': PERMISSION_NAME,
+                    'env': {**workspace_environment(item['working']), 'PYTHONUNBUFFERED': '1'}, 'permissionProfile': PERMISSION_NAME,
                     'processId': item['process_id'], 'streamStdin': True, 'streamStdoutStderr': True,
                     'timeoutMs': 90000, 'outputBytesCap': 256000}, timeout=100, sent=item['request_sent']))
             except Exception as exc:
