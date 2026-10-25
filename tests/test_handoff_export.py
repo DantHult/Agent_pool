@@ -7,7 +7,8 @@ import unittest
 import uuid
 from unittest.mock import patch
 
-from relay.handoff import export_handoff
+from relay.handoff import export_handoff, export_project_handoff
+from relay.ide import ProjectIDE
 from relay.store import Relay
 import test_local_native_dashboard as native_fixture
 
@@ -73,6 +74,44 @@ class HandoffExportTests(unittest.TestCase):
         self.assertIn('- **Project files:** `' + str(self.relay.ws.path('demo')) + '`', self.export()['content'])
 
 
+class ProjectHandoffTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory();self.root = Path(self.temp.name).resolve()
+        self.env = patch.dict(os.environ, {'RELAY_NATIVE_ROOT': str(self.root / 'native')});self.env.start()
+        self.relay = Relay(self.root / 'data');self.ide = ProjectIDE(self.relay)
+        self.first = self.relay.detail('alice', 'demo')['conversation']['id']
+
+    def tearDown(self):self.relay.close();self.env.stop();self.temp.cleanup()
+
+    def test_every_visible_project_is_listed_with_its_conversations(self):
+        second = self.ide.create_conversation('alice', 'demo', 'Second idea')
+        listed = {item['id']: [c['title'] for c in item['conversations']] for item in self.ide.all_conversations('alice')['projects']}
+        self.assertEqual(set(listed), {'demo'})  # not bob's private project
+        self.assertEqual(set(listed['demo']), {'Password toolkit', 'Second idea'})
+        self.assertEqual({item['id'] for item in self.ide.all_conversations('bob')['projects']}, {'demo', 'private'})
+        self.relay.mutate('admin', 'projects/delete', {'project_id': 'private', 'confirm_name': 'Private sandbox'})
+        self.assertEqual({item['id'] for item in self.ide.all_conversations('bob')['projects']}, {'demo'})
+
+    def test_project_handoff_combines_active_conversations(self):
+        task = self.relay.mutate('alice', 'prompt', {'conversation_id': self.first, 'prompt': 'Build a password validator'})
+        self.relay.mutate('alice', 'switch', {'task_id': task['id'], 'generation': task['generation'], 'target_worker_id': 'codexB'})
+        later = self.ide.create_conversation('alice', 'demo', 'Docs pass')
+        hidden = self.ide.create_conversation('alice', 'demo', 'Abandoned idea')
+        self.ide.update_conversation('alice', 'demo', hidden['id'], {'archived': True, 'confirmed': True})
+        text = export_project_handoff(self.relay, 'alice', 'demo')['content']
+        self.assertTrue(text.startswith('# Handoff: Password toolkit\n'))
+        self.assertIn('- **Conversations:** 2 (1 archived, not included)', text)
+        self.assertNotIn('Abandoned idea', text)
+        self.assertLess(text.index('## Conversation: Docs pass'), text.index('## Conversation: Password toolkit'))  # most recent first
+        self.assertIn('_No agent work yet', text)
+        for expected in ('### Requests in this conversation', '1. Build a password validator', 'worked on by Codex Worker A, Codex Worker B',
+                         'handed off to Codex Worker B', 'Work so far by Codex Worker A, Codex Worker B'):
+            self.assertIn(expected, text)
+        self.assertNotIn('/api/', text)
+        with self.assertRaises(PermissionError):export_project_handoff(self.relay, 'alice', 'private')
+        self.assertTrue(self.relay.rows("SELECT 1 FROM audit_events WHERE action='handoff_exported' AND metadata LIKE '%project%'"))
+
+
 class HandoffExportHTTPTests(unittest.TestCase):
     def setUp(self):self.fixture = native_fixture.LocalNativeDashboardTests();self.fixture.setUp()
     def tearDown(self):self.fixture.tearDown()
@@ -83,6 +122,11 @@ class HandoffExportHTTPTests(unittest.TestCase):
         handoff = self.fixture.client.get(path.removeprefix('/api/'))
         self.assertEqual(handoff['filename'], 'HANDOFF.md');self.assertIn('# Handoff: Disposable native sample', handoff['content'])
         self.assertTrue(self.fixture.client.get('overview?light=1')['features']['handoff_export'])
+        listed = self.fixture.client.get('conversations')['projects']
+        self.assertEqual([item['id'] for item in listed], [self.fixture.project])
+        project = self.fixture.client.get('projects/' + self.fixture.project + '/handoff')
+        self.assertIn('## Conversation: Disposable native sample', project['content'])
+        self.assertEqual(native_fixture.Client(self.fixture.server).request('/api/projects/' + self.fixture.project + '/handoff')[0], 401)
 
 
 if __name__ == '__main__':

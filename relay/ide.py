@@ -81,6 +81,11 @@ class ProjectIDE:
             row['participants'] = self.relay.rows('SELECT DISTINCT w.id,w.name,w.native_profile FROM assignments a JOIN tasks t ON t.id=a.task_id JOIN workers w ON w.id=a.worker_id WHERE t.conversation_id=?', (row['id'],))
         return {'conversations': rows}
 
+    def all_conversations(self, user):
+        """Every project the user can open, each with its conversations."""
+        return {'projects': [{'id': p['id'], 'name': p['name'], 'can_write': p['can_write'], 'conversations': self.conversations(user, p['id'])['conversations']}
+                             for p in self.relay.visible_projects(user)]}
+
     def create_conversation(self, user, project, title):
         self.relay.write_access(user, project)
         if not isinstance(title, str) or not title.strip() or len(title) > 100:

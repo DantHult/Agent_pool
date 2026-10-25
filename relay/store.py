@@ -808,16 +808,20 @@ class Relay:
         self._execute(t,w,True,self._latest_context(t))
         return self.one('SELECT * FROM tasks WHERE id=?',(t['id'],))
 
-    def overview(self,user,light=False):
-        u=self.user(user); self.org_member(user)
+    def visible_projects(self,user):
+        """The projects this user can open, with their role in each."""
         projects=self.rows("SELECT * FROM projects WHERE organization_id='orgdemo' AND deleted_at IS NULL") if self.is_admin(user) else self.rows('SELECT p.* FROM projects p JOIN memberships m ON m.project_id=p.id WHERE m.user_id=? AND p.deleted_at IS NULL',(user,))
-        directory={'workers':[],'personal_subscription':{'supported':False,'reason':PERSONAL_UNSUPPORTED_REASON}} if light else self.workers(user)
-        people=self.rows('SELECT id,name,role FROM users') if self.demo else self.rows('SELECT u.id,u.name,u.role FROM users u JOIN accounts a ON a.user_id=u.id WHERE a.disabled=0')
         for p in projects:
             p['role']='admin' if self.is_admin(user) else self.one('SELECT role FROM memberships WHERE user_id=? AND project_id=?',(user,p['id']))['role']
             p['can_write']=p['role']!='viewer' and self.org_member(user)['role']!='viewer'
+        return projects
+    def overview(self,user,light=False):
+        u=self.user(user); self.org_member(user)
+        projects=self.visible_projects(user)
+        directory={'workers':[],'personal_subscription':{'supported':False,'reason':PERSONAL_UNSUPPORTED_REASON}} if light else self.workers(user)
+        people=self.rows('SELECT id,name,role FROM users') if self.demo else self.rows('SELECT u.id,u.name,u.role FROM users u JOIN accounts a ON a.user_id=u.id WHERE a.disabled=0')
         return {'user':u,'users':people,'organizations':self.rows('SELECT * FROM organizations'),'projects':projects,'workers':directory['workers'],
-            'features':{'agent_management':True,'explorer_operations':True,'checkpoint_reviews':True,'automatic_workflow':True,'recent_history':True,'development_terminal':True,'live_agents':True,'editor_leases':True,'handoff_export':True},
+            'features':{'agent_management':True,'explorer_operations':True,'checkpoint_reviews':True,'automatic_workflow':True,'recent_history':True,'development_terminal':True,'live_agents':True,'editor_leases':True,'handoff_export':True,'all_conversations':True},
             'auth':{'mode':'local-owner' if self.local_owner_id else 'local_demo' if self.demo else 'invite','production_ready':not self.demo and not self.local_owner_id,'description':'Pinned local owner; loopback only' if self.local_owner_id else 'Seeded local identities' if self.demo else 'Invite-only Relay accounts; HTTPS required','native_enabled':self.native_enabled,'local_owner_id':self.local_owner_id},
             'personal_subscription':directory['personal_subscription'],
             'execution':{'mode':'mixed','connected':any(w['execution_mode'] in LIVE_MODES and w['health'].get('connected',False) for w in directory['workers']),'detail':'Native profiles use the local owner’s ChatGPT subscriptions and explicit handoffs. Simulated capacity is labeled; organization API capacity is shared by organization.'}}

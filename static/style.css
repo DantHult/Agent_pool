@@ -25,3 +25,9 @@ dialog{color:var(--text);background:#1c2531;border:1px solid #3d4c5e;border-radi
 .primary.danger{background:#5b3535;border-color:#7a4a4a;color:#f3d6d6}.primary.danger:hover:not(:disabled){background:#713f3f}
 #projectList .conversation-actions{margin-top:-2px}
 .conversation-actions{flex-wrap:wrap}
+/* Conversations grouped by project. */
+.project-conversations{border-bottom:1px solid var(--border);padding-bottom:4px}
+.project-conversations-heading{display:flex;align-items:baseline;gap:8px;padding:12px 12px 2px}
+.project-conversations-heading strong{font-size:12px;font-weight:600;color:#d5dee8;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.project-conversations-heading small{font-size:10px;color:#8cdbba}
+.project-handoff{padding:2px 12px 4px}

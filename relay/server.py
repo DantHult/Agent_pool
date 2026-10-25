@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from .store import Relay
-from .handoff import export_handoff
+from .handoff import export_handoff, export_project_handoff
 from .auth import LocalDemoIdentityProvider
 from .accounts import InviteIdentityProvider,LoginRequired,csrf_token,digest
 from .config import load_env_file
@@ -142,6 +142,8 @@ class Handler(BaseHTTPRequestHandler):
                 elif path=='/api/tasks':result=relay.management.tasks(user,q.get('project_id',[''])[0],q.get('worker_id',[None])[0])
                 elif path=='/api/ide/review':result=relay.management.review(user,q.get('project_id',[''])[0],q.get('task_id',[None])[0],q.get('before',[None])[0],q.get('after',[None])[0])
                 elif path=='/api/ide/conversations':result=self.server.ide.conversations(user,q.get('project_id',[''])[0])
+                elif path=='/api/conversations':result=self.server.ide.all_conversations(user)
+                elif re.fullmatch(r'/api/projects/[^/]+/handoff',path):result=export_project_handoff(relay,user,path.split('/')[3])
                 elif path=='/api/ide/console':
                     if not self.server.ide.console:raise PermissionError('Console execution requires the pinned local owner')
                     result=self.server.ide.console.poll(user,q.get('session_id',[''])[0],digest(self.token()))

@@ -198,6 +198,7 @@ async function load(force = false) {
     if($('project').innerHTML!==options)$('project').innerHTML=options;
     $('project').value=project;$('user').value=overview.user.id;
     render(); // Files/editor no longer wait for provider probes or event history.
+    if (conversationsVisible() && Date.now() - otherConversationsAt > 10000) loadAllConversations().catch(() => {});
     loadActivity(conversation,version,changed).catch(showError);
     if(changed || !workersLoading) {
       clearTimeout(workerTimer);
@@ -459,9 +460,39 @@ function renderConversation() {
   $('rawEventCount').textContent=events.length;
 }
 
+// Other projects' conversations, fetched while the Conversations tab is open.
+let otherConversations = null, otherConversationsAt = 0;
+async function loadAllConversations() {
+  if (!overview?.features?.all_conversations || document.body.classList.contains('signed-out')) return;
+  otherConversationsAt = Date.now();
+  const result = await api('conversations');
+  otherConversations = Object.fromEntries(result.projects.map(item => [item.id, item.conversations]));
+  renderConversations();
+}
+const conversationsVisible = () => !$('pane-conversations').hidden;
+document.querySelector('[data-pane="conversations"]')?.addEventListener('click', () => loadAllConversations().catch(showError));
+function handoffButtons(kind, id, label) {
+  return overview.features?.handoff_export ? `<button data-copy-${kind}="${esc(id)}" title="Copy a HANDOFF.md of ${label}, to continue it with another agent">Copy ${kind === 'project-handoff' ? 'project ' : ''}HANDOFF.md</button><button data-download-${kind}="${esc(id)}" title="Save the HANDOFF.md of ${label}">Download</button>` : '';
+}
+function otherConversationRow(item, projectId) {
+  return `<div class="conversation-row"><button class="conversation" data-open-conversation="${esc(item.id)}" data-conversation-project="${esc(projectId)}"><span>◉</span><div><strong>${esc(item.title)}${item.archived_at?' · Archived':''}</strong><small>${esc(item.latest_task ? item.latest_task.state.replaceAll('_', ' ') : 'No task yet')} · ${esc(item.updated_at ? new Date(item.updated_at).toLocaleDateString() : '')}<br>${esc((item.participants || []).map(worker=>worker.name).join(', ') || 'No agent participants yet')}</small></div></button><div class="conversation-actions">${handoffButtons('handoff', item.id, 'this conversation\'s work')}</div></div>`;
+}
 function renderConversations() {
   renderProjects();
-  $('conversationList').innerHTML=conversations.filter(item=>!item.archived_at || $('showArchived').checked || item.id===detail?.conversation.id).map(item => `<div class="conversation-row"><button class="conversation ${item.id===detail?.conversation.id ? 'selected' : ''}" data-conversation="${esc(item.id)}"><span>◉</span><div><strong>${esc(item.title)}${item.archived_at?' · Archived':''}</strong><small>${esc(item.latest_task ? workerName(item.latest_task.worker_id || item.latest_task.requested_worker_id)+' · '+item.latest_task.state : 'No task yet')}<br>${esc(item.updated_at ? new Date(item.updated_at).toLocaleDateString() : '')} · ${esc(item.event_count)} events saved<br>${esc((item.participants || []).map(worker=>worker.name).join(', ') || 'No agent participants yet')}</small></div></button><div class="conversation-actions"><button data-rename-conversation="${esc(item.id)}" ${!currentCanWrite()?'disabled':''}>Rename</button><button data-archive-conversation="${esc(item.id)}" ${!currentCanWrite()?'disabled':''}>${item.archived_at?'Restore':'Archive'}</button>${overview.features?.handoff_export?`<button data-copy-handoff="${esc(item.id)}" title="Copy a HANDOFF.md of this conversation's work, to continue it with another agent">Copy HANDOFF.md</button><button data-download-handoff="${esc(item.id)}" title="Save this conversation's HANDOFF.md">Download</button>`:''}</div></div>`).join('');
+  const visible = item => !item.archived_at || $('showArchived').checked || item.id===detail?.conversation.id;
+  const grouped = overview?.features?.all_conversations;
+  $('conversationList').innerHTML=(grouped ? overview.projects : overview.projects.filter(item => item.id===project)).map(item => {
+    const current = item.id===project, rows = current ? conversations : otherConversations?.[item.id];
+    const body = rows ? rows.filter(visible).map(row => current ? currentConversationRow(row) : otherConversationRow(row, item.id)).join('') || '<div class="empty">No conversations yet.</div>' : '<div class="empty">Loading conversations…</div>';
+    return `<section class="project-conversations ${current ? 'current' : ''}"><div class="project-conversations-heading"><strong title="${esc(item.name)}">${esc(item.name)}</strong>${current ? '<small>Open</small>' : ''}</div><div class="conversation-actions project-handoff">${handoffButtons('project-handoff', item.id, 'every active conversation in this project')}</div>${body}</section>`;
+  }).join('');
+  document.querySelectorAll('[data-open-conversation]').forEach(button => button.onclick=() => openTask(null, button.dataset.openConversation, button.dataset.conversationProject).catch(showError));
+  wireCurrentConversations();
+}
+function currentConversationRow(item) {
+  return `<div class="conversation-row"><button class="conversation ${item.id===detail?.conversation.id ? 'selected' : ''}" data-conversation="${esc(item.id)}"><span>◉</span><div><strong>${esc(item.title)}${item.archived_at?' · Archived':''}</strong><small>${esc(item.latest_task ? workerName(item.latest_task.worker_id || item.latest_task.requested_worker_id)+' · '+item.latest_task.state : 'No task yet')}<br>${esc(item.updated_at ? new Date(item.updated_at).toLocaleDateString() : '')} · ${esc(item.event_count)} events saved<br>${esc((item.participants || []).map(worker=>worker.name).join(', ') || 'No agent participants yet')}</small></div></button><div class="conversation-actions"><button data-rename-conversation="${esc(item.id)}" ${!currentCanWrite()?'disabled':''}>Rename</button><button data-archive-conversation="${esc(item.id)}" ${!currentCanWrite()?'disabled':''}>${item.archived_at?'Restore':'Archive'}</button>${handoffButtons('handoff', item.id, 'this conversation\'s work')}</div></div>`;
+}
+function wireCurrentConversations() {
   document.querySelectorAll('[data-conversation]').forEach(button => button.onclick=() => selectConversation(button.dataset.conversation).catch(showError));
   document.querySelectorAll('[data-rename-conversation]').forEach(button=>button.onclick=async()=>{
     const item=conversations.find(row=>row.id===button.dataset.renameConversation),title=window.prompt('Conversation title',item.title);if(!title?.trim())return;
@@ -649,12 +680,12 @@ function saveHandoff(handoff) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 document.addEventListener('click', async event => {
-  const button = event.target.closest('[data-copy-handoff],[data-download-handoff]');
+  const button = event.target.closest('[data-copy-handoff],[data-download-handoff],[data-copy-project-handoff],[data-download-project-handoff]');
   if (!button) return;
-  const id = button.dataset.copyHandoff || button.dataset.downloadHandoff;
-  const handoff = api('conversations/' + encodeURIComponent(id) + '/handoff');
+  const projectId = button.dataset.copyProjectHandoff || button.dataset.downloadProjectHandoff;
+  const handoff = projectId ? api('projects/' + encodeURIComponent(projectId) + '/handoff') : api('conversations/' + encodeURIComponent(button.dataset.copyHandoff || button.dataset.downloadHandoff) + '/handoff');
   try {
-    if (button.dataset.downloadHandoff) { saveHandoff(await handoff); showNotice('HANDOFF.md downloaded.'); return; }
+    if (button.dataset.downloadHandoff || button.dataset.downloadProjectHandoff) { saveHandoff(await handoff); showNotice('HANDOFF.md downloaded.'); return; }
     try {
       // Safari only allows clipboard writes inside the click, so hand it a promise.
       if (window.ClipboardItem && navigator.clipboard?.write) await navigator.clipboard.write([new ClipboardItem({'text/plain': handoff.then(value => new Blob([value.content], {type: 'text/plain'}))})]);
