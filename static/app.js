@@ -699,7 +699,7 @@ document.addEventListener('click', async event => {
 });
 
 function renderProjects() {
-  $('projectList').innerHTML = (overview?.projects || []).map(item => `<div class="conversation-row"><button class="conversation ${item.id === project ? 'selected' : ''}" data-open-project="${esc(item.id)}"><span>▱</span><div><strong>${esc(item.name)}</strong><small>${item.id === project ? 'Open now · ' : ''}${esc(item.role === 'admin' ? 'Administrator' : item.role)}</small></div></button>${item.role === 'admin' ? `<div class="conversation-actions"><button class="danger" data-delete-project="${esc(item.id)}">Delete</button></div>` : ''}</div>`).join('') || '<div class="empty">No projects yet.</div>';
+  $('projectList').innerHTML = (overview?.projects || []).map(item => `<div class="conversation-row"><button class="conversation ${item.id === project ? 'selected' : ''}" data-open-project="${esc(item.id)}"><span>▱</span><div><strong>${esc(item.name)}</strong><small>${item.id === project ? 'Open now · ' : ''}${esc(item.role === 'admin' ? 'Administrator' : item.role)}${overview.features?.internet_access ? ' · Internet: ' + internetSummary(item) : ''}</small></div></button>${item.role === 'admin' ? `<div class="conversation-actions">${overview.features?.internet_access ? `<button data-project-internet="${esc(item.id)}">Internet</button>` : ''}<button class="danger" data-delete-project="${esc(item.id)}">Delete</button></div>` : ''}</div>`).join('') || '<div class="empty">No projects yet.</div>';
 }
 let deletingProject = null;
 document.addEventListener('click', event => {
@@ -734,6 +734,54 @@ $('deleteProjectForm').onsubmit = async event => {
   finally { busy = false; if (detail) render(); }
 };
 $('newProjectPane').onclick = () => $('newProject').click();
+
+// Per-project internet access: any public host (default), listed domains with
+// optional API key names (values live in Relay's environment), or none.
+let internetProject = null;
+const textLines = value => value.split('\n').map(line => line.trim()).filter(Boolean);
+const internetSummary = item => ({off: 'off', listed: item.internet_domains + ' domain' + (item.internet_domains === 1 ? '' : 's')})[item.internet_mode] || 'any public host';
+const internetMode = () => document.querySelector('input[name="internetMode"]:checked')?.value || 'public';
+const INTERNET_NOTES = {
+  public: 'APIs that need no key work with no setup. API keys are never added in this mode, because any host could receive them; to use a key, list its domains instead.',
+  listed: 'Only these domains are reachable. The API keys listed here can be used with them.',
+  off: 'Agents and the apps they run cannot reach the internet.'
+};
+function showInternetMode() {
+  $('internetModeNote').textContent = INTERNET_NOTES[internetMode()];
+  $('internetListed').hidden = internetMode() !== 'listed';
+}
+function renderKeyHelp(settings) {
+  const status = settings.key_names.map(name => name + (settings.keys_configured[name] ? ': found in Relay\'s environment' : ': not found. Add RELAY_SECRET_' + name + '=… to Relay\'s environment file and restart Relay'));
+  $('internetKeyHelp').textContent = ['Put each key\'s value in Relay\'s environment file as RELAY_SECRET_<NAME>=value and start Relay with --env-file. Relay never shows or stores the values, and hides them from agent output.', ...status].join('\n');
+}
+document.addEventListener('click', event => {
+  const button = event.target.closest('[data-project-internet]');
+  if (!button || busy) return;
+  const item = overview?.projects.find(entry => entry.id === button.dataset.projectInternet);
+  api('projects/' + encodeURIComponent(item.id) + '/internet').then(settings => {
+    internetProject = item.id;
+    $('internetProject').textContent = 'Project: ' + item.name;
+    document.querySelector(`input[name="internetMode"][value="${settings.mode}"]`).checked = true;
+    $('internetDomains').value = settings.domains.join('\n'); $('internetKeys').value = settings.key_names.join('\n');
+    renderKeyHelp(settings); showInternetMode(); $('internetError').textContent = '';
+    $('internetDialog').showModal(); document.querySelector('input[name="internetMode"]:checked').focus();
+  }).catch(showError);
+});
+document.querySelectorAll('input[name="internetMode"]').forEach(input => input.addEventListener('change', showInternetMode));
+$('cancelInternet').onclick = () => $('internetDialog').close();
+$('internetForm').onsubmit = async event => {
+  event.preventDefault();
+  if (!internetProject || busy) return;
+  try {
+    const saved = await api('projects/internet', {project_id: internetProject, mode: internetMode(), domains: textLines($('internetDomains').value), key_names: textLines($('internetKeys').value), request_id: crypto.randomUUID()});
+    renderKeyHelp(saved);
+    const missing = saved.mode === 'listed' ? saved.key_names.filter(name => !saved.keys_configured[name]) : [];
+    $('internetDialog').close();
+    await load(true);
+    const reach = {public: 'agents can reach any public website or API', listed: 'agents can reach ' + saved.domains.join(', '), off: 'agents stay offline'}[saved.mode];
+    showNotice('Internet access saved: ' + reach + '. It applies to agents right away.' + (missing.length ? ' Not yet in Relay\'s environment: ' + missing.join(', ') + '.' : ''));
+  } catch (failure) { $('internetError').textContent = failure.message; }
+};
 $('newProject').onclick = async () => {
   if (busy) return;
   const name = window.prompt('Project name');

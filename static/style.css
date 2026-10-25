@@ -31,3 +31,6 @@ dialog{color:var(--text);background:#1c2531;border:1px solid #3d4c5e;border-radi
 .project-conversations-heading strong{font-size:12px;font-weight:600;color:#d5dee8;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .project-conversations-heading small{font-size:10px;color:#8cdbba}
 .project-handoff{padding:2px 12px 4px}
+#internetDialog textarea{width:100%;font:12px/1.5 "SFMono-Regular",Consolas,monospace}
+.internet-modes legend{font-size:10px;color:#8fa4b0;padding:0 4px}.internet-modes .checkbox-row{margin:6px 0;font-size:11px}#internetDialog input[type=radio]{padding:0}
+.key-help{white-space:pre-line}

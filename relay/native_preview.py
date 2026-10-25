@@ -91,15 +91,19 @@ def preview_policy(workspace, backend_port=8000, frontend_port=5173, runtime=Non
     return sandbox_policy(workspace, ports(backend_port, frontend_port), runtime)
 
 
-def sandbox_policy(workspace, selected, runtime=None):
-    """Seatbelt profile for project code that may use only the given loopback ports."""
+def sandbox_policy(workspace, selected, runtime=None, outbound=(), certificates=False):
+    """Seatbelt profile for project code that may use only the given loopback ports.
+
+    outbound ports (Relay's allowlisting proxy) can be connected to but never
+    served; certificates grants the system CA bundle for HTTPS through it.
+    """
     workspace = private_workspace(workspace)
     approved = toolchain()
     if runtime is not None and Path(runtime).resolve() != approved:
         raise ValueError('Preview runtime must be the approved toolchain')
     runtime = approved
-    if not 1 <= len(selected) <= 2 or len(set(selected)) != len(selected) or any(type(port) is not int or not 1024 <= port <= 65535 for port in selected):
-        raise ValueError('Select one or two distinct unprivileged loopback ports')
+    if len(selected) > 2 or len(set(selected)) != len(selected) or any(type(port) is not int or not 1024 <= port <= 65535 for port in (*selected, *outbound)):
+        raise ValueError('Select up to two distinct unprivileged loopback ports')
     python = Path(sys.base_prefix).resolve()
     if python in (Path('/'), Path.home().resolve()) or python.is_relative_to(root()):
         raise ValueError('Unsafe Python runtime scope')
@@ -137,6 +141,10 @@ def sandbox_policy(workspace, selected, runtime=None):
         lines.extend(('(allow network-bind (local ip ' + address + '))',
                       '(allow network-inbound (local ip ' + address + '))',
                       '(allow network-outbound (remote ip ' + address + '))'))
+    for port in outbound:
+        lines.append('(allow network-outbound (remote ip "localhost:' + str(port) + '"))')
+    if certificates:
+        lines.append('(allow file-read* (subpath "/private/etc/ssl"))')
     return '\n'.join(lines) + '\n'
 
 

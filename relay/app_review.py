@@ -21,6 +21,7 @@ import tempfile
 import threading
 import time
 
+from . import internet
 from .ide import file_path
 from .native_environment import workspace_environment
 from .native_preview import ensure_port_available, private_workspace, sandbox_policy, stop_group
@@ -51,7 +52,7 @@ TOOLS = [
                              'body': {'type': 'string'}, 'headers': {'type': 'object', 'additionalProperties': {'type': 'string'}},
                              'port': {'type': 'integer', 'description': 'Which of the app\'s ports; defaults to the first.'}}, ('path',))},
     {'type': 'function', 'name': 'view_page',
-     'description': 'Open a page of the running app in headless Chrome and return its visible text, console messages, uncaught JavaScript errors, failed requests and a screenshot. Only the app\'s own ports are reachable, so external resources fail to load.',
+     'description': 'Open a page of the running app in headless Chrome and return its visible text, console messages, uncaught JavaScript errors, failed requests and a screenshot. Other local services are unreachable; external resources load only where the project\'s internet access allows.',
      'inputSchema': _schema({'path': {'type': 'string', 'description': 'Path starting with /; defaults to /.'},
                              'port': {'type': 'integer'}, 'wait_ms': {'type': 'integer', 'description': 'Extra time after load for scripts to run (default 1500, max 10000).'},
                              'width': {'type': 'integer'}, 'height': {'type': 'integer'}, 'screenshot': {'type': 'boolean', 'description': 'Include a screenshot (default true).'}})},
@@ -59,7 +60,31 @@ TOOLS = [
      'description': 'Show the running app\'s recent output and whether it is still running.',
      'inputSchema': _schema({'lines': {'type': 'integer', 'description': 'Number of lines (default 80, max 400).'}})},
     {'type': 'function', 'name': 'stop_app', 'description': 'Stop the running app.', 'inputSchema': _schema({})},
+    {'type': 'function', 'name': 'fetch_url',
+     'description': 'Call an internet API yourself. Any public host is reachable unless the project limits access to listed domains or turns it off. Write ${NAME} in the url, headers or body to use an API key the project enables (only with listed domains); Relay inserts the value, which you never see. Redirects are returned, not followed.',
+     'inputSchema': _schema({'url': {'type': 'string', 'description': 'http:// or https:// URL the project\'s internet access allows.'},
+                             'method': {'type': 'string', 'enum': list(METHODS)}, 'body': {'type': 'string'},
+                             'headers': {'type': 'object', 'additionalProperties': {'type': 'string'}}}, ('url',))},
+    {'type': 'function', 'name': 'run_command',
+     'description': 'Run a short command from your workspace (a script or tests) with this project\'s internet access and API keys (as environment variables), and return its exit code and output. Your shell has no internet; use this for code that calls an external API. No ports can be opened.',
+     'inputSchema': _schema({'command': {'type': 'string', 'description': 'Command to run, for example "python3 -m unittest" or "node check_api.js". No shell syntax.'},
+                             'cwd': {'type': 'string', 'description': 'Directory relative to the workspace root.'},
+                             'timeout_seconds': {'type': 'integer', 'description': 'Default 60, max 300.'}}, ('command',))},
 ]
+
+
+def internet_note(settings):
+    """One paragraph for the agent's instructions about this project's internet access."""
+    if not settings or not settings['domains']:
+        return 'Internet: this project has internet access turned off, so external APIs cannot be reached; a project administrator can turn it on in Relay. '
+    if internet.ANY_PUBLIC in settings['domains']:
+        return ('Internet: your shell has no internet, but run_app apps, view_page, run_command and fetch_url can reach any public website or API on ports 80 and 443 '
+                '(addresses on this machine or a local network are refused). Prefer APIs that need no key: no API keys are available while the project allows any host, '
+                'so an API that requires a key needs a project administrator to limit access to listed domains and enable that key. ')
+    keys = sorted(settings['keys'])
+    return ('Internet: your shell has no internet, but run_app apps, view_page, run_command and fetch_url can reach these allowed domains: ' + ', '.join(settings['domains']) + '. '
+            + ('API keys available as environment variables in run_app and run_command, and as ${NAME} in fetch_url: ' + ', '.join(keys) + '. Never print, log or commit key values. ' if keys else 'No API keys are enabled. ')
+            + ('Listed but not yet configured by the administrator, so unavailable: ' + ', '.join(settings['missing']) + '. ' if settings.get('missing') else ''))
 
 
 def available():
@@ -120,9 +145,12 @@ def _app_path(path):
 
 
 class AppReview:
-    def __init__(self, workspace, emit=None):
+    def __init__(self, workspace, emit=None, internet=None):
         self.workspace = private_workspace(workspace)
         self.emit = emit or (lambda *args, **kwargs: None)
+        # Re-read on every call, so an administrator's change applies at once.
+        self.internet = internet or (lambda: {'domains': [], 'keys': {}})
+        self.proxy = None
         self.child = None
         self.ports = ()
         self.guards = []
@@ -155,6 +183,38 @@ class AppReview:
     def close(self):
         with self.lock:
             self._stop_app({})
+            if self.proxy:
+                self.proxy.close()
+                self.proxy = None
+
+    def _egress(self):
+        """This project's settings, with the session proxy matching its domains."""
+        settings = self.internet()
+        if settings['domains']:
+            if not self.proxy:
+                self.proxy = internet.EgressProxy(settings['domains'])
+            self.proxy.domains = list(settings['domains'])
+        elif self.proxy:
+            self.proxy.domains = []  # an open tunnel finishes; nothing new is allowed
+        return settings
+
+    def _sandbox(self, selected, settings):
+        """Seatbelt policy and environment for project code in this session."""
+        online = bool(settings['domains'])
+        policy = sandbox_policy(self.workspace, selected, outbound=(self.proxy.port,) if online else (), certificates=online)
+        environment = {**workspace_environment(self.workspace), 'HOST': '127.0.0.1', 'PYTHONUNBUFFERED': '1', 'BROWSER': 'none', 'NO_COLOR': '1'}
+        if online:
+            proxy = 'http://127.0.0.1:' + str(self.proxy.port)
+            environment.update({name: proxy for name in ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy')})
+            environment.update({'NO_PROXY': '127.0.0.1,localhost', 'no_proxy': '127.0.0.1,localhost', 'NODE_USE_ENV_PROXY': '1',
+                                'SSL_CERT_FILE': internet.SYSTEM_CERTIFICATES, 'NODE_EXTRA_CA_CERTS': internet.SYSTEM_CERTIFICATES})
+            environment.update(settings['keys'])
+        return policy, environment
+
+    def _internet_log(self):
+        if not self.proxy or not self.proxy.recent:
+            return ''
+        return '\n\nInternet requests (through Relay):\n' + '\n'.join(list(self.proxy.recent)[-20:])
 
     def _running(self):
         return self.child is not None and self.child.poll() is None
@@ -176,7 +236,7 @@ class AppReview:
         data = re.sub(r'\x1b(?:\][^\x07]*(?:\x07|\x1b\\)|\[[0-?]*[ -/]*[@-~])', '', data)
         return '\n'.join(data.splitlines()[-lines:])
 
-    def _run_app(self, arguments):
+    def _command(self, arguments):
         command = arguments.get('command')
         if not isinstance(command, str) or not command.strip() or len(command) > 1000:
             raise ValueError('command must be 1-1000 characters')
@@ -191,6 +251,10 @@ class AppReview:
             cwd = self.workspace.joinpath(*file_path(arguments['cwd'], write=True))
             if cwd.is_symlink() or not cwd.resolve().is_relative_to(self.workspace) or not cwd.is_dir():
                 raise ValueError('cwd must be an existing folder inside your workspace')
+        return argv, cwd
+
+    def _run_app(self, arguments):
+        argv, cwd = self._command(arguments)
         selected = [_bounded(arguments.get('port'), None, 1024, 65535, 'port') or _free_port()]
         if arguments.get('second_port') is not None:
             selected.append(_bounded(arguments['second_port'], None, 1024, 65535, 'second_port'))
@@ -200,9 +264,8 @@ class AppReview:
             ensure_port_available(port)  # never hand an existing service to project code
         for port in selected:
             self.guards += _reserve_wildcards(port)
-        policy = sandbox_policy(self.workspace, selected)
-        environment = {**workspace_environment(self.workspace), 'PORT': str(selected[0]), 'HOST': '127.0.0.1',
-                       'PYTHONUNBUFFERED': '1', 'BROWSER': 'none', 'NO_COLOR': '1'}
+        policy, environment = self._sandbox(selected, self._egress())
+        environment['PORT'] = str(selected[0])
         if len(selected) > 1:
             environment['SECOND_PORT'] = str(selected[1])
         directory = os.open(self.workspace / '.native', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -270,7 +333,8 @@ class AppReview:
         width = _bounded(arguments.get('width'), 1280, 320, 2560, 'width')
         height = _bounded(arguments.get('height'), 800, 240, 2000, 'height')
         screenshot = arguments.get('screenshot', True) is not False
-        page = PageView(browser, self.ports)
+        self._egress()
+        page = PageView(browser, self.ports, self.proxy.port if self.proxy and self.proxy.domains else None)
         try:
             result = page.open('http://127.0.0.1:' + str(port) + path, wait, width, height, screenshot)
         finally:
@@ -280,7 +344,7 @@ class AppReview:
             if items:
                 lines += ['', heading + ':'] + ['- ' + item for item in items[:40]]
         if result['failed']:
-            lines.append('(Requests outside the app\'s own port are blocked in review, so external resources are expected to fail.)')
+            lines.append('(Requests to other local services, and to hosts the project\'s internet access does not allow, are blocked in review.)')
         lines += ['', 'Visible text:', result['text'][:8000] or '(no visible text)']
         return '\n'.join(lines), result['screenshot']
 
@@ -289,7 +353,45 @@ class AppReview:
         if self.child is None:
             return 'No app has been started in this task.'
         state = 'running' if self._running() else 'exited with code ' + str(self.child.returncode)
-        return 'App is ' + state + '.\n\n' + (self._tail(lines) or '(no output)')
+        return 'App is ' + state + '.\n\n' + (self._tail(lines) or '(no output)') + self._internet_log()
+
+    def _fetch_url(self, arguments):
+        settings = self._egress()
+        url, method = arguments.get('url'), arguments.get('method', 'GET')
+        if not isinstance(url, str) or len(url) > 4000 or any(ord(char) < 33 for char in url):
+            raise ValueError('url must be a single http:// or https:// address')
+        if method not in METHODS:
+            raise ValueError('method must be one of ' + ', '.join(METHODS))
+        headers = arguments.get('headers') or {}
+        if not isinstance(headers, dict) or len(headers) > 20 or any(not isinstance(k, str) or not isinstance(v, str) or any(c in k + v for c in '\r\n') for k, v in headers.items()):
+            raise ValueError('headers must be at most 20 single-line text values')
+        body = arguments.get('body')
+        if body is not None and (not isinstance(body, str) or len(body) > 100000):
+            raise ValueError('body must be text of at most 100,000 characters')
+        response, data, truncated, elapsed = internet.fetch(url, method, headers, body, settings['domains'], settings['keys'])
+        shown = '\n'.join(name + ': ' + value for name, value in response.getheaders() if name.lower() in ('content-type', 'content-length', 'location', 'retry-after', 'x-ratelimit-remaining'))
+        text = data[:TEXT_LIMIT].decode('utf-8', 'replace')
+        return (method + ' ' + url + ' -> ' + str(response.status) + ' ' + response.reason + ' in ' + str(elapsed) + ' ms\n' + shown + '\n\n'
+                + (text or '(empty body)') + ('\n\n[body truncated]' if truncated or len(data) > TEXT_LIMIT else ''))
+
+    def _run_command(self, arguments):
+        argv, cwd = self._command(arguments)
+        timeout = _bounded(arguments.get('timeout_seconds'), 60, 1, 300, 'timeout_seconds')
+        settings = self._egress()
+        policy, environment = self._sandbox([], settings)
+        started = time.monotonic()
+        child = subprocess.Popen([SANDBOX, '-p', policy, *argv], cwd=cwd, env=environment, stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            output, _ = child.communicate(timeout=timeout)
+            status = 'exited with code ' + str(child.returncode)
+        except subprocess.TimeoutExpired:
+            stop_group(child)
+            output, status = child.stdout.read() if child.stdout else b'', 'was stopped after ' + str(timeout) + ' s'
+        text = output[-TEXT_LIMIT:].decode('utf-8', 'replace')
+        text = re.sub(r'\x1b(?:\][^\x07]*(?:\x07|\x1b\\)|\[[0-?]*[ -/]*[@-~])', '', text)
+        reach = ('with internet access to ' + internet.describe(settings['domains'])) if settings['domains'] else 'without internet access (this project has it turned off)'
+        return ('Command ' + status + ' in ' + str(int((time.monotonic() - started) * 1000)) + ' ms, run ' + reach + '.\n\n' + (text or '(no output)') + self._internet_log())
 
     def _stop_app(self, arguments):
         for guard in self.guards:
@@ -306,13 +408,15 @@ class AppReview:
 class PageView:
     """One headless Chrome page driven over a private DevTools pipe.
 
-    The proxy points at a closed port and only the app's ports bypass it, so
-    page scripts cannot reach other local services or the Internet. A fresh
-    temporary profile holds no cookies or credentials.
+    Only the app's ports bypass the proxy, which is the session's egress proxy
+    or, without internet access, a closed port; so page scripts cannot reach
+    other local services, and reach the Internet only as the project allows.
+    A fresh temporary profile holds no cookies or credentials.
     """
-    def __init__(self, browser, allowed_ports):
+    def __init__(self, browser, allowed_ports, proxy_port=None):
         self.profile = tempfile.mkdtemp(prefix='relay-review-')
-        closed = _free_port()
+        # Without internet access the proxy is a closed port, so every request fails.
+        closed = proxy_port or _free_port()
         bypass = ';'.join(['<-loopback>'] + ['127.0.0.1:' + str(port) for port in allowed_ports])
         flags = ['--headless=new', '--use-mock-keychain', '--password-store=basic', '--no-first-run', '--no-default-browser-check',
                  '--disable-extensions', '--disable-background-networking', '--disable-component-update', '--disable-sync',

@@ -133,7 +133,7 @@ class AppReviewTests(unittest.TestCase):
         self.assertFalse(any('relay-review-' in name for name in os.listdir(tempfile.gettempdir()) if (Path(tempfile.gettempdir()) / name).is_dir() and time.time() - (Path(tempfile.gettempdir()) / name).stat().st_mtime < 5))
 
     def test_tool_specs_are_valid_for_codex(self):
-        self.assertEqual([tool['name'] for tool in TOOLS], ['run_app', 'http_request', 'view_page', 'app_logs', 'stop_app'])
+        self.assertEqual([tool['name'] for tool in TOOLS], ['run_app', 'http_request', 'view_page', 'app_logs', 'stop_app', 'fetch_url', 'run_command'])
         for tool in TOOLS:
             self.assertEqual(tool['inputSchema']['type'], 'object');self.assertFalse(tool['inputSchema']['additionalProperties'])
 

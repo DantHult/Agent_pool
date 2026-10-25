@@ -51,7 +51,7 @@ def remove_private_workspace(profile, identity):
     remove_tree(target);return True
 
 # Offered with Relay's app review tools; the shell itself still has no network.
-REVIEW_INSTRUCTIONS=('To review an app you build, call run_app to start it (your shell cannot open ports; servers must listen on 127.0.0.1 using $HOST and $PORT), then use http_request and view_page '
+REVIEW_INSTRUCTIONS=('To review an app you build, call run_app to start it (your shell cannot open ports or reach the internet; servers must listen on 127.0.0.1 using $HOST and $PORT), then use http_request and view_page '
                      '(visible text, console messages, JavaScript errors and a screenshot) and app_logs; call stop_app when done. '
                      'Do not report blocked only because your shell cannot start a server. If the app cannot run even with these tools, list that under limitations. ')
 
@@ -395,8 +395,11 @@ class NativeCodexAdapter:
             session.auth();client=session.connect();client.drain()
             working,expected=self._prepare(workspace)
             from . import app_review
+            loader=self.worker.get('_internet');project=Path(workspace).name
+            internet=(lambda:loader(project)) if loader else None
             if app_review.available():
-                review=app_review.AppReview(working,emit);client.tool_handler=review.handle
+                review=app_review.AppReview(working,emit,internet);client.tool_handler=review.handle
+            access=app_review.internet_note(internet()) if review and internet else ''
             environment=json.loads((working/'.native/environment.json').read_text())
             emit('native_environment',environment['message'],environment)
             session.permissions(working)
@@ -408,7 +411,7 @@ class NativeCodexAdapter:
             text=('Work only in the current private workspace. Read .relay/HANDOFF.md and relevant .relay/history. Never read or request authentication credentials. '
                   'Git checkpoints are managed by Relay; do not modify .git or .relay. Use python/python3 from PATH and the approved node/npm on PATH. '
                   'Read .native/environment.json for dependency readiness. Package downloads are disabled; do not retry network installation. '
-                  +(REVIEW_INSTRUCTIONS if review else '')+
+                  +(REVIEW_INSTRUCTIONS+access if review else '')+
                   'Stay within the original authorization. Report completion_state=continue with concrete pending_steps only when useful authorized work remains. '
                   'Report blocked for missing dependencies or genuine obstacles, needs_authorization for out-of-scope permissions, uncertain for ambiguous completion. '
                   'Report completed only when all acceptance criteria are met and include concrete acceptance_evidence, completed_work and actual test_results. '+phase+'\n\nOriginal request:\n'+task['objective']+'\n\nWorking context:\n'+json.dumps(context)[:30000])
@@ -468,7 +471,7 @@ class NativeCodexAdapter:
                 turn_index+=1
                 text=('Continue the same original authorized objective below. Inspect the saved context and files; preserve completed work. '
                       'The previous turn ended at an intermediate checkpoint, not task completion. Do remaining steps and actual tests. '
-                      'Stop with blocked or needs_authorization when appropriate. Do not request routine permission already granted. '+(REVIEW_INSTRUCTIONS if review else '')+'\nOriginal request:\n'+task['objective']+'\nSaved progress:\n'+json.dumps(saved)[:30000])
+                      'Stop with blocked or needs_authorization when appropriate. Do not request routine permission already granted. '+(REVIEW_INSTRUCTIONS+access if review else '')+'\nOriginal request:\n'+task['objective']+'\nSaved progress:\n'+json.dumps(saved)[:30000])
                 emit('continuation','Continuing the unfinished objective on the same worker and native thread',{'native_thread_id':native,'turn_index':turn_index,'checkpoint':expected})
             result.duration_ms=int((time.monotonic()-started)*1000)
             return result

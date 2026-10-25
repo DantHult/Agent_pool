@@ -26,7 +26,8 @@ def load_env_file(path: str | Path) -> None:
         if not line or line.startswith('#'): continue
         if line.startswith('export '): line=line[7:].lstrip()
         key,separator,value=line.partition('=');key=key.strip()
-        if not separator or not re.fullmatch(r'RELAY_[A-Z0-9_]+',key) or key not in ENV_KEYS:
+        # RELAY_SECRET_<NAME> holds an API key a project may enable by name.
+        if not separator or not re.fullmatch(r'RELAY_[A-Z0-9_]+',key) or (key not in ENV_KEYS and not re.fullmatch(r'RELAY_SECRET_[A-Z][A-Z0-9_]{0,63}',key)):
             raise ValueError(f'Unsupported environment setting at line {number}; use .env.example')
         try: parts=shlex.split(value,comments=True,posix=True)
         except ValueError: raise ValueError(f'Invalid quoting in environment file at line {number}') from None

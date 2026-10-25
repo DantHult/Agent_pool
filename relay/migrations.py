@@ -43,6 +43,7 @@ def migrate(db):
         migrate_management(db)
         migrate_reservation_leases(db)
         migrate_project_deletion(db)
+        migrate_project_internet(db)
         return
     timestamp=datetime.now(timezone.utc).isoformat()
     db.execute('BEGIN IMMEDIATE')
@@ -83,6 +84,7 @@ def migrate(db):
     migrate_management(db)
     migrate_reservation_leases(db)
     migrate_project_deletion(db)
+    migrate_project_internet(db)
 
 
 def migrate_live(db):
@@ -209,6 +211,20 @@ def migrate_project_deletion(db):
         # entries still name a real project; Relay refuses all access to it.
         db.execute('ALTER TABLE projects ADD COLUMN deleted_at TEXT')
         db.execute('INSERT INTO schema_migrations VALUES(10,?)',(datetime.now(timezone.utc).isoformat(),))
+        db.execute('COMMIT')
+    except Exception:
+        db.execute('ROLLBACK');raise
+
+
+def migrate_project_internet(db):
+    if db.execute('SELECT 1 FROM schema_migrations WHERE version=11').fetchone():return
+    db.execute('BEGIN IMMEDIATE')
+    try:
+        # Whether a project's agents may reach any public host (the default
+        # without a row), only listed domains, or nothing; and the names
+        # (never values) of API keys from Relay's environment for listed domains.
+        db.execute("CREATE TABLE project_internet(project_id TEXT PRIMARY KEY,mode TEXT NOT NULL DEFAULT 'public',domains TEXT NOT NULL,key_names TEXT NOT NULL,updated_by TEXT NOT NULL,updated_at TEXT NOT NULL)")
+        db.execute('INSERT INTO schema_migrations VALUES(11,?)',(datetime.now(timezone.utc).isoformat(),))
         db.execute('COMMIT')
     except Exception:
         db.execute('ROLLBACK');raise

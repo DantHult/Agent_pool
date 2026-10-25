@@ -65,7 +65,7 @@ class Relay:
         return dict(r)
     def adapter(self,worker):
         if worker.get('execution_mode')=='native':
-            worker={**worker,'_native_owner_id':self.native_actor(),'_native_enabled':self.native_enabled}
+            worker={**worker,'_native_owner_id':self.native_actor(),'_native_enabled':self.native_enabled,'_internet':self.internet_for}
         return get_adapter(worker)
     def native_actor(self):
         from .native import native_owner
@@ -197,6 +197,47 @@ class Relay:
         self.db.execute('INSERT INTO conversations(id,project_id,title,created_at,updated_at) VALUES(?,?,?,?,?)',(uid(),project,clean(name),now(),now()))
         self.audit(user,'project_created',project=project)
         return {'id':project}
+    def internet_for(self,project):
+        """Reachable domains and enabled API key values for a project's agents (no access check)."""
+        from .internet import ANY_PUBLIC
+        with self.lock:
+            rows=self.rows('SELECT * FROM project_internet WHERE project_id=?',(project,))
+            live=self.rows('SELECT 1 FROM projects WHERE id=? AND deleted_at IS NULL',(project,))
+        mode=rows[0]['mode'] if rows else 'public'
+        if not live or mode=='off':return {'mode':'off','domains':[],'keys':{},'missing':[]}
+        # Any host could receive a key, so keys go only with listed domains.
+        if mode=='public':return {'mode':'public','domains':[ANY_PUBLIC],'keys':{},'missing':[]}
+        from .security import SECRET_PREFIX
+        names=json.loads(rows[0]['key_names'])
+        return {'mode':'listed','domains':json.loads(rows[0]['domains']),'keys':{name:os.environ[SECRET_PREFIX+name] for name in names if os.environ.get(SECRET_PREFIX+name)},
+                'missing':[name for name in names if not os.environ.get(SECRET_PREFIX+name)]}
+    def _project_admin(self,user,project):
+        p=self.write_access(user,project)
+        if not self.is_admin(user,p['organization_id']) and self.one('SELECT role FROM memberships WHERE user_id=? AND project_id=?',(user,project))['role']!='admin':
+            raise PermissionError('Only a project administrator can change this project')
+        return p
+    def internet_settings(self,user,project):
+        self.access(user,project)
+        from .internet import configured
+        rows=self.rows('SELECT * FROM project_internet WHERE project_id=?',(project,))
+        mode,domains,names=(rows[0]['mode'],json.loads(rows[0]['domains']),json.loads(rows[0]['key_names'])) if rows else ('public',[],[])
+        try:self._project_admin(user,project);editable=True
+        except PermissionError:editable=False
+        # Whether each key is present in Relay's environment; never its value.
+        return {'mode':mode,'domains':domains,'key_names':names,'keys_configured':{name:configured(name) for name in names},'editable':editable,
+                'updated_at':rows[0]['updated_at'] if rows else None}
+    def set_internet(self,user,data):
+        from .internet import MODES,normalize_domains,normalize_key_names
+        project=data['project_id'];self._project_admin(user,project)
+        domains,names=normalize_domains(data.get('domains',[])),normalize_key_names(data.get('key_names',[]))
+        mode=data.get('mode') or ('listed' if domains else 'off')
+        if mode not in MODES:raise ValueError('mode must be one of '+', '.join(MODES))
+        if mode=='listed' and not domains:raise ValueError('List at least one domain, or allow any public host')
+        # The list is kept in every mode, so switching back restores it.
+        self.db.execute('INSERT INTO project_internet(project_id,mode,domains,key_names,updated_by,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(project_id) DO UPDATE SET mode=excluded.mode,domains=excluded.domains,key_names=excluded.key_names,updated_by=excluded.updated_by,updated_at=excluded.updated_at',
+                        (project,mode,json.dumps(domains),json.dumps(names),user,now()))
+        self.audit(user,'project_internet_changed',project=project,metadata={'mode':mode,'domains':domains,'key_names':names})
+        return self.internet_settings(user,project)
     def delete_project(self,user,data):
         """Remove a project from Relay after its administrator confirms by name.
 
@@ -205,9 +246,7 @@ class Relay:
         database, unreachable through Relay. Nothing runs while it is deleted.
         """
         from .ide import WorkspaceConflict
-        project=data['project_id'];p=self.write_access(user,project)
-        if not self.is_admin(user,p['organization_id']) and self.one('SELECT role FROM memberships WHERE user_id=? AND project_id=?',(user,project))['role']!='admin':
-            raise PermissionError('Only a project administrator can delete this project')
+        project=data['project_id'];p=self._project_admin(user,project)
         if data.get('confirm_name')!=p['name']:raise ValueError('Type the project name exactly to confirm deletion')
         unfinished=self.rows("SELECT t.* FROM tasks t JOIN conversations c ON c.id=t.conversation_id WHERE c.project_id=? AND t.state NOT IN ('completed','failed','cancelled')",(project,))
         if self.rows('SELECT 1 FROM workspace_leases WHERE project_id=?',(project,)) or any(t['state'] not in ('queued','handoff_pending') or t['id'] in self.jobs for t in unfinished):
@@ -222,7 +261,7 @@ class Relay:
         clones=self.rows("SELECT DISTINCT json_extract(metadata,'$.native_profile') AS profile,json_extract(metadata,'$.workspace_id') AS identity FROM events WHERE project_id=? AND event_type='session_started'",(project,))
         artifacts=[row['artifact'] for row in self.rows("SELECT json_extract(metadata,'$.artifact_id') AS artifact FROM events WHERE project_id=? AND json_extract(metadata,'$.artifact_id') IS NOT NULL",(project,))]
         self.db.execute('UPDATE projects SET deleted_at=? WHERE id=?',(now(),project))
-        for table in ('worker_projects','editor_drafts','human_workspace_locks'):
+        for table in ('worker_projects','editor_drafts','human_workspace_locks','project_internet'):
             self.db.execute(f'DELETE FROM {table} WHERE project_id=?',(project,))
         self.db.execute('UPDATE invitations SET revoked_at=? WHERE project_id=? AND accepted_at IS NULL AND revoked_at IS NULL',(time.time(),project))
         self.audit(user,'project_deleted',project=project,metadata={'name':p['name'],'cancelled_tasks':[t['id'] for t in unfinished]})
@@ -814,6 +853,9 @@ class Relay:
         for p in projects:
             p['role']='admin' if self.is_admin(user) else self.one('SELECT role FROM memberships WHERE user_id=? AND project_id=?',(user,p['id']))['role']
             p['can_write']=p['role']!='viewer' and self.org_member(user)['role']!='viewer'
+            internet=self.rows('SELECT mode,domains FROM project_internet WHERE project_id=?',(p['id'],))
+            p['internet_mode']=internet[0]['mode'] if internet else 'public'
+            p['internet_domains']=len(json.loads(internet[0]['domains'])) if internet else 0
         return projects
     def overview(self,user,light=False):
         u=self.user(user); self.org_member(user)
@@ -821,7 +863,7 @@ class Relay:
         directory={'workers':[],'personal_subscription':{'supported':False,'reason':PERSONAL_UNSUPPORTED_REASON}} if light else self.workers(user)
         people=self.rows('SELECT id,name,role FROM users') if self.demo else self.rows('SELECT u.id,u.name,u.role FROM users u JOIN accounts a ON a.user_id=u.id WHERE a.disabled=0')
         return {'user':u,'users':people,'organizations':self.rows('SELECT * FROM organizations'),'projects':projects,'workers':directory['workers'],
-            'features':{'agent_management':True,'explorer_operations':True,'checkpoint_reviews':True,'automatic_workflow':True,'recent_history':True,'development_terminal':True,'live_agents':True,'editor_leases':True,'handoff_export':True,'all_conversations':True},
+            'features':{'agent_management':True,'explorer_operations':True,'checkpoint_reviews':True,'automatic_workflow':True,'recent_history':True,'development_terminal':True,'live_agents':True,'editor_leases':True,'handoff_export':True,'all_conversations':True,'internet_access':True},
             'auth':{'mode':'local-owner' if self.local_owner_id else 'local_demo' if self.demo else 'invite','production_ready':not self.demo and not self.local_owner_id,'description':'Pinned local owner; loopback only' if self.local_owner_id else 'Seeded local identities' if self.demo else 'Invite-only Relay accounts; HTTPS required','native_enabled':self.native_enabled,'local_owner_id':self.local_owner_id},
             'personal_subscription':directory['personal_subscription'],
             'execution':{'mode':'mixed','connected':any(w['execution_mode'] in LIVE_MODES and w['health'].get('connected',False) for w in directory['workers']),'detail':'Native profiles use the local owner’s ChatGPT subscriptions and explicit handoffs. Simulated capacity is labeled; organization API capacity is shared by organization.'}}
@@ -891,6 +933,7 @@ class Relay:
                 return cached
             if method=='projects': result=self.create_project(user,data['name'])
             elif method=='projects/delete': result=self.delete_project(user,data)
+            elif method=='projects/internet': result=self.set_internet(user,data)
             elif method=='prompt': result=self.submit(user,data['conversation_id'],data['prompt'],data.get('worker_id'),data.get('execution_mode'),data.get('pause_after_turn',False),data.get('native_phases',2))
             elif method in ('switch','limit'):
                 result=self.switch(user,data['task_id'],int(data['generation']),'Simulated usage limit' if method=='limit' else 'Manual worker switch',data.get('target_worker_id'),'simulated_limit' if method=='limit' else data.get('reason_code','manual_switch'))

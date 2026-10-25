@@ -143,6 +143,7 @@ class Handler(BaseHTTPRequestHandler):
                 elif path=='/api/ide/review':result=relay.management.review(user,q.get('project_id',[''])[0],q.get('task_id',[None])[0],q.get('before',[None])[0],q.get('after',[None])[0])
                 elif path=='/api/ide/conversations':result=self.server.ide.conversations(user,q.get('project_id',[''])[0])
                 elif path=='/api/conversations':result=self.server.ide.all_conversations(user)
+                elif re.fullmatch(r'/api/projects/[^/]+/internet',path):result=relay.internet_settings(user,path.split('/')[3])
                 elif re.fullmatch(r'/api/projects/[^/]+/handoff',path):result=export_project_handoff(relay,user,path.split('/')[3])
                 elif path=='/api/ide/console':
                     if not self.server.ide.console:raise PermissionError('Console execution requires the pinned local owner')
