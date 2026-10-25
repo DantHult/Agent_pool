@@ -32,6 +32,8 @@ let liveTimer = null;
 let nativeProfiles = null;
 let selectedConversation = null;
 let conversations = [];
+let projectTasks = [];
+let assignmentTarget = '';
 let activityFrame = null;
 const activityView = new RelayActivity.View($('timeline'), workerName);
 
@@ -77,7 +79,7 @@ function projectWorkers() {
 }
 
 function workerName(id) {
-  const worker = projectWorkers().find(item => item.id === id);
+  const worker = [...projectWorkers(),...conversations.flatMap(item=>item.participants || [])].find(item => item.id === id);
   return worker?.display_name || worker?.name || id || 'Unassigned';
 }
 
@@ -116,6 +118,7 @@ function invalidateView() {
   nativeProfiles = null;
   selectedConversation = null;
   conversations = [];
+  projectTasks = [];
   activityView.reset(null);
   selectedStartWorker = '';
   selectedTarget = '';
@@ -125,6 +128,7 @@ function invalidateView() {
   $('handoffs').textContent = '';
   $('workers').textContent = '';
   $('conversationList').textContent='';
+  $('projectTasks').textContent='';
   $('taskObjective').textContent='Loading conversation…';$('taskObjectiveFull').textContent='';$('activeWorkerLabel').textContent='No worker selected';
 }
 
@@ -184,10 +188,12 @@ async function load(force = false) {
       return;
     }
     const listed = await api('ide/conversations?' + new URLSearchParams({project_id:nextProject}));
+    const tasks = nextOverview.features?.agent_management ? await api('tasks?' + new URLSearchParams({project_id:nextProject})) : {tasks:[]};
     if (version !== viewVersion || serial !== refreshSerial) return;
     conversations = listed.conversations;
+    projectTasks = tasks.tasks;
     const remembered = sessionStorage.getItem('relay-conversation:' + nextOverview.user.id + ':' + nextProject);
-    const choice = [selectedConversation,remembered].find(id => conversations.some(item => item.id === id)) || conversations[0]?.id;
+    const choice = [selectedConversation,remembered].find(id => conversations.some(item => item.id === id)) || conversations.find(item=>!item.archived_at)?.id || conversations[0]?.id;
     const nextDetail = await api('projects/' + encodeURIComponent(nextProject) + (choice ? '?conversation_id=' + encodeURIComponent(choice) : ''));
     if (version !== viewVersion || serial !== refreshSerial) return;
     const conversation = nextDetail.conversation.id;
@@ -243,8 +249,8 @@ function renderWorker(worker, task) {
   const availabilityControl = mode === 'personal_supported'
     ? '<select name="state" disabled><option value="unsupported">Unsupported</option></select>'
     : `<select name="state">${['available', 'paused', 'offline', 'quota_blocked'].map(value => `<option value="${value}" ${status === value || capacity.availability === value ? 'selected' : ''}>${value.replace('_', ' ')}</option>`).join('')}</select>`;
-  const settings = canManage(worker) ? `<details class="worker-settings" data-settings="${esc(worker.id)}"><summary>Owner settings</summary><form data-worker-form="${esc(worker.id)}"><label>Availability${availabilityControl}</label><label class="checkbox-row"><input type="checkbox" name="opt_in" ${worker.opt_in ? 'checked' : ''}> Opt in to eligible assignments</label><fieldset><legend>Explicit project approvals</legend>${overview.projects.map(item => `<label class="checkbox-row"><input type="checkbox" name="project_ids" value="${esc(item.id)}" ${projects.includes(item.id) ? 'checked' : ''}> ${esc(item.name)}</label>`).join('')}</fieldset><div class="settings-actions"><button class="outline" type="submit">Save settings</button><button class="quiet danger" type="button" data-revoke="${esc(worker.id)}">Opt out & stop safely</button></div></form></details>` : '<div class="permission-note">Settings controlled by the worker owner or administrator</div>';
-  return `<article class="worker-entry ${active ? 'active' : ''}"><div class="worker"><span class="worker-icon">⌘</span><div><strong>${esc(worker.display_name || worker.name)}</strong><small>${esc(ownerName(worker))} · ${worker.owner_type === 'org' ? 'Organization owned' : 'User owned'}</small></div><span class="state">${esc(active ? task.state.replaceAll('_', ' ') : status.replaceAll('_', ' '))}</span></div><div class="worker-facts"><span class="pill ${mode === 'simulation' ? 'simulated' : mode === 'personal_supported' ? 'blocked' : 'api-mode'}">${esc(modeLabel)}</span><span class="eligibility ${eligible(worker) ? 'eligible' : ''}">${eligible(worker) ? '✓ Eligible' : '○ Not eligible'}</span><p>${esc(reason)}</p><dl><dt>Project</dt><dd>${esc((worker.assigned_projects || []).map(item => item.name + ' · ' + item.state.replaceAll('_', ' ')).join(', ') || 'No current assignment')}</dd><dt>Consent</dt><dd>${worker.opt_in ? 'Opted in' : 'Opted out'}</dd><dt>Capacity</dt><dd>${esc(scope)}</dd><dt>Observation</dt><dd>${esc(capacity.source || 'manual')} · ${esc(capacity.availability || status)}</dd><dt>Quota scope</dt><dd>${esc(capacity.quota_scope || 'Not reported')}</dd><dt>Last seen</dt><dd>${esc(displayDate(worker.last_seen_at))}</dd><dt>Capabilities</dt><dd>${esc(Object.keys(worker.health?.capabilities || {}).filter(key => worker.health.capabilities[key] === true).join(', ') || 'Not reported')}</dd><dt>Parallel tasks</dt><dd>${esc(worker.max_parallel_tasks || 1)}</dd>${capacity.reset_at ? `<dt>Reset reported</dt><dd>${esc(displayDate(capacity.reset_at))}</dd>` : ''}</dl>${worker.health?.reason ? `<p class="health-note">${esc(worker.health.reason)}</p>` : ''}</div>${settings}</article>`;
+  const settings = canManage(worker) ? `<details class="worker-settings" data-settings="${esc(worker.id)}"><summary>Owner settings</summary><form data-worker-form="${esc(worker.id)}"><label>Display name<input name="display_name" maxlength="100" required value="${esc(worker.display_name || worker.name)}"></label><label>Availability${availabilityControl}</label><label class="checkbox-row"><input type="checkbox" name="opt_in" ${worker.opt_in ? 'checked' : ''}> Opt in to eligible assignments</label><fieldset><legend>Explicit project approvals</legend>${overview.projects.map(item => `<label class="checkbox-row"><input type="checkbox" name="project_ids" value="${esc(item.id)}" ${projects.includes(item.id) ? 'checked' : ''}> ${esc(item.name)}</label>`).join('')}</fieldset><div class="settings-actions"><button class="outline" type="submit">Save settings</button><button class="quiet danger" type="button" data-revoke="${esc(worker.id)}">Opt out & stop safely</button></div></form></details>` : '<div class="permission-note">Settings controlled by the worker owner or administrator</div>';
+  return `<article class="worker-entry ${active ? 'active' : ''}"><div class="worker"><span class="worker-icon">⌘</span><div><strong>${esc(worker.display_name || worker.name)}</strong><small>${esc(ownerName(worker))} · ${worker.owner_type === 'org' ? 'Organization owned' : 'User owned'}</small></div><span class="state">${esc(active ? task.state.replaceAll('_', ' ') : status.replaceAll('_', ' '))}</span></div>${renderWorkerActions(worker)}<details class="worker-facts"><summary>Permissions &amp; runtime</summary><span class="pill ${mode === 'simulation' ? 'simulated' : mode === 'personal_supported' ? 'blocked' : 'api-mode'}">${esc(modeLabel)}</span><span class="eligibility ${eligible(worker) ? 'eligible' : ''}">${eligible(worker) ? '✓ Eligible' : '○ Not eligible'}</span><p>${esc(reason)}</p><dl><dt>Project</dt><dd>${esc((worker.assigned_projects || []).map(item => item.name + ' · ' + item.state.replaceAll('_', ' ')).join(', ') || 'No current assignment')}</dd><dt>Consent</dt><dd>${worker.opt_in ? 'Opted in' : 'Opted out'}</dd><dt>Capacity</dt><dd>${esc(scope)}</dd><dt>Observation</dt><dd>${esc(capacity.source || 'manual')} · ${esc(capacity.availability || status)}</dd><dt>Quota scope</dt><dd>${esc(capacity.quota_scope || 'Not reported')}</dd><dt>Last seen</dt><dd>${esc(displayDate(worker.last_seen_at))}</dd><dt>Capabilities</dt><dd>${esc(Object.keys(worker.health?.capabilities || {}).filter(key => worker.health.capabilities[key] === true).join(', ') || 'Not reported')}</dd><dt>Parallel tasks</dt><dd>${esc(worker.max_parallel_tasks || 1)}</dd>${capacity.reset_at ? `<dt>Reset reported</dt><dd>${esc(displayDate(capacity.reset_at))}</dd>` : ''}</dl>${worker.health?.reason ? `<p class="health-note">${esc(worker.health.reason)}</p>` : ''}</details>${settings}</article>`;
 }
 
 function renderWorkerSelectors(workers, task) {
@@ -265,6 +271,64 @@ function renderWorkerSelectors(workers, task) {
   $('switchReason').disabled = busy || !task;
   $('startWorker').disabled = busy || !!task;
 }
+
+function canDispatch(worker) {
+  const lock=RelayIDE.getState()?.lock;
+  return worker.eligible && (!lock || lock.mine) && !projectTasks.some(task=>!terminalStates.has(task.state) && task.state!=='queued');
+}
+
+function renderWorkerActions(worker) {
+  if(!overview?.features?.agent_management)return '<p class="permission-note">Restart the Relay backend to enable direct assignments and agent management.</p>';
+  const observed=worker.observation || {},task=observed.current_task,latest=observed.latest_task,action=observed.last_action;
+  const run=observed.latest_run;
+  const elapsed=run?.started_at ? Math.max(0,Math.floor(((run.finished_at?Date.parse(run.finished_at):Date.now())-Date.parse(run.started_at))/1000))+'s' : 'No execution observed';
+  return `<div class="agent-observation"><strong>${esc(task?.objective || latest?.objective || 'No assigned task')}</strong><small>${esc((task || latest)?.project_name || 'No project')} · ${esc((task || latest)?.conversation_title || 'No conversation')}</small><div class="agent-last-action">${esc(action ? 'Last observed: '+action.event_type+' · '+action.content.slice(0,180) : 'No observable execution event recorded')}</div><small>${esc(displayDate(action?.timestamp))} · ${esc(observed.phase || 'idle')} · ${esc(elapsed)}</small><div class="agent-last-action">${esc(observed.last_command ? 'Last command: '+observed.last_command.content.slice(0,150) : 'No command recorded for this task')}<br>${observed.reported_changed_files?.length ? esc(observed.reported_changed_files.length+' files reported changed') : 'No file-change events reported'}${observed.checkpoint ? '<br>Checkpoint '+esc(observed.checkpoint.git_commit.slice(0,10)) : ''}</div><small>Provider: ${esc(worker.execution_mode==='simulation'?'Simulated fixture':'Codex')} · Profile: ${esc(worker.native_profile?.toUpperCase() || worker.execution_mode)} · Model: ${esc(observed.model || 'Not reported')}</small></div><div class="agent-controls"><button class="primary compact" data-assign-worker="${esc(worker.id)}" ${!worker.authorized || !currentCanWrite() || busy ? 'disabled' : ''} title="${esc(worker.assignment_reason || worker.eligibility_reason)}">${canDispatch(worker)?'Assign Task':'Queue Task'}</button>${latest?`<button class="outline compact" data-agent-task="${esc(latest.id)}" data-task-project="${esc(latest.project_id)}" data-task-conversation="${esc(latest.conversation_id)}">View activity</button>`:''}${canManage(worker)?`<button class="quiet" data-remove-project="${esc(worker.id)}" ${!worker.permitted_project_ids.includes(project)?'disabled':''}>Remove from project</button><button class="quiet danger" data-remove-worker="${esc(worker.id)}">Remove enrollment</button>`:''}</div>`;
+}
+
+async function openTask(identity,conversationId,projectId=project) {
+  if(busy)return;
+  if(projectId!==project){project=projectId;loading=false;invalidateView();selectedConversation=conversationId;await load(true);}
+  else await selectConversation(conversationId);
+  if(identity)RelayIDE.pane('agents');
+}
+
+function renderProjectTasks() {
+  $('activeTaskCount').textContent=projectTasks.filter(task=>!terminalStates.has(task.state)).length+' active / queued';
+  $('projectTasks').innerHTML=projectTasks.length?projectTasks.map(task=>{
+    const worker=projectWorkers().find(item=>item.id===(task.worker_id || task.requested_worker_id));
+    const write=currentCanWrite() && !busy, paused=task.state==='handoff_pending';
+    return `<article class="task-entry"><strong>${esc(task.objective)}</strong><small>${esc(workerName(task.worker_id || task.requested_worker_id))} · ${esc(task.state)} · ${esc(task.conversation_title)}</small><div class="agent-controls"><button class="quiet" data-open-task="${esc(task.id)}">History</button>${task.state==='queued'?`<button class="primary compact" data-task-action="tasks/start" data-task="${esc(task.id)}" ${!write || !worker?.eligible?'disabled':''}>Start chosen agent</button>`:''}${task.state==='running'?`<button class="outline compact" data-task-action="pause" data-task="${esc(task.id)}" ${!write?'disabled':''}>Pause / checkpoint</button>`:''}${paused?`<button class="outline compact" data-task-action="resume" data-task="${esc(task.id)}" ${!write || !worker?.eligible?'disabled':''}>Resume same agent</button>`:''}${!terminalStates.has(task.state)?`<button class="quiet danger" data-task-action="cancel" data-task="${esc(task.id)}" ${!write?'disabled':''}>Cancel</button>`:''}<button class="quiet" data-inspect-task="${esc(task.id)}" ${task.state==='queued'?'disabled':''}>Inspect Changes</button></div>${task.last_error?`<p>${esc(task.last_error)}</p>`:''}</article>`;
+  }).join(''):'<div class="empty">No project tasks yet.</div>';
+  document.querySelectorAll('[data-open-task]').forEach(button=>button.onclick=()=>{const task=projectTasks.find(item=>item.id===button.dataset.openTask);openTask(task.id,task.conversation_id).catch(showError);});
+  document.querySelectorAll('[data-task-action]').forEach(button=>button.onclick=()=>{const task=projectTasks.find(item=>item.id===button.dataset.task);if(button.dataset.taskAction==='cancel' && !window.confirm('Cancel this task? Running tools must stop before its checkpoint is released.'))return;action(button.dataset.taskAction,{task_id:task.id,generation:task.generation});});
+  document.querySelectorAll('[data-inspect-task]').forEach(button=>button.onclick=()=>RelayIDE.reviewTask(button.dataset.inspectTask).catch(showError));
+}
+
+function openAssignment(workerId) {
+  const worker=projectWorkers().find(item=>item.id===workerId);if(!worker)return;
+  assignmentTarget=workerId;
+  $('assignWorkerName').textContent=worker.display_name || worker.name;
+  $('assignReadiness').textContent=worker.assignment_reason || worker.eligibility_reason;
+  $('assignConversation').innerHTML='<option value="">New independent conversation</option>'+conversations.filter(item=>!item.archived_at && (!item.latest_task || terminalStates.has(item.latest_task.state))).map(item=>`<option value="${esc(item.id)}">${esc(item.title)}</option>`).join('');
+  const lock=RelayIDE.getState()?.lock;
+  $('assignQueue').checked=!worker.eligible || projectTasks.some(task=>!terminalStates.has(task.state) && task.state!=='queued') || !!(lock && !lock.mine);
+  $('assignPrompt').value='';$('assignError').textContent='';$('assignDialog').showModal();
+}
+$('closeAssign').onclick=()=>$('assignDialog').close();
+$('assignForm').onsubmit=async event=>{
+  event.preventDefault();const at=viewVersion,selected=project,worker=assignmentTarget;
+  $('submitAssignment').disabled=true;
+  const immediate=!$('assignQueue').checked;
+  try {
+    if(immediate)await RelayIDE.prepareForAgent();
+    const result=await api('tasks/assign',{project_id:selected,worker_id:worker,prompt:$('assignPrompt').value,queue:$('assignQueue').checked,...($('assignConversation').value?{conversation_id:$('assignConversation').value}:{}),request_id:crypto.randomUUID()});
+    sessionStorage.setItem('relay-conversation:'+overview.user.id+':'+selected,result.conversation_id);
+    if(at!==viewVersion){$('assignDialog').close();return;}
+    await openTask(result.id,result.conversation_id,selected);await load(true);$('assignDialog').close();
+    showNotice(result.state==='queued'?'Task queued for the chosen agent. Start it explicitly when the project and agent are ready.':'Task dispatched to the chosen agent. Follow its recorded execution here.');
+  }catch(error){$('assignError').textContent=error.message;}
+  finally{if(immediate)await RelayIDE.finishTransition().catch(showError);$('submitAssignment').disabled=false;}
+};
 
 function eventOrigin(event) {
   let metadata = {};
@@ -300,6 +364,7 @@ function render() {
   if (authMode === 'local-owner') $('authBadge').textContent = '● NATIVE LOCAL · owner ' + overview.user.name;
   renderConversation();
   renderConversations();
+  document.body.classList.toggle('management-ready',!!overview.features?.agent_management);
   $('workers').innerHTML = workers.length ? workers.map(worker => renderWorker(worker, task)).join('') : '<div class="empty">No workers are visible for this project. Enroll your own worker or ask an owner to approve this project.</div>';
   const nativeWorkerCount = workers.filter(worker => worker.execution_mode === 'native').length;
   const hasOrgWorkers = workers.some(worker => worker.execution_mode === 'organization_api');
@@ -334,10 +399,13 @@ function render() {
     : authMode==='local-owner' ? 'Choose a local worker in Agents to start your next task.' : 'Select a worker to see its execution mode.';
   renderArtifact();
   bindWorkerSettings();
+  renderProjectTasks();
+  if(busy)document.querySelectorAll('#workers button,#workers input,#workers select,#projectTasks button,#conversationList button').forEach(control=>control.disabled=true);
   renderNativeProfiles();
   setControlsDisabled(busy);
   const writable = currentCanWrite();
-  $('pause').disabled = busy || !task || !writable || !['running', 'queued'].includes(task.state);
+  document.querySelectorAll('[data-rename-conversation],[data-archive-conversation]').forEach(button=>{if(!overview.features?.agent_management){button.disabled=true;button.title='Restart Relay to enable conversation management';}});
+  $('pause').disabled = busy || !task || !writable || task.state!=='running';
   const sourceWorker = workers.find(worker => worker.id === task?.worker_id);
   $('resume').disabled = busy || !task || !writable || task.state !== 'handoff_pending' || sourceWorker?.capacity?.availability === 'quota_blocked' || !eligible(sourceWorker || {});
   $('handoffPhases').disabled = busy || !!task || !writable;
@@ -346,10 +414,11 @@ function render() {
     ['switch', 'cancel', 'limit', 'continue'].forEach(id => $(id).disabled = true);
     document.querySelector('.send').disabled = true;
   }
+  if (detail.conversation.archived_at) document.querySelector('.send').disabled=true;
   if (authMode==='local-owner' && !selectedStartWorker) document.querySelector('.send').disabled=true;
   RelayIDE.update({project,user:overview.user.id,conversation:detail.conversation.id,projectName:currentProject?.name || project,
     worker:task?.worker_id ? workerName(task.worker_id) : detail.tasks[0]?.worker_id ? workerName(detail.tasks[0].worker_id) : '',
-    state:task?.state || detail.tasks[0]?.state,objective:task?.objective || detail.tasks[0]?.objective,checkpoint:detail.workspace.checkpoint,
+    automaticWorkflow:!!overview.features?.automatic_workflow,managementAvailable:!!overview.features?.agent_management,checkpoints:detail.checkpoints,state:task?.state || detail.tasks[0]?.state,objective:task?.objective || detail.tasks[0]?.objective,checkpoint:detail.workspace.checkpoint,
     selectedWorker:workers.find(worker => worker.id === selectedStartWorker)?.display_name || workers.find(worker => worker.id === selectedStartWorker)?.name}).catch(showError);
 }
 
@@ -364,12 +433,23 @@ function renderConversation() {
 }
 
 function renderConversations() {
-  $('conversationList').innerHTML=conversations.map(item => `<button class="conversation ${item.id===detail?.conversation.id ? 'selected' : ''}" data-conversation="${esc(item.id)}"><span>◉</span><div><strong>${esc(item.title)}</strong><small>${esc(item.latest_task ? workerName(item.latest_task.worker_id)+' · '+item.latest_task.state : 'No task yet')}<br>${esc(item.updated_at ? new Date(item.updated_at).toLocaleDateString() : '')} · ${esc(item.event_count)} events saved</small></div></button>`).join('');
+  $('conversationList').innerHTML=conversations.filter(item=>!item.archived_at || $('showArchived').checked || item.id===detail?.conversation.id).map(item => `<div class="conversation-row"><button class="conversation ${item.id===detail?.conversation.id ? 'selected' : ''}" data-conversation="${esc(item.id)}"><span>◉</span><div><strong>${esc(item.title)}${item.archived_at?' · Archived':''}</strong><small>${esc(item.latest_task ? workerName(item.latest_task.worker_id || item.latest_task.requested_worker_id)+' · '+item.latest_task.state : 'No task yet')}<br>${esc(item.updated_at ? new Date(item.updated_at).toLocaleDateString() : '')} · ${esc(item.event_count)} events saved<br>${esc((item.participants || []).map(worker=>worker.name).join(', ') || 'No agent participants yet')}</small></div></button><div class="conversation-actions"><button data-rename-conversation="${esc(item.id)}" ${!currentCanWrite()?'disabled':''}>Rename</button><button data-archive-conversation="${esc(item.id)}" ${!currentCanWrite()?'disabled':''}>${item.archived_at?'Restore':'Archive'}</button></div></div>`).join('');
   document.querySelectorAll('[data-conversation]').forEach(button => button.onclick=() => selectConversation(button.dataset.conversation).catch(showError));
+  document.querySelectorAll('[data-rename-conversation]').forEach(button=>button.onclick=async()=>{
+    const item=conversations.find(row=>row.id===button.dataset.renameConversation),title=window.prompt('Conversation title',item.title);if(!title?.trim())return;
+    try{await api('ide/conversations/update',{project_id:project,conversation_id:item.id,title:title.trim()});await load(true);}catch(error){showError(error);}
+  });
+  document.querySelectorAll('[data-archive-conversation]').forEach(button=>button.onclick=async()=>{
+    const item=conversations.find(row=>row.id===button.dataset.archiveConversation),archived=!item.archived_at;
+    if(archived && !window.confirm('Archive '+item.title+'? Its messages, tasks and checkpoints remain available.'))return;
+    try{await api('ide/conversations/update',{project_id:project,conversation_id:item.id,archived,confirmed:archived});await load(true);}catch(error){showError(error);}
+  });
 }
+$('showArchived').onchange=renderConversations;
 
 async function selectConversation(identity) {
   if (busy || identity===detail?.conversation.id) return;
+  await RelayIDE.flushDrafts();
   loading=false;invalidateView();selectedConversation=identity;
   await load(true);
 }
@@ -382,6 +462,14 @@ async function newConversation() {
 }
 
 function bindWorkerSettings() {
+  document.querySelectorAll('[data-assign-worker]').forEach(button=>button.onclick=()=>openAssignment(button.dataset.assignWorker));
+  document.querySelectorAll('[data-agent-task]').forEach(button=>button.onclick=()=>openTask(button.dataset.agentTask,button.dataset.taskConversation,button.dataset.taskProject).catch(showError));
+  document.querySelectorAll('[data-remove-worker]').forEach(button=>button.onclick=()=>{
+    if(window.confirm('Remove this agent enrollment? Historical tasks and checkpoints are retained. Native authentication is untouched. Cancel or hand off unfinished tasks first.'))action('workers/remove',{worker_id:button.dataset.removeWorker,confirmed:true},'Agent enrollment removed. History and native login are preserved.');
+  });
+  document.querySelectorAll('[data-remove-project]').forEach(button=>button.onclick=()=>{
+    if(window.confirm('Remove this agent authorization from this project? Active work will stop and checkpoint safely. Enrollment and other project permissions remain.'))action('workers/revoke',{worker_id:button.dataset.removeProject,project_id:project},'Project authorization revoked; any affected task stops safely.');
+  });
   document.querySelectorAll('[data-worker-form]').forEach(form => {
     form.onsubmit = event => {
       event.preventDefault();
@@ -390,6 +478,7 @@ function bindWorkerSettings() {
       const unchangedHiddenProjects = (worker.permitted_project_ids || []).filter(id => !visibleProjects.has(id));
       action('workers/configure', {
         worker_id: form.dataset.workerForm,
+        display_name:form.elements.display_name.value,
         ...(!form.elements.state.disabled && worker.execution_mode !== 'personal_supported'
           ? {state: form.elements.state.value} : {}),
         opt_in: form.elements.opt_in.checked,
@@ -430,6 +519,7 @@ async function action(method, data, notice = '') {
   showNotice('');
   render();
   try {
+    if(['prompt','switch','resume','tasks/start','demo'].includes(method))await RelayIDE.prepareForAgent();
     await api(method, {...data, request_id: crypto.randomUUID()});
     if (version !== viewVersion) return;
     await load(true);
@@ -443,6 +533,7 @@ async function action(method, data, notice = '') {
       await load(true).catch(showError);
     }
   } finally {
+    await RelayIDE.finishTransition().catch(showError);
     busy = false;
     if (version === viewVersion) render();
   }
@@ -474,7 +565,9 @@ $('switch').onclick = () => {
 $('demo').onclick = () => action('demo', {project_id: project}, 'Handoff demo recorded. Inspect the worker attribution, checkpoint, and unchanged conversation ID.');
 $('project').onchange = async () => {
   if (busy) return;
-  project = $('project').value;
+  const next=$('project').value;
+  try{await RelayIDE.leaveProject();}catch(error){$('project').value=project;showError(error);return;}
+  project = next;
   loading = false;
   invalidateView();
   $('error').hidden = true;
@@ -489,6 +582,7 @@ $('newProject').onclick = async () => {
   busy = true;
   setControlsDisabled(true);
   try {
+    await RelayIDE.leaveProject();
     const created = await api('projects', {name, request_id: crypto.randomUUID()});
     project = created.id;
     loading = false;
@@ -545,12 +639,17 @@ function renderEnrollmentMode() {
   $('nativeProfile').hidden = mode !== 'native';
   $('nativeProfile').disabled = mode !== 'native';
   if (mode === 'native') {
+    const existing=(nativeProfiles?.profiles || []).filter(profile=>profile.authentication==='chatgpt' && profile.available && !profile.worker_id);
+    $('nativeProfile').innerHTML=existing.map(profile=>`<option value="${esc(profile.profile)}">${esc(profile.profile.toUpperCase())} · authenticated and preflight ready</option>`).join('') || '<option value="">No unenrolled authenticated profiles</option>';
+    $('enrollmentForm').querySelector('[type=submit]').disabled=!existing.length;
     $('workerOwner').value = 'user';
-    $('enrollmentModeNote').textContent = 'Uses one independently authenticated local CODEX_HOME. Authenticate with scripts/native_profiles.py; only the configured local owner can initiate this profile. No Docker or API key required.';
+    $('enrollmentModeNote').textContent = 'Only existing authenticated, ready, unenrolled profiles appear here. For setup, run python3 scripts/native_profiles.py init in the Relay directory, then run its printed login commands privately in your terminal. Keep credentials there. Existing enrolled profiles are managed in Agents.';
   } else if (mode === 'organization_api') {
+    $('enrollmentForm').querySelector('[type=submit]').disabled=false;
     $('workerOwner').value = 'org';
     $('enrollmentModeNote').textContent = 'Organization API workers require an administrator and server-side credential/runtime configuration. All workers under that organization share API quota.';
   } else {
+    $('enrollmentForm').querySelector('[type=submit]').disabled=mode==='personal_supported';
     if (overview?.user.role !== 'admin' || $('workerOwner').value === 'org') $('workerOwner').value = 'user';
     $('enrollmentModeNote').textContent = mode === 'personal_supported'
       ? 'This enrollment remains disabled with unsupported_execution_mode. No provider-supported cross-user delegation mechanism has been verified for Relay.'
@@ -559,6 +658,7 @@ function renderEnrollmentMode() {
 }
 $('enroll').onclick = () => {
   if (!overview) return;
+  if(authMode==='local-owner')$('workerMode').value='native';
   renderEnrollmentMode();
   $('enrollProject').disabled = !project;
   $('enrollmentDialog').showModal();
@@ -585,7 +685,8 @@ function renderNativeProfiles(selectedProject = project) {
   $('localNativePanel').hidden = authMode !== 'local-owner';
   if (!nativeProfiles || authMode !== 'local-owner') return;
   $('localNativeOwner').textContent = 'Pinned owner: ' + (overview?.user.name || nativeProfiles.profiles[0]?.owner_name || 'Local owner');
-  $('localNativeProfiles').innerHTML = nativeProfiles.profiles.map(profile => `<article class="native-profile"><strong>Codex ${esc(profile.profile.toUpperCase())}</strong><span class="pill">${esc(profile.status)}</span><p class="profile-project">${esc((profile.assigned_projects || []).map(item => item.name).join(', ') || 'No current project')} · ${esc(profile.owner_name || 'Local owner')}</p><p>${esc(profile.reason)}</p><button class="outline" data-native-profile="${esc(profile.profile)}" ${busy || loading || !detail || !selectedProject || !profile.available ? 'disabled' : ''}>${activeTask() ? 'Prepare ' + esc(profile.profile.toUpperCase()) + ' for handoff' : 'Select ' + esc(profile.profile.toUpperCase()) + ' for this project'}</button></article>`).join('');
+  $('localNativeProfiles').innerHTML = nativeProfiles.profiles.map(profile => `<article class="native-profile"><strong>Codex ${esc(profile.profile.toUpperCase())}</strong><span class="pill">${esc(profile.status)}</span><p class="profile-project">${esc((profile.assigned_projects || []).map(item => item.name).join(', ') || 'No current project')} · ${esc(profile.owner_name || 'Local owner')}</p><p>${esc(profile.reason)}</p><button class="outline" data-native-profile="${esc(profile.profile)}" ${busy || loading || !detail || !selectedProject || !profile.available ? 'disabled' : ''}>${activeTask() ? 'Prepare ' + esc(profile.profile.toUpperCase()) + ' for handoff' : 'Select ' + esc(profile.profile.toUpperCase()) + ' for this project'}</button>${!profile.available && profile.status!=='busy'?`<button class="quiet" data-native-setup="${esc(profile.profile)}">Profile setup / resolve prerequisite</button>`:''}</article>`).join('');
+  document.querySelectorAll('[data-native-setup]').forEach(button=>button.onclick=()=>{const profile=nativeProfiles.profiles.find(item=>item.profile===button.dataset.nativeSetup);$('nativeSetupReason').textContent='Profile '+profile.profile.toUpperCase()+': '+profile.reason;$('nativeSetupDialog').showModal();});
   document.querySelectorAll('[data-native-profile]').forEach(button => button.onclick = async () => {
     if (busy || !selectedProject) return;
     busy = true;
@@ -599,6 +700,8 @@ function renderNativeProfiles(selectedProject = project) {
     finally { busy = false; if (detail) render(); }
   });
 }
+
+$('closeNativeSetup').onclick=()=>$('nativeSetupDialog').close();
 
 function currentCanWrite() {
   return overview?.projects?.find(item => item.id === project)?.can_write !== false;
@@ -688,7 +791,7 @@ $('accountForm').onsubmit = async event => {
   finally { button.disabled = false; }
 };
 $('logout').onclick = async () => {
-  try { await RelayIDE.flushDrafts();await api('logout', {}); showSignIn(); }
+  try { await RelayIDE.leaveProject();await api('logout', {}); showSignIn(); }
   catch (failure) { showError(failure); }
 };
 $('inviteMember').onclick = () => {
@@ -744,9 +847,9 @@ async function init() {
     catch (failure) { if (failure.status === 403) await login(); else showError(failure); }
   }
 }
-RelayIDE.connect({api,showError,showNotice,refresh:()=>load(true),canWrite:currentCanWrite,newConversation:()=>newConversation().catch(showError),loadHistory:()=>{if (!historyEvents.length) $('more').onclick();}});
+RelayIDE.connect({api,showError,showNotice,openTask:task=>{if(task)openTask(task.id,task.conversation_id).catch(showError);},refresh:()=>load(true),canWrite:currentCanWrite,newConversation:()=>newConversation().catch(showError),loadHistory:()=>{if (!historyEvents.length) $('more').onclick();}});
 init().catch(showError);
 setInterval(() => {
   const editingWorker = document.activeElement?.closest('.worker-settings');
-  if (!document.body.classList.contains('signed-out') && !busy && !loading && !$('enrollmentDialog').open && !editingWorker && !document.querySelector('.worker-settings[open]')) load().catch(showError);
+  if (!document.body.classList.contains('signed-out') && !busy && !loading && !$('enrollmentDialog').open && !$('assignDialog').open && !editingWorker && !document.querySelector('.worker-settings[open]')) load().catch(showError);
 }, 5000);

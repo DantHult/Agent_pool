@@ -1,12 +1,14 @@
 """Project-scoped editor and constrained Git operations for the existing Relay.
 
-Human reservations are durable and explicit. They do not expire silently while
-a browser has unsaved work; the owner must save/discard and release the lock.
+Human reservations are durable and managed automatically by normal IDE actions.
+They do not expire silently while a browser has unsaved work.
 All entry points run under Relay.lock, alongside the existing agent scheduler.
 """
 import hashlib
 import os
+import platform
 import re
+import shutil
 import subprocess
 import time
 
@@ -32,10 +34,10 @@ def file_path(value, write=False):
     parts = value.split('/')
     if any(not part or part in ('.', '..') or ord(part[0]) < 32 for part in parts):
         raise ValueError('Invalid relative project path')
-    if any(part in PROTECTED or part == '.env' or part.endswith(('.env', '.key', '.pem')) or
-           (part.startswith('.env.') and part != '.env.example') for part in parts):
+    if any(part.casefold() in PROTECTED or part.casefold() == '.env' or part.casefold().endswith(('.env', '.key', '.pem')) or
+           (part.casefold().startswith('.env.') and part.casefold() != '.env.example') for part in parts):
         raise PermissionError('Protected credentials or runtime path')
-    if '.relay' in parts and (write or value != '.relay/HANDOFF.md'):
+    if any(part.casefold()=='.relay' for part in parts) and (write or value != '.relay/HANDOFF.md'):
         raise PermissionError('Relay metadata is read-only')
     return parts
 
@@ -56,6 +58,8 @@ class ProjectIDE:
         self.relay = relay
         self.local_owner = local_owner
         self.console = None
+        from .file_operations import FileOperations
+        self.files = FileOperations(self)
 
     def conversation(self, user, project, conversation=None):
         self.relay.access(user, project)
@@ -67,9 +71,10 @@ class ProjectIDE:
         self.relay.access(user, project)
         rows = self.relay.rows('SELECT * FROM conversations WHERE project_id=? ORDER BY updated_at DESC,rowid DESC', (project,))
         for row in rows:
-            tasks = self.relay.rows('SELECT id,state,worker_id,objective FROM tasks WHERE conversation_id=? ORDER BY rowid DESC LIMIT 1', (row['id'],))
+            tasks = self.relay.rows('SELECT id,state,worker_id,requested_worker_id,objective FROM tasks WHERE conversation_id=? ORDER BY rowid DESC LIMIT 1', (row['id'],))
             row['latest_task'] = tasks[0] if tasks else None
             row['event_count'] = self.relay.db.execute('SELECT COUNT(*) FROM events WHERE conversation_id=?', (row['id'],)).fetchone()[0]
+            row['participants'] = self.relay.rows('SELECT DISTINCT w.id,w.name,w.native_profile FROM assignments a JOIN tasks t ON t.id=a.task_id JOIN workers w ON w.id=a.worker_id WHERE t.conversation_id=?', (row['id'],))
         return {'conversations': rows}
 
     def create_conversation(self, user, project, title):
@@ -77,8 +82,25 @@ class ProjectIDE:
         if not isinstance(title, str) or not title.strip() or len(title) > 100:
             raise ValueError('Conversation title must contain 1–100 characters')
         identity = uid()
-        self.relay.db.execute('INSERT INTO conversations VALUES(?,?,?,?,?)', (identity, project, clean(title.strip()), now(), now()))
+        self.relay.db.execute('INSERT INTO conversations(id,project_id,title,created_at,updated_at) VALUES(?,?,?,?,?)', (identity, project, clean(title.strip()), now(), now()))
         self.relay.audit(user, 'conversation_created', project=project, metadata={'conversation_id': identity})
+        return self.conversation(user, project, identity)
+
+    def update_conversation(self, user, project, identity, data):
+        self.relay.write_access(user, project)
+        self.conversation(user, project, identity)
+        if 'title' in data:
+            title = data['title']
+            if not isinstance(title, str) or not title.strip() or len(title)>100:raise ValueError('Conversation title must contain 1–100 characters')
+            self.relay.db.execute('UPDATE conversations SET title=?,updated_at=? WHERE id=?', (clean(title.strip()), now(), identity))
+        elif isinstance(data.get('archived'), bool):
+            if data['archived']:
+                if data.get('confirmed') is not True:raise ValueError('Archiving requires confirmation')
+                if self.relay.rows("SELECT 1 FROM tasks WHERE conversation_id=? AND state NOT IN ('completed','failed','cancelled')", (identity,)):
+                    raise WorkspaceConflict('Finish or cancel this conversation task before archiving')
+            self.relay.db.execute('UPDATE conversations SET archived_at=?,updated_at=? WHERE id=?', (now() if data['archived'] else None, now(), identity))
+        else:raise ValueError('Choose a title or archive/restore action')
+        self.relay.audit(user, 'conversation_updated', project=project, metadata={'conversation_id': identity})
         return self.conversation(user, project, identity)
 
     def _agent_idle(self, project):
@@ -110,6 +132,43 @@ class ProjectIDE:
             self.relay.db.execute('UPDATE human_workspace_locks SET client_id=?,session_hash=? WHERE project_id=?', (client, session_hash, project))
         self.relay.audit(user, 'editor_lock_acquired', project=project)
         return self.state(user, project, client, session_hash)
+
+    def prepare(self, user, project, client, session_hash):
+        """Reserve an editable workspace without an edit-mode activation step."""
+        self.relay.write_access(user, project)
+        self._require_editor_support()
+        self._agent_idle(project)
+        rows = self.relay.rows('SELECT * FROM human_workspace_locks WHERE project_id=?', (project,))
+        if rows:
+            prior = rows[0]
+            if prior['user_id']==user and prior['client_id']==client and prior['session_hash']!=session_hash:
+                valid = self.relay.rows('SELECT 1 FROM sessions WHERE digest=? AND expires_at>?', (prior['session_hash'], time.time()))
+                if not valid and not (self.console and self.console.active(project)):
+                    return self.acquire(user, project, client, session_hash, recover=True)
+            self._reservation(user, project, client, session_hash)
+            return self.state(user, project, client, session_hash)
+        return self.acquire(user, project, client, session_hash)
+
+    def finish(self, user, project, client, session_hash, conversation=None):
+        """Release clean human work before navigation or an explicit AI action.
+
+        Drafts, foreign reservations, running commands and unpublished console
+        edits fail closed. Publication remains an explicit reviewed operation.
+        """
+        self.relay.write_access(user, project)
+        conversation = self.conversation(user, project, conversation)['id']
+        rows = self.relay.rows('SELECT * FROM human_workspace_locks WHERE project_id=?', (project,))
+        if not rows:return {'released': False}
+        self._reservation(user, project, client, session_hash)
+        if self.relay.rows('SELECT 1 FROM editor_drafts WHERE project_id=?', (project,)):
+            raise WorkspaceConflict('Save or discard retained drafts before continuing with the agent')
+        if self.console:self.console.finish_clean(user, project, client, session_hash)
+        if self.relay.ws.status(project):
+            return self.release(user, project, client, session_hash, True, conversation)
+        checkpoint = self.relay.ws.git(self.relay.ws.path(project), 'rev-parse', 'HEAD')
+        self.relay.db.execute('DELETE FROM human_workspace_locks WHERE project_id=?', (project,))
+        self.relay.audit(user, 'editor_lock_released', project=project, metadata={'checkpoint': checkpoint, 'automatic': True})
+        return {'released': True, 'checkpoint': checkpoint}
 
     def _read(self, project, name, missing=False):
         parts = file_path(name)
@@ -198,7 +257,7 @@ class ProjectIDE:
 
     def _record_commit(self, user, project, conversation, commit, reason):
         c = self.conversation(user, project, conversation)
-        pending = self.relay.rows("SELECT t.* FROM tasks t JOIN conversations c ON c.id=t.conversation_id WHERE c.project_id=? AND t.state NOT IN ('completed','failed','cancelled') ORDER BY t.rowid DESC LIMIT 1", (project,))
+        pending = self.relay.rows("SELECT t.* FROM tasks t JOIN conversations c ON c.id=t.conversation_id WHERE c.project_id=? AND t.state NOT IN ('completed','failed','cancelled','queued') ORDER BY t.rowid DESC LIMIT 1", (project,))
         task = pending[0] if pending else None
         self.relay.db.execute('INSERT INTO workspace_checkpoints VALUES(?,?,?,?,?,?,?,?,?)',
                               (uid(), project, task['conversation_id'] if task else c['id'], task['id'] if task else None, None, commit, now(), reason, ''))
@@ -279,10 +338,13 @@ class ProjectIDE:
         elif agent:
             lock = {'kind': 'agent', **agent[0]}
         drafts = self.relay.rows('SELECT path,base_version,content,updated_at FROM editor_drafts WHERE project_id=? AND user_id=?', (project, user))
-        tasks = self.relay.rows("SELECT t.id,t.conversation_id,t.worker_id,t.state FROM tasks t JOIN conversations c ON c.id=t.conversation_id WHERE c.project_id=? AND t.state NOT IN ('completed','failed','cancelled') LIMIT 1", (project,))
-        return {'files': files, 'editor_writable': workspace_api._USE_DIR_FD, 'changes': self.changes(project), 'branch': self.relay.ws.git(workspace, 'rev-parse', '--abbrev-ref', 'HEAD'),
+        tasks = self.relay.rows("SELECT t.id,t.conversation_id,t.worker_id,t.state,t.generation FROM tasks t JOIN conversations c ON c.id=t.conversation_id WHERE c.project_id=? AND t.state NOT IN ('completed','failed','cancelled','queued') LIMIT 1", (project,))
+        console_owner = self.local_owner and user == self.relay.local_owner_id
+        console_available = bool(console_owner and platform.system()=='Darwin' and shutil.which(os.environ.get('RELAY_CODEX_BIN','codex')))
+        return {'files': files, 'folders': self.files.folders(project) if workspace_api._USE_DIR_FD else [], 'editor_writable': workspace_api._USE_DIR_FD, 'changes': self.changes(project), 'branch': self.relay.ws.git(workspace, 'rev-parse', '--abbrev-ref', 'HEAD'),
                 'checkpoint': self.relay.ws.git(workspace, 'rev-parse', 'HEAD'), 'lock': lock, 'drafts': drafts, 'active_project_task': tasks[0] if tasks else None,
-                'console_available': self.local_owner and user == self.relay.local_owner_id,
+                'console_available': console_available,
+                'console_unavailable_reason': None if console_available else 'The native command sandbox requires macOS and the Codex CLI on the server PATH' if console_owner else 'Command execution requires the authenticated local owner',
                 'console_limitation': 'Restricted approved-command console in a private clone; no general shell or PTY. Git writes use the constrained project Git API.'}
 
     def git(self, user, project, client, session_hash, arguments, conversation=None):
@@ -319,6 +381,11 @@ class ProjectIDE:
                 for name in names:
                     file_path(name, write=True)
                 args = ['--literal-pathspecs', 'add', '-A', '--', *names]
+            elif command == 'unstage' and values:
+                names = [entry['path'] for entry in self.changes(project) if entry['staged']] if values == ['.'] else values
+                if not names:return {'output': 'No staged source changes.', 'exit_code': 0}
+                for name in names:file_path(name, write=True)
+                args = ['--literal-pathspecs', 'restore', '--staged', '--', *names]
             elif command == 'commit' and len(values) == 2 and values[0] == '-m' and values[1].strip():
                 staged = self.relay.ws.git(workspace, 'diff', '--cached', '--name-only', '-z', raw=True).split('\0')
                 for name in filter(None, staged):

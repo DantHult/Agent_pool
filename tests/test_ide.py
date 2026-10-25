@@ -335,6 +335,39 @@ class RealConsoleTests(unittest.TestCase):
         self.assertTrue(result['applied']);self.assertEqual((canonical/'created.py').read_text(),'answer = 42\n')
         self.assertEqual(result['checkpoint'],self.server.relay.ws.git(canonical,'rev-parse','HEAD'))
 
+    def test_automatic_finish_closes_unchanged_console_and_releases(self):
+        identity=self.open()['id']
+        self.client.post('ide/console/run',{'session_id':identity,'command':'python3 --version'})
+        self.assertEqual(self.wait(identity,{'finished'})['exit_code'],0)
+        result=self.client.post('ide/finish',{'project_id':self.project,'client_id':CLIENT})
+        self.assertTrue(result['released'])
+        self.assertTrue(self.client.get('ide/console?session_id='+identity)['closed'])
+        self.assertIsNone(self.client.get('ide/state?project_id='+self.project)['lock'])
+
+    def test_automatic_finish_refuses_running_or_unpublished_console_work(self):
+        identity=self.open()['id'];ctx={'project_id':self.project,'client_id':CLIENT}
+        self.client.post('ide/console/run',{'session_id':identity,'command':"python3 -u -c 'from pathlib import Path; import time; Path(\"pending.py\").write_text(\"value=42\\n\"); print(\"waiting\",flush=True); time.sleep(60)'"})
+        self.assertEqual(self.client.request('/api/ide/finish',ctx)[0],409)
+        deadline=time.monotonic()+10
+        while time.monotonic()<deadline:
+            if 'waiting' in self.client.get('ide/console?session_id='+identity)['output']:break
+            time.sleep(.05)
+        self.client.post('ide/console/cancel',{'session_id':identity});self.wait(identity,{'finished'})
+        self.assertEqual(self.client.request('/api/ide/finish',ctx)[0],409)
+        self.assertIsNotNone(self.client.get('ide/state?project_id='+self.project)['lock'])
+        self.assertFalse((self.server.relay.ws.path(self.project)/'pending.py').exists())
+
+    def test_next_run_refreshes_clean_snapshot_after_editor_save(self):
+        first=self.open()['id'];ctx={'project_id':self.project,'client_id':CLIENT,'authorize':True}
+        self.client.post('ide/save',{**ctx,'path':'latest.py','content':'value=73\n','version':None})
+        replacement=self.client.post('ide/console/ensure',ctx)
+        self.assertNotEqual(replacement['id'],first)
+        self.wait(replacement['id'],{'ready'})
+        self.client.post('ide/console/run',{'session_id':replacement['id'],'command':"python3 -c 'import latest; print(latest.value)'"})
+        done=self.wait(replacement['id'],{'finished'})
+        self.assertEqual(done['exit_code'],0);self.assertIn('73',done['output'])
+        self.assertTrue(self.client.get('ide/console?session_id='+first)['closed'])
+
     def test_sensitive_files_git_metadata_network_and_shell_denied(self):
         canary=self.root/'nonsecret-canary';canary.write_text('must-not-read')
         canonical=self.server.relay.ws.path(self.project)

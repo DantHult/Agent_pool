@@ -2,6 +2,10 @@
 
 Relay's existing application now provides a local Monaco editor, project files and Git changes, a readable live agent panel, persistent project conversations, and an explicitly authorized development command console. It retains the native A/B/C App Server adapter, authentication, worker grants, event history, checkpoints, context versions and handoffs. It is not a separate application.
 
+For the subsequent file/folder lifecycle, direct assignments, manual task queues, agent removal, conversation archive/restore and complete control audit, see [IDE_MANAGEMENT.md](IDE_MANAGEMENT.md). That guide describes schema migration 8 and the current concurrency boundary; the verification below records the earlier IDE delivery.
+
+The current [default workflow](DEFAULT_WORKFLOW.md) enables supported operations without edit-mode or console-enable buttons. Reservations are managed automatically.
+
 ## Start and use it
 
 Use the existing local-owner account and data. Do not bootstrap again or repeat Codex login:
@@ -16,11 +20,11 @@ Stop an older process gracefully before starting this command. Keep the same env
 The upstream Windows demo and portable data-directory locking are retained. On platforms without POSIX directory-descriptor protection, the IDE exposes the existing read-only workspace and Git inspection; editor reservations and writes fail closed. Native Codex execution and the privileged command console remain macOS-only. The portable fallback is regression-tested on macOS; this change does not claim a Windows end-to-end verification.
 
 - **Explorer:** open files, navigate folders, filter names, or use **⌘/Ctrl P**. Tabs preserve open files across refreshes. Monaco and its syntax definitions are vendored locally; no CDN, npm process or external editor service is needed at runtime.
-- **Edit:** click **Acquire edit lock**, then edit and **Save / ⌘/Ctrl S**. The browser synchronizes a draft separately from saving the actual project file. “Draft retained” means SQLite holds the draft. “Saved” means the authoritative file was atomically replaced. Refresh restores drafts and the lock.
+- **Edit:** open a file and edit immediately; Relay reserves the project automatically. Use **Save / ⌘/Ctrl S**. The browser synchronizes a draft separately from saving the actual project file. “Draft retained” means SQLite holds the draft. “Saved” means the authoritative file was atomically replaced. Refresh restores drafts and the lock.
 - **Source Control:** inspect actual status/diff/log/branches, stage files, commit, and create/switch branches. A diff opens as a read-only, syntax-highlighted unified diff in Monaco. Existing Git checkpoint records remain available in Agents → Context & checkpoints.
-- **Release:** **Checkpoint & release** saves open dirty buffers and creates an explicit Git checkpoint before allowing an agent to write. Close the command console first. Locks do not silently expire and expose unsaved work to an agent. The same authenticated user can explicitly **Recover my lock** after a new login or lost browser session; another editor cannot recover it automatically.
+- **Reservations:** Relay automatically saves/checkpoints and releases human work before agent dispatch. Clean project navigation and last-tab closure also release it. Unsaved drafts and unpublished command work retain their protection. **Recover previous editor session** appears only for an actual same-owner reservation conflict.
 - **Agents:** inspect native profiles, current assigned projects, owner controls, grants and actual availability. Choose a worker, run a task, pause/checkpoint, resume, or explicitly hand off. Unknown remaining provider quota is never presented as a measured balance.
-- **Conversations:** create/select persistent conversations. Each has its own messages, tool history, tasks and handoffs; all conversations in a project share its authoritative Git workspace. One unfinished task is permitted per project, including paused tasks. Finish or cancel it before starting another conversation's task.
+- **Conversations:** create/select persistent conversations. Each has its own messages, tool history, tasks and handoffs; all conversations in a project share its authoritative Git workspace. One running or paused task owns a project at a time. Additional chosen-agent tasks can queue in separate conversations and require an explicit Start after the current task finishes or is cancelled.
 
 The right agent panel and left sidebar resize by dragging their separators or using arrow keys when a separator is focused. The bottom panel resizes vertically. **Ctrl `** toggles the command console. Smaller screens use collapsible sidebar/agent overlays.
 
@@ -28,7 +32,7 @@ The right agent panel and left sidebar resize by dragging their separators or us
 
 The bottom panel deliberately provides a **restricted command console**, with genuine subprocess output and stdin. It is not a general shell, xterm emulator or PTY. Resizing changes the viewport, not a remote terminal's rows/columns. Pipes, shell builtins, shell redirection, persistent shell environment changes, full-screen terminal applications and arbitrary executable paths are not supported.
 
-Console access is available only in direct loopback **local-owner/native** mode. It is disabled in demo, invite/shared and proxied modes, independently of the native-enable environment flag. Acquire the project edit lock, save/discard drafts, then click **Authorize project console**. Authorization is bound to that authenticated Relay session, project, user and browser edit reservation; knowing a console ID does not confer access. Logout, expiration, project revocation, command deadlines, explicit stop and server shutdown stop execution. Idle console sessions close after two minutes without authenticated polling. At most two project consoles may be open.
+Console access is available only in direct loopback **local-owner/native** mode. It is disabled in demo, invite/shared and proxied modes, independently of the native-enable environment flag. Enter an approved command and click **Run**. Relay reserves the project, saves editor drafts and prepares the isolated command environment automatically. Run is the explicit command authorization; there is no console-enable control. Authorization is bound to that authenticated Relay session, project, user and browser edit reservation; knowing a console ID does not confer access. Logout, expiration, project revocation, command deadlines, explicit stop and server shutdown stop execution. Idle console sessions close after two minutes without authenticated polling. At most two project consoles may be open.
 
 Approved command names are:
 

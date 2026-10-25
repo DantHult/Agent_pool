@@ -41,7 +41,9 @@ def main():
             page.wait_for_function('() => !!window.RelayIDE?.editor',timeout=30000)
             page.locator('[data-open-file="README.md"]').first.click()
             page.wait_for_function('() => window.RelayIDE.activeFile === "README.md"')
-            page.locator('#editLock').click();page.wait_for_function('() => window.RelayIDE.getState().lock?.mine')
+            page.wait_for_function('() => window.RelayIDE.getState().lock?.mine && !window.RelayIDE.editor.getOption(window.RelayMonaco.editor.EditorOption.readOnly)')
+            assert page.locator('#editLock,#releaseLock,#enableConsole').count()==0
+            report['checks'].append('Editor editable immediately; no editing-mode or console enablement controls')
             page.evaluate('() => window.RelayIDE.editor.setValue("# Browser edited project\\nSaved through Monaco.\\n")')
             page.locator('#saveFile').click();page.wait_for_function('() => document.getElementById("saveState").textContent === "Saved"')
             assert 'Browser edited project' in case.client.get('ide/file?project_id='+case.project+'&path=README.md')['content']
@@ -56,7 +58,7 @@ def main():
             page.locator('#commitMessage').fill('Browser IDE source commit');page.locator('#commitChanges').click()
             page.wait_for_function('() => document.getElementById("commitMessage").value === ""')
             report['checks'].append('Real Git stage/commit and checkpoint')
-            page.locator('#enableConsole').click();page.wait_for_function('() => !document.getElementById("commandInput").disabled',timeout=30000)
+            page.wait_for_function('() => !document.getElementById("commandInput").disabled',timeout=30000)
             page.locator('#commandInput').fill('python3 -u -c \'print("console-ready",flush=True); print("echo:"+input())\'');page.locator('#runCommand').click()
             page.wait_for_function('() => document.getElementById("consoleOutput").textContent.includes("\\nconsole-ready\\n")')
             page.locator('#stdinInput').fill('browser-input');page.locator('#stdinForm button[type=submit], #stdinForm button:not([type])').first.click()
@@ -68,12 +70,17 @@ def main():
                     page.locator('#commandInput').fill(command);page.locator('#runCommand').click()
                     page.wait_for_function('(expected)=>document.getElementById("consoleState").textContent.includes("exit 0") && document.getElementById("consoleOutput").textContent.includes("\\n"+expected)',arg=expected)
                 report['checks'].append('Actual approved Node/npm execution inside the command sandbox')
+            page.evaluate('() => window.RelayIDE.editor.setValue("# Saved automatically for the next command\\n")')
+            page.locator('#commandInput').fill('python3 -c \'from pathlib import Path; print(Path("README.md").read_text())\'');page.locator('#runCommand').click()
+            page.wait_for_function('() => document.getElementById("consoleState").textContent.includes("exit 0") && document.getElementById("consoleOutput").textContent.includes("Saved automatically for the next command")')
+            report['checks'].append('Run saves editor drafts and refreshes an unchanged stale command snapshot')
             page.locator('#commandInput').fill('python3 -c \'from pathlib import Path; Path("browser_console.py").write_text("console_value = 42\\n")\'');page.locator('#runCommand').click()
             page.wait_for_function('() => document.getElementById("consoleState").textContent.includes("exit 0")')
             page.locator('#applyConsole').click();page.wait_for_function('() => document.getElementById("notice").textContent.includes("Console changes applied")')
             assert 'console_value = 42' in case.client.get('ide/file?project_id='+case.project+'&path=browser_console.py')['content']
             report['checks'].append('Explicit console publish + consistent Git checkpoint')
-            page.locator('#releaseLock').click();page.wait_for_function('() => !window.RelayIDE.getState().lock')
+            page.evaluate('() => window.RelayIDE.editor.setValue("# Human draft saved automatically before the agent\\n")')
+            page.wait_for_function('() => document.getElementById("saveState").textContent === "Draft retained"')
             page.locator('[data-pane=agents]').click();page.locator('[data-native-profile=a]').click()
             page.wait_for_function('() => document.getElementById("startWorker").value !== ""')
             page.locator('#prompt').fill(OBJECTIVE)
@@ -82,8 +89,9 @@ def main():
             assert 'NATIVE LOCAL' in page.locator('#timeline').inner_text()
             page.locator('[data-native-profile=b]').click();page.wait_for_function('() => document.getElementById("switchTarget").value !== ""');page.locator('#switch').click()
             page.wait_for_function('() => document.getElementById("taskState").textContent === "completed"',timeout=30000)
+            assert 'Human draft saved automatically' in case.client.get('ide/file?project_id='+case.project+'&path=README.md')['content']
             assert page.locator('#timeline .operation-card').count()>0
-            report['checks'].append('Mocked AI stream, operation cards, explicit A-to-B handoff')
+            report['checks'].append('Automatic draft save/checkpoint/release, mocked AI stream, operations and explicit A-to-B handoff')
             # A large stream should remain one message, and final output should
             # replace rather than duplicate those fragments.
             task=case.server.relay.rows('SELECT * FROM tasks ORDER BY rowid DESC')[0]

@@ -134,6 +134,11 @@ class Handler(BaseHTTPRequestHandler):
                 if path=='/api/overview':result=relay.overview(user)
                 elif path=='/api/ide/state':result=self.server.ide.state(user,q.get('project_id',[''])[0],q.get('client_id',[''])[0],digest(self.token()))
                 elif path=='/api/ide/file':result=self.server.ide.read_file(user,q.get('project_id',[''])[0],q.get('path',[''])[0],q.get('create',['0'])[0]=='1')
+                elif path=='/api/ide/entry':
+                    try:result=self.server.ide.files.inspect(user,q.get('project_id',[''])[0],q.get('path',[''])[0])
+                    except OSError as exc:raise ValueError('Cannot inspect project entry: '+(exc.strerror or 'filesystem error')) from None
+                elif path=='/api/tasks':result=relay.management.tasks(user,q.get('project_id',[''])[0],q.get('worker_id',[None])[0])
+                elif path=='/api/ide/review':result=relay.management.review(user,q.get('project_id',[''])[0],q.get('task_id',[None])[0],q.get('before',[None])[0],q.get('after',[None])[0])
                 elif path=='/api/ide/conversations':result=self.server.ide.conversations(user,q.get('project_id',[''])[0])
                 elif path=='/api/ide/console':
                     if not self.server.ide.console:raise PermissionError('Console execution requires the pinned local owner')
@@ -191,6 +196,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not console:raise PermissionError('Console execution requires the pinned local owner')
                 operation=method.removeprefix('ide/console/');binding=digest(self.token())
                 if operation=='open':result=console.open(user,data,binding)
+                elif operation=='ensure':result=console.ensure(user,data,binding)
                 elif operation=='run':result=console.run(user,data,binding)
                 elif operation=='input':result=console.write(user,data,binding)
                 elif operation=='cancel':result=console.cancel(user,data,binding)
@@ -202,12 +208,18 @@ class Handler(BaseHTTPRequestHandler):
                 ide=self.server.ide;project=data['project_id'];binding=digest(self.token());client=data.get('client_id','')
                 with relay.lock:
                     if method=='ide/lock':result=ide.acquire(user,project,client,binding,data.get('recover') is True)
+                    elif method=='ide/prepare':result=ide.prepare(user,project,client,binding)
+                    elif method=='ide/finish':result=ide.finish(user,project,client,binding,data.get('conversation_id'))
                     elif method=='ide/save':result=ide.save(user,project,client,binding,data['path'],data.get('version'),data['content'],data.get('conversation_id'))
                     elif method=='ide/draft':result=ide.draft(user,project,client,binding,data['path'],data.get('version'),data['content'])
                     elif method=='ide/discard':result=ide.discard(user,project,client,binding,data['path'])
                     elif method=='ide/release':result=ide.release(user,project,client,binding,data.get('checkpoint') is True,data.get('conversation_id'))
                     elif method=='ide/git':result=ide.git(user,project,client,binding,data['arguments'],data.get('conversation_id'))
                     elif method=='ide/conversations':result=ide.create_conversation(user,project,data['title'])
+                    elif method=='ide/conversations/update':result=ide.update_conversation(user,project,data['conversation_id'],data)
+                    elif method=='ide/files':
+                        try:result=ide.files.mutate(user,project,client,binding,data)
+                        except OSError as exc:raise ValueError('Explorer operation failed: '+(exc.strerror or 'filesystem error')+'. Refresh and check that the parent folder exists and is writable.') from None
                     else:raise ValueError('Unknown editor action')
                 return self.reply(200,result)
             if self.server.auth_mode!='demo':
@@ -327,8 +339,9 @@ def main():
         # Windows local demos default to seed identities; shared invite servers stay Unix/HTTPS.
         default_mode='demo' if os.name=='nt' else 'invite'
         mode=args.auth or os.environ.get('RELAY_AUTH_MODE',default_mode)
+        if mode=='local-owner' and args.backend is None:args.backend='native'
         if args.backend=='native' and mode!='local-owner':raise ValueError('Native dashboard execution requires --auth local-owner; demo/shared identities cannot authorize it')
-        if mode=='local-owner' and args.backend!='native':raise ValueError('Local-owner mode requires the explicit --backend native opt-in')
+        if mode=='local-owner' and args.backend!='native':raise ValueError('Local-owner mode supports the native backend; Docker/API execution uses its authorized shared backend')
         if args.backend=='native':os.environ['RELAY_ENABLE_NATIVE']='1'
         server=make_server(args.data or os.environ.get('RELAY_DATA_DIR','data'),args.port,mode,args.public_url,args.allow_http_local)
     except (ValueError,OSError,ServerAlreadyRunning) as exc:parser.exit(1,clean(exc)+'\n')

@@ -109,6 +109,25 @@ class CommandConsole:
             self.relay.audit(user, 'console_authorized', project=project, metadata={'console_id': identity, 'scope': 'private snapshot; approved argv only; no network'})
             return self.view(item)
 
+    def ensure(self, user, data, session_hash):
+        """Run uses the current saved source; refresh an unchanged stale snapshot."""
+        with self.relay.lock:
+            project, client = data['project_id'], data['client_id']
+            self._valid(user, project, session_hash)
+            if data.get('authorize') is not True:raise PermissionError('An explicit command action is required')
+            self.ide._reservation(user, project, client, session_hash)
+            self.ide.conversation(user, project, data.get('conversation_id'))
+            for item in list(self.sessions.values()):
+                if item['project']!=project or item['closed']:continue
+                self._session(user, item['id'], session_hash)
+                if item['client_id']!=client:raise WorkspaceConflict('Another editor owns this command workspace')
+                if item['state']=='preparing':return self.view(item)
+                if item['state'] not in ('ready','finished'):raise WorkspaceConflict('Stop the command or close its failed session before running another command')
+                _, _, fingerprint = snapshot(self.relay, project)
+                if fingerprint==item['fingerprint']:return self.view(item)
+                self.finish_clean(user, project, client, session_hash)
+            return self.open(user, data, session_hash)
+
     def _prepare(self, item, files):
         client = None
         try:
@@ -152,6 +171,21 @@ class CommandConsole:
     def poll(self, user, identity, session_hash):
         with self.relay.lock:
             return self.view(self._session(user, identity, session_hash))
+
+    def finish_clean(self, user, project, client, session_hash):
+        """Close idle unchanged snapshots; never discard unreviewed source work."""
+        for item in list(self.sessions.values()):
+            if item['project']!=project or item['closed']:continue
+            self._session(user, item['id'], session_hash)
+            if item['client_id']!=client:raise WorkspaceConflict('A console in another editor still owns this project')
+            if item['state'] not in ('ready','finished'):
+                raise WorkspaceConflict('Stop the command or wait for it to finish before starting the agent')
+            working=item['working'];source=Workspace(working.parent)
+            changed=source.git(working, 'diff', '--name-only', item['baseline'], '--', '.', *EXCLUSIONS)
+            untracked=source.git(working, 'ls-files', '--others', '--exclude-standard', '--', '.', *EXCLUSIONS)
+            if changed or untracked:
+                raise WorkspaceConflict('The command workspace has unpublished changes. Apply & checkpoint them, or close that session explicitly before starting the agent.')
+            self._close(item)
 
     def run(self, user, data, session_hash):
         with self.relay.lock:

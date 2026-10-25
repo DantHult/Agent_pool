@@ -43,6 +43,8 @@ class Relay:
                     path=self.root/name
                     if path.exists():path.chmod(0o600)
             self.ws=Workspace(self.root/'workspaces')
+            from .management import Management
+            self.management=Management(self)
             if demo:self._seed()
             else:self.db.execute("UPDATE organizations SET is_demo=0,name=CASE WHEN name='Relay Labs (demo)' THEN 'Relay organization' ELSE name END WHERE id='orgdemo'")
             self._recover()
@@ -70,7 +72,7 @@ class Relay:
         from .native import PROFILE_IDS
         profiles=[]
         for profile in PROFILE_IDS:
-            enrolled=self.rows("SELECT * FROM workers WHERE execution_mode='native' AND native_profile=?",(profile,))
+            enrolled=self.rows("SELECT * FROM workers WHERE execution_mode='native' AND native_profile=? AND removed_at IS NULL",(profile,))
             w=enrolled[0] if enrolled else {'id':'profile-'+profile,'owner_type':'user','owner_id':user,'execution_mode':'native','native_profile':profile,'state':'available','opt_in':True}
             if w['owner_id']!=user:
                 profiles.append({'profile':profile,'status':'unavailable','available':False,'reason':'This profile belongs to a different worker owner; use a dedicated local-owner data directory'})
@@ -223,6 +225,7 @@ class Relay:
         self.db.execute('UPDATE workers SET state=?,updated_at=? WHERE id=?',(state,now(),worker))
         self.db.execute('UPDATE capacity_sources SET availability=?,source=?,observed_at=?,limit_kind=COALESCE(?,limit_kind) WHERE worker_id=?',(state,source,now(),limit_kind,worker))
     def approval(self,w,project,user=None):
+        if w.get('removed_at'): return False,'Worker enrollment was removed'
         if w['execution_mode']=='personal_supported': return False,PERSONAL_UNSUPPORTED_REASON
         if w['execution_mode']=='native':
             if not self.native_enabled:return False,'Native execution requires the authenticated local-owner dashboard; demo/shared execution is disabled'
@@ -269,11 +272,20 @@ class Relay:
         health=self.adapter(w).health()
         public.update({'display_name':w['name'],'status':w['state'],'owner_name':owner,'opt_in':bool(w['opt_in']),'can_manage':managed,'permitted_project_ids':visible,'capacity':self.one('SELECT * FROM capacity_sources WHERE worker_id=?',(w['id'],)),'authorized':self.approval(w,project,user)[0] if project else False,'eligible':eligible,'eligibility_reason':reason,'health':health,'last_seen_at':now() if health.get('available') else None,'last_seen_source':'local adapter health check'})
         public['assigned_projects']=self.worker_assignments(user,w['id'])
+        public['observation']=self.management.observation(user,w['id'])
+        public['last_seen_at']=(public['observation']['last_action'] or {}).get('timestamp')
+        public['last_seen_source']='last recorded observable event'
+        project_blocked=bool(project and (self.rows('SELECT 1 FROM human_workspace_locks WHERE project_id=?',(project,)) or self.rows("SELECT 1 FROM tasks t JOIN conversations c ON c.id=t.conversation_id WHERE c.project_id=? AND t.state NOT IN ('completed','failed','cancelled','queued')",(project,))))
+        public['can_accept_task']=eligible and not project_blocked
+        public['assignment_reason']='Project is reserved by a human or unfinished task; queue explicitly or finish/checkpoint and release first' if project_blocked else reason
+        if not w['opt_in'] and w['state']=='available':public['status']='paused'
+        if not public['observation']['current_task'] and w['state']=='available' and not health.get('available'):
+            public['status']=health.get('status','unavailable')
         return public
     def workers(self,user,project=None,mine=False):
         self.org_member(user)
         if project: self.access(user,project)
-        all_workers=self.rows("SELECT * FROM workers WHERE organization_id='orgdemo' ORDER BY id")
+        all_workers=self.rows("SELECT * FROM workers WHERE organization_id='orgdemo' AND removed_at IS NULL ORDER BY id")
         selected=[]
         for w in all_workers:
             if (not self.native_enabled and w['execution_mode']=='native') or (not self.demo and w['execution_mode']=='personal_supported'):continue
@@ -295,7 +307,9 @@ class Relay:
             from .native import PROFILE_IDS
             if owner_type!='user' or user!=self.native_actor():raise PermissionError('Only the configured local native owner may enroll this profile')
             if data.get('native_profile') not in PROFILE_IDS:raise ValueError('Native profile must be a, b or c')
-            if self.rows("SELECT 1 FROM workers WHERE execution_mode='native' AND native_profile=?",(data['native_profile'],)):raise ValueError('Native profile already enrolled')
+            if self.rows("SELECT 1 FROM workers WHERE execution_mode='native' AND native_profile=? AND removed_at IS NULL",(data['native_profile'],)):raise ValueError('Native profile already enrolled')
+            health=self.adapter({'id':'profile-'+data['native_profile'],'execution_mode':'native','native_profile':data['native_profile'],'owner_type':'user','owner_id':user,'state':'available'}).health()
+            if not health.get('available'):raise ValueError('Native profile is not ready: '+health.get('reason','Preflight failed'))
         name=data.get('display_name','').strip()
         if not name or len(name)>100: raise ValueError('Worker name must contain 1–100 characters')
         # One writer per worker in this MVP. Reject rather than claim concurrency support.
@@ -313,6 +327,7 @@ class Relay:
         return self.public_worker(user,self.one('SELECT * FROM workers WHERE id=?',(worker,)),projects[0] if projects else None)
     def configure(self,user,data,revoke=False):
         w=self.one('SELECT * FROM workers WHERE id=?',(data['worker_id'],)); self.manage(user,w)
+        if w['removed_at']:raise ValueError('Worker enrollment was removed; enroll it again explicitly')
         if 'project_ids' in data:
             if not isinstance(data['project_ids'],list): raise ValueError('project_ids must be a list')
             for p in data['project_ids']: self.write_access(user,p)
@@ -385,7 +400,7 @@ class Relay:
     def available(self,project=None,user=None,exclude=None,mode=None):
         if project is None: return []
         candidates=[]
-        for w in self.rows("SELECT * FROM workers WHERE state='available' AND id!=? ORDER BY id",(exclude or '',)):
+        for w in self.rows("SELECT * FROM workers WHERE state='available' AND removed_at IS NULL AND id!=? ORDER BY id",(exclude or '',)):
             if mode and w['execution_mode']!=mode: continue
             if self.eligibility(w,project,user)[0]: candidates.append(w)
         return candidates
@@ -403,6 +418,7 @@ class Relay:
     def assign(self,t,w,authorized_by,context=None):
         # Caller owns process lock; SQLite makes lease+assignment atomic.
         self.assert_no_human_writer(self.project(t))
+        self.management._project_idle(self.project(t),t['id'])
         approved,reason=self.eligibility(w,self.project(t),authorized_by)
         if not approved: raise PermissionError('Worker assignment no longer permitted: '+reason)
         self.db.execute('BEGIN IMMEDIATE')
@@ -428,6 +444,7 @@ class Relay:
             if not other_active and state!=w['state']: self._capacity(t['worker_id'],state)
     def submit(self,user,conversation,prompt,worker_id=None,execution_mode=None,pause_after_turn=False,native_phases=2):
         c=self.one('SELECT * FROM conversations WHERE id=?',(conversation,)); self.write_access(user,c['project_id'])
+        if c['archived_at']:raise ValueError('Restore the conversation before starting work')
         self.assert_no_human_writer(c['project_id'])
         if self.rows("SELECT 1 FROM tasks t JOIN conversations c ON c.id=t.conversation_id WHERE c.project_id=? AND t.state NOT IN ('completed','failed','cancelled')",(c['project_id'],)):
             raise ValueError('Finish or cancel the active task in this project before starting another conversation task')
@@ -453,7 +470,7 @@ class Relay:
             mode=execution_mode or ('organization_api' if not fixture and approved_api else 'simulation')
             w=self._candidate(user,c['project_id'],mode=mode)
         if mode=='simulation' and not fixture: raise ValueError('Simulated workers support the password-strength validator demo only.')
-        t={'id':uid(),'conversation_id':conversation,'state':'queued','worker_id':None,'objective':clean(prompt),'generation':0,'requested_by':user,'execution_mode':mode,'last_error':None,'pending_action':None,'pending_target':None,'pending_reason':None,'pending_authorized_by':None,'pause_after_turn':int(pause_after_turn),'execution_phase':0,'progress_json':'{}','native_phases':native_phases}
+        t={'id':uid(),'conversation_id':conversation,'state':'queued','worker_id':None,'requested_worker_id':worker_id or (w['id'] if w else None),'objective':clean(prompt),'generation':0,'requested_by':user,'execution_mode':mode,'last_error':None,'pending_action':None,'pending_target':None,'pending_reason':None,'pending_authorized_by':None,'pause_after_turn':int(pause_after_turn),'execution_phase':0,'progress_json':'{}','native_phases':native_phases}
         fields=','.join(t); self.db.execute(f"INSERT INTO tasks({fields}) VALUES({','.join('?' for _ in t)})",tuple(t.values()))
         self.event(t,'prompt',prompt,'user',{'user_id':user}); self.state(t,'queued')
         if not w:
@@ -624,6 +641,8 @@ class Relay:
         t=self.task(user,task_id)
         self.write_access(user,self.project(t))
         self.assert_no_human_writer(self.project(t))
+        self.management._project_idle(self.project(t),t['id'])
+        if t['state']=='queued' and not target and t.get('requested_worker_id'):target=t['requested_worker_id']
         if t['generation']!=generation: return t
         if reason_code not in ('manual_switch','task_pause','retry','simulated_limit'): raise ValueError('Invalid switch reason')
         if t['state'] not in ('running','queued','handoff_pending','pausing'): raise ValueError('Task cannot switch in this state')
@@ -654,6 +673,9 @@ class Relay:
         self.state(t,'cancelled'); self.event(t,'stop',f'Cancelled by {user}'); self._release(t,'cancelled')
     def cancel(self,user,t):
         if t['state'] not in ACTIVE: raise ValueError('Task is not active')
+        if t['state']=='queued' and t['id'] not in self.jobs:
+            self.state(t,'cancelled');self.event(t,'stop',f'Queued task cancelled by {user}; no workspace changes')
+            return self.one('SELECT * FROM tasks WHERE id=?',(t['id'],))
         if t['id'] in self.unsafe_tasks: raise ValueError('Container cleanup is unverified. Restore Docker and restart Relay to verify shutdown.')
         if t['id'] in self.jobs and self.jobs[t['id']]['thread'] is not None:
             self.state(t,'pausing'); self.db.execute("UPDATE tasks SET pending_action='cancel',pending_authorized_by=? WHERE id=?",(user,t['id']))
@@ -679,6 +701,7 @@ class Relay:
             p['role']='admin' if self.is_admin(user) else self.one('SELECT role FROM memberships WHERE user_id=? AND project_id=?',(user,p['id']))['role']
             p['can_write']=p['role']!='viewer' and self.org_member(user)['role']!='viewer'
         return {'user':u,'users':people,'organizations':self.rows('SELECT * FROM organizations'),'projects':projects,'workers':directory['workers'],
+            'features':{'agent_management':True,'explorer_operations':True,'checkpoint_reviews':True,'automatic_workflow':True},
             'auth':{'mode':'local-owner' if self.local_owner_id else 'local_demo' if self.demo else 'invite','production_ready':not self.demo and not self.local_owner_id,'description':'Pinned local owner; loopback only' if self.local_owner_id else 'Seeded local identities' if self.demo else 'Invite-only Relay accounts; HTTPS required','native_enabled':self.native_enabled,'local_owner_id':self.local_owner_id},
             'personal_subscription':directory['personal_subscription'],
             'execution':{'mode':'mixed','connected':any(w['execution_mode'] in LIVE_MODES and w['health'].get('connected',False) for w in directory['workers']),'detail':'Native profiles use the local owner’s ChatGPT subscriptions and explicit handoffs. Simulated capacity is labeled; organization API capacity is shared by organization.'}}
@@ -745,6 +768,9 @@ class Relay:
             elif method=='workers/enroll': result=self.enroll(user,data)
             elif method=='workers/configure': result=self.configure(user,data)
             elif method=='workers/revoke': result=self.configure(user,data,True)
+            elif method=='workers/remove': result=self.management.remove(user,data)
+            elif method=='tasks/assign': result=self.management.assign(user,data)
+            elif method=='tasks/start': result=self.management.start(user,data['task_id'])
             elif method=='membership':
                 result=self.set_membership(user,data)
             elif method=='demo':

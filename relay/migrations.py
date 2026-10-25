@@ -40,6 +40,7 @@ def migrate(db):
     db.execute('CREATE TABLE IF NOT EXISTS request_signatures(key TEXT PRIMARY KEY,fingerprint TEXT NOT NULL)')
     if db.execute('SELECT 1 FROM schema_migrations WHERE version=2').fetchone():
         migrate_live(db)
+        migrate_management(db)
         return
     timestamp=datetime.now(timezone.utc).isoformat()
     db.execute('BEGIN IMMEDIATE')
@@ -77,6 +78,7 @@ def migrate(db):
     except Exception:
         db.execute('ROLLBACK'); raise
     migrate_live(db)
+    migrate_management(db)
 
 
 def migrate_live(db):
@@ -160,6 +162,22 @@ def migrate_ide(db):
         db.execute('CREATE TABLE human_workspace_locks(project_id TEXT PRIMARY KEY,user_id TEXT NOT NULL,client_id TEXT NOT NULL,session_hash TEXT NOT NULL,created_at TEXT NOT NULL)')
         db.execute('CREATE TABLE editor_drafts(project_id TEXT,user_id TEXT,path TEXT,base_version TEXT,content TEXT NOT NULL,updated_at TEXT NOT NULL,PRIMARY KEY(project_id,user_id,path))')
         db.execute('INSERT INTO schema_migrations VALUES(7,?)',(datetime.now(timezone.utc).isoformat(),))
+        db.execute('COMMIT')
+    except Exception:
+        db.execute('ROLLBACK');raise
+
+
+def migrate_management(db):
+    if db.execute('SELECT 1 FROM schema_migrations WHERE version=8').fetchone():return
+    db.execute('BEGIN IMMEDIATE')
+    try:
+        db.execute('ALTER TABLE conversations ADD COLUMN archived_at TEXT')
+        db.execute('ALTER TABLE workers ADD COLUMN removed_at TEXT')
+        db.execute('ALTER TABLE tasks ADD COLUMN requested_worker_id TEXT')
+        db.execute("UPDATE tasks SET requested_worker_id=COALESCE(worker_id,(SELECT json_extract(e.metadata,'$.requested_worker_id') FROM events e WHERE e.task_id=tasks.id AND e.event_type='queue' AND json_valid(e.metadata) AND json_extract(e.metadata,'$.requested_worker_id') IS NOT NULL ORDER BY e.sequence DESC LIMIT 1))")
+        db.execute('DROP INDEX one_native_profile')
+        db.execute("CREATE UNIQUE INDEX one_native_profile ON workers(native_profile) WHERE execution_mode='native' AND removed_at IS NULL")
+        db.execute('INSERT INTO schema_migrations VALUES(8,?)',(datetime.now(timezone.utc).isoformat(),))
         db.execute('COMMIT')
     except Exception:
         db.execute('ROLLBACK');raise

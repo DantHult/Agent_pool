@@ -10,9 +10,15 @@
   let opened = [], refreshAt = 0, refreshing = false, generation = 0, consoleSession = null, consoleTimer;
   let commandHistory = [], historyPosition = 0, paletteIndex = 0, activePane = 'explorer';
   let ready = false;
+  let selectedEntry = null;
+  let managementAvailable = false;
+  let workflowAvailable = false, acquiring = null, transitioning = false, autoFailed = false, commandStarting = false;
+  let refreshPromise = null;
+  let consoleVersion = 0;
   const language = name => ({py:'python',js:'javascript',jsx:'javascript',mjs:'javascript',ts:'typescript',tsx:'typescript',html:'html',css:'css',scss:'css',json:'javascript',md:'markdown',yml:'yaml',yaml:'yaml',sh:'shell',sql:'sql',diff:'diff'}[name.split('.').pop()] || 'plaintext');
   const bufferKey = name => [user, project, name].join(':');
   const mine = () => state?.lock?.kind === 'human' && state.lock.mine;
+  const canReserve = () => project && state?.editor_writable!==false && bridge?.canWrite()!==false && (!state?.lock || mine());
   const context = () => ({project_id: project, client_id: client, conversation_id: conversation});
   const notifyError = error => bridge?.showError(error);
   const notice = text => bridge?.showNotice(text);
@@ -135,6 +141,8 @@
     if (at !== generation) return;
     const draft = state?.drafts?.find(item => item.path === path);
     const buffer = {key,project,path,version:draft ? draft.base_version : result.version,saved:result.content,text:draft?.content ?? result.content,syncedText:draft?.content,readonly:result.readonly,dirty:!!draft,model:null,view:null,pending:Promise.resolve(),timer:null};
+    if (!buffer.readonly && canReserve() && !mine() && !transitioning) await acquire().catch(notifyError);
+    if(at!==generation)return;
     buffers.set(key, buffer); opened.push(key); makeModel(buffer); showBuffer(key);
     sessionStorage.setItem('relay-open-files:' + user + ':' + project, JSON.stringify(opened.map(item => buffers.get(item).path)));
   }
@@ -156,6 +164,7 @@
       if (buffer.dirty) notice('Draft retained. Reopen this file or recover it after a refresh.');
       renderTabs(); updateEditing();
       sessionStorage.setItem('relay-open-files:' + user + ':' + project, JSON.stringify(opened.map(item => buffers.get(item).path)));
+      if(!opened.length)leaveProject().catch(notifyError);
     });
   }
   function scheduleDraft(buffer) {
@@ -178,7 +187,7 @@
   }
   async function saveBuffer(buffer) {
     if (!buffer.dirty || buffer.readonly || buffer.virtual) return;
-    if (!mine()) throw new Error('Acquire or recover your edit lock before saving this draft.');
+    if (!mine()) await acquire();
     const target={project_id:buffer.project,client_id:client,...(project===buffer.project ? {conversation_id:conversation} : {})};
     clearTimeout(buffer.timer); await buffer.pending;
     const content = buffer.text;
@@ -189,21 +198,40 @@
     renderTabs(); updateEditing(); await refresh(true);
   }
   async function acquire(recover=false) {
+    if(acquiring && !recover)return acquiring;
     const at=generation;
-    const result=await api('ide/lock', {...context(),recover});
-    if (at!==generation) throw new Error('Project changed while the edit lock was being acquired. Return to that project to continue.');
-    state=result;renderState();
+    acquiring=(async()=>{
+      const result=await api(workflowAvailable && !recover ? 'ide/prepare' : 'ide/lock', {...context(),recover});
+      if(at!==generation)throw new Error('Project changed while reserving the workspace. Return to that project to continue.');
+      state=result;autoFailed=false;renderState();
+    })();
+    try{await acquiring;}catch(error){autoFailed=true;throw error;}finally{acquiring=null;updateEditing();}
   }
-  byId('editLock').onclick = guard(() => acquire());
   byId('recoverLock').onclick = guard(() => acquire(true));
   byId('saveFile').onclick = guard(saveCurrent);
-  byId('releaseLock').onclick = guard(async () => {
-    const target=context();
-    for (const buffer of buffers.values()) if (buffer.project === target.project_id && buffer.dirty) await save(buffer);
-    const result = await api('ide/release', {...target,checkpoint:true});
-    notice('Checkpoint ' + result.checkpoint.slice(0,12) + ' saved. Workspace released for agents.');
-    await refresh(true); await bridge.refresh();
-  });
+  async function saveAll() {
+    for(const buffer of buffers.values())if(buffer.project===project && buffer.dirty && !buffer.virtual)await save(buffer);
+    for(const buffer of buffers.values())if(buffer.project===project && buffer.pending)await buffer.pending;
+  }
+  async function finishReservation() {
+    if(!mine())return;
+    const result=await api(workflowAvailable?'ide/finish':'ide/release',{...context(),checkpoint:true});
+    if(result.released){clearTimeout(consoleTimer);consoleSession=null;sessionStorage.removeItem(consoleKey());state={...state,lock:null};}
+    renderState();
+  }
+  async function prepareForAgent() {
+    transitioning=true;updateEditing();
+    try{if(acquiring)await acquiring;await saveAll();await finishReservation();}
+    catch(error){transitioning=false;updateEditing();bottom('console',!!consoleSession);throw error;}
+  }
+  async function finishTransition(){try{await refresh(true);}finally{transitioning=false;updateEditing();}}
+  async function leaveProject() {
+    await flushDrafts();
+    if(!mine() || consoleSession && !consoleSession.closed || [...buffers.values()].some(buffer=>buffer.project===project && buffer.dirty))return;
+    transitioning=true;updateEditing();
+    try{await finishReservation();}finally{transitioning=false;}
+  }
+  byId('viewWriter').onclick=()=>bridge?.openTask(state?.active_project_task);
   byId('discardDraft').onclick = guard(async () => {
     const buffer = activeBuffer(); if (!buffer?.dirty) return;
     if (!window.confirm('Discard the unsaved draft for ' + buffer.path + '? The saved project file stays intact.')) return;
@@ -216,27 +244,94 @@
   byId('newFile').onclick = guard(async () => {
     const name = window.prompt('New file path, relative to this project'); if (!name?.trim()) return;
     if (!mine()) await acquire();
-    await openFile(name.trim(),true);
+    await api('ide/save', {...context(),path:name.trim(),version:null,content:''});
+    await refresh(true); await openFile(name.trim());
   });
+  byId('newFolder').onclick = guard(()=>newFolder());
+  async function newFolder(prefix='') {
+    const name=window.prompt('New folder path; its parent must exist',prefix);if(!name?.trim())return;
+    if(!mine())await acquire();
+    await api('ide/files',{...context(),action:'mkdir',path:name.trim()});await refresh(true);
+  }
+  async function saveAs() {
+    const buffer=activeBuffer();if(!buffer || buffer.virtual)return;
+    const name=window.prompt('Save a copy as a new project file',buffer.path);if(!name?.trim())return;
+    if(!mine())await acquire();
+    const at=generation;
+    await api('ide/save',{...context(),path:name.trim(),version:null,content:buffer.text});
+    if(at!==generation)return;
+    await refresh(true);await openFile(name.trim());
+  }
+  byId('saveAsFile').onclick=guard(saveAs);
+  function forgetPaths(path) {
+    for(const [key,buffer] of buffers) if(buffer.project===project && (buffer.path===path || buffer.path.startsWith(path+'/'))) {
+      clearTimeout(buffer.timer);buffer.listener?.dispose();buffer.model?.dispose();buffers.delete(key);opened=opened.filter(value=>value!==key);
+      if(current===key)current=null;
+    }
+    if(current)showBuffer(current);else if(opened.length)showBuffer(opened[opened.length-1]);else{byId('editorWelcome').hidden=false;byId('monacoEditor').hidden=true;byId('editorFallback').hidden=true;byId('editorBreadcrumb').textContent='Workspace';}
+    sessionStorage.setItem('relay-open-files:'+user+':'+project,JSON.stringify(opened.map(key=>buffers.get(key).path)));
+    renderTabs();updateEditing();
+  }
+  async function changeEntry(action,path=selectedEntry || activeBuffer()?.path) {
+    if(!path)return;
+    if([...buffers.values()].some(buffer=>buffer.project===project && buffer.dirty && (buffer.path===path || buffer.path.startsWith(path+'/'))))throw new Error('Save or discard affected drafts before renaming or deleting.');
+    if(!mine())await acquire();
+    const at=generation,ctx=context();
+    const entry=await api('ide/entry?'+new URLSearchParams({project_id:project,path}));
+    if(at!==generation)return;
+    let target;
+    if(action==='rename'){target=window.prompt('New path; destination must not exist',path)?.trim();if(!target)return;}
+    else if(!window.confirm('Delete '+entry.kind+' '+path+(entry.kind==='folder'?' and its '+entry.entries+' entries':'')+'? Unsaved changes must be saved or discarded first.'))return;
+    await api('ide/files',{...ctx,action,path,version:entry.version,target,confirmed:action==='delete'});
+    if(at!==generation)return;
+    forgetPaths(path);selectedEntry=target || null;await refresh(true);
+    if(action==='rename' && entry.kind==='file')await openFile(target);
+    notice(action==='rename'?'Moved '+path+' to '+target:'Deleted '+path);
+  }
+  byId('renameEntry').onclick=guard(()=>changeEntry('rename',activeBuffer()?.path));
+  byId('deleteEntry').onclick=guard(()=>changeEntry('delete',activeBuffer()?.path));
+  byId('fileTree').addEventListener('contextmenu',event=>{
+    const row=event.target.closest('[data-open-file], [data-folder] > summary');
+    if(!row)return;event.preventDefault();
+    selectedEntry=row.dataset.openFile || row.parentElement.dataset.folder;
+    const menu=byId('fileContextMenu');byId('fileContextPath').textContent=selectedEntry;
+    const folder=row.tagName==='SUMMARY';
+    menu.querySelector('[data-file-action="open"]').disabled=folder;
+    menu.querySelectorAll('[data-file-action]:not([data-file-action="open"])').forEach(button=>button.disabled=!managementAvailable || state?.editor_writable===false || !bridge.canWrite() || state?.lock?.kind==='agent');
+    menu.style.left=Math.min(event.clientX,window.innerWidth-250)+'px';menu.style.top=Math.min(event.clientY,window.innerHeight-230)+'px';menu.hidden=false;
+    menu.querySelector('button:not(:disabled)')?.focus();
+  });
+  document.querySelectorAll('[data-file-action]').forEach(button=>button.onclick=guard(async()=>{
+    byId('fileContextMenu').hidden=true;const action=button.dataset.fileAction,path=selectedEntry;
+    if(action==='open')return openFile(path);
+    const prefix=(state.folders || []).includes(path)?path+'/':path.includes('/')?path.slice(0,path.lastIndexOf('/')+1):'';
+    if(action==='new-folder')return newFolder(prefix);
+    if(action==='new-file'){
+      const name=window.prompt('New file path',prefix);if(!name?.trim())return;
+      if(!mine())await acquire();await api('ide/save',{...context(),path:name.trim(),version:null,content:''});await refresh(true);await openFile(name.trim());return;
+    }
+    await changeEntry(action,path);
+  }));
+  document.addEventListener('click',event=>{if(!event.target.closest('#fileContextMenu'))byId('fileContextMenu').hidden=true;});
+  document.addEventListener('keydown',event=>{if(event.key==='Escape')byId('fileContextMenu').hidden=true;});
 
   function updateEditing() {
     const buffer = activeBuffer();
-    const writable = state?.editor_writable!==false && mine() && !buffer?.readonly && !buffer?.virtual;
+    const writable = state?.editor_writable!==false && mine() && !transitioning && !buffer?.readonly && !buffer?.virtual;
     editor?.updateOptions({readOnly:!writable});
     byId('editorFallback').readOnly = !writable;
     byId('saveFile').disabled = !writable || !buffer?.dirty;
     byId('discardDraft').disabled = !mine() || !buffer?.dirty;
-    byId('saveState').textContent = buffer?.dirty ? buffer.syncedText===buffer.text ? 'Draft retained' : 'Saving draft…' : writable && buffer ? 'Saved' : 'Read-only';
-    byId('editLock').hidden = mine(); byId('editLock').disabled = !project || state?.editor_writable===false || state?.lock?.kind === 'agent' || bridge?.canWrite() === false;
-    byId('editLock').textContent=state?.editor_writable===false ? 'Read-only platform' : 'Acquire edit lock';
-    byId('releaseLock').hidden = !mine();
+    byId('saveState').textContent = buffer?.dirty ? buffer.syncedText===buffer.text ? 'Draft retained' : 'Saving draft…' : buffer?.virtual ? 'Recorded view' : buffer?.readonly ? 'Protected file' : writable && buffer ? 'Saved' : acquiring ? 'Preparing workspace…' : state?.lock?.kind==='agent' ? 'Agent writing' : state?.lock && !mine() ? 'Another editor is active' : bridge?.canWrite()===false ? 'Project permission required' : state?.editor_writable===false ? 'Secure writes unavailable on this platform' : 'Ready';
     byId('recoverLock').hidden = !(state?.lock?.kind === 'human' && state.lock.recoverable && !state.lock.mine);
-    byId('newFile').disabled = state?.editor_writable===false || bridge?.canWrite() === false || state?.lock?.kind === 'agent';
-    byId('stageAll').disabled = byId('commitChanges').disabled = byId('createBranch').disabled = byId('switchBranch').disabled = !mine();
-    if (state?.lock?.kind === 'human') {
-      ['switch','resume'].forEach(id => byId(id).disabled = true);
-      document.querySelector('.send').disabled = true;
-    }
+    byId('newFile').disabled = !project || !canReserve() || transitioning;
+    byId('newFolder').disabled=byId('newFile').disabled || !managementAvailable;
+    byId('saveAsFile').disabled=byId('newFile').disabled || !buffer || buffer.virtual;
+    byId('renameEntry').disabled=byId('deleteEntry').disabled=byId('newFile').disabled || !buffer || buffer.readonly || buffer.virtual || !managementAvailable;
+    byId('unstageAll').disabled=!canReserve() || !managementAvailable || transitioning;
+    for(const id of ['newFolder','renameEntry','deleteEntry','unstageAll'])if(!managementAvailable)byId(id).title='Restart Relay to enable this operation';
+    byId('stageAll').disabled = byId('commitChanges').disabled = byId('createBranch').disabled = byId('switchBranch').disabled = !canReserve() || transitioning;
+    if(buffer && !buffer.readonly && !buffer.virtual && canReserve() && !mine() && !transitioning && !acquiring && !autoFailed)acquire().catch(notifyError);
     if (state?.active_project_task && state.active_project_task.conversation_id!==conversation) document.querySelector('.send').disabled=true;
   }
   function treeFiles() {
@@ -249,6 +344,10 @@
     if (!state) return;
     const query = byId('fileFilter').value.toLowerCase();
     const root = {folders:new Map(),files:[]};
+    for(const path of state.folders || []) {
+      if(query && !path.toLowerCase().includes(query))continue;
+      let node=root,prefix='';for(const part of path.split('/')){prefix+=(prefix?'/':'')+part;if(!node.folders.has(part))node.folders.set(part,{folders:new Map(),files:[],prefix});node=node.folders.get(part);}
+    }
     for (const file of treeFiles().filter(file => file.path.toLowerCase().includes(query))) {
       const parts=file.path.split('/'); let node=root, prefix='';
       for (const part of parts.slice(0,-1)) { prefix += (prefix ? '/' : '') + part; if (!node.folders.has(part)) node.folders.set(part,{folders:new Map(),files:[],prefix}); node=node.folders.get(part); }
@@ -278,38 +377,45 @@
     byId('statusBranch').textContent='⑂ ' + state.branch;
     const lock=state.lock;
     const otherTask=state.active_project_task && state.active_project_task.conversation_id!==conversation;
-    const text=lock?.kind==='agent' ? 'Agent owns the workspace. Files are read-only until its checkpoint is complete.' : lock?.kind==='human' ? (lock.mine ? 'Your edit lock is active. Agents are blocked until you checkpoint and release.' : lock.name + ' holds the edit lock. Saved files remain readable.') : otherTask ? 'An unfinished task in another conversation owns this project. Finish or cancel it before starting another task.' : 'No writer active. Acquire an edit lock to make changes.';
-    byId('workspaceLock').textContent=text; byId('workspaceLock').hidden=!lock && !otherTask;
+    const text=lock?.kind==='agent' ? 'An agent is writing this project. Wait for its checkpoint, or open its task and request Pause / Checkpoint to edit safely.' : lock?.kind==='human' ? (lock.mine ? 'Your edits are protected. Relay saves and releases this reservation automatically before an agent starts.' : lock.name + ' is editing this project in another session. Ask that editor to save and finish, or recover your own previous session if it is no longer in use.') : otherTask ? 'An unfinished task in another conversation owns this project. Finish or cancel it before starting another task.' : 'Ready. Editing and Git reserve this project automatically.';
+    byId('workspaceLock').textContent=text; byId('workspaceLock').hidden=(!lock || mine()) && !otherTask;
+    byId('viewWriter').hidden=lock?.kind!=='agent' && !otherTask;
     byId('workspaceLock').classList.toggle('agent-locked',lock?.kind==='agent');
     byId('sourceLock').textContent=text;
-    byId('statusLock').textContent=lock?.kind==='agent' ? 'Agent lock' : mine() ? 'Your edit lock' : lock ? 'Editor reserved' : 'Read-only';
-    byId('gitChanges').innerHTML=state.changes.length ? state.changes.map(change=>'<div class="git-change"><button data-open-file="' + escape(change.path) + '" title="' + escape(change.path) + '">' + escape(change.path) + '</button><span class="git-code">' + escape(change.status) + (change.staged ? ' ✓' : '') + '</span><button class="icon-button" data-stage="' + escape(change.path) + '" aria-label="Stage ' + escape(change.path) + '" ' + (!mine() ? 'disabled' : '') + '>＋</button></div>').join('') : '<div class="empty">Working tree is clean.</div>';
-    byId('gitChanges').querySelectorAll('[data-stage]').forEach(button=>button.onclick=guard(()=>runGit(['add',button.dataset.stage])));
-    byId('enableConsole').disabled=!state.console_available || !mine();
-    byId('consoleScope').textContent=state.console_available ? 'Private snapshot · approved commands · no host shell' : 'Command execution requires the authenticated local owner';
+    byId('statusLock').textContent=lock?.kind==='agent' ? 'Agent writing' : mine() ? 'Editing' : lock ? 'Another editor is active' : 'Ready';
+    byId('gitChanges').innerHTML=state.changes.length ? state.changes.map(change=>'<div class="git-change"><button data-open-file="' + escape(change.path) + '" title="' + escape(change.path) + '">' + escape(change.path) + '</button><span class="git-code">' + escape(change.status) + (change.staged ? ' ✓' : '') + '</span><button class="icon-button" data-stage="' + escape(change.path) + '" aria-label="Stage ' + escape(change.path) + '" ' + (!canReserve() ? 'disabled' : '') + '>＋</button></div>').join('') : '<div class="empty">Working tree is clean.</div>';
+    byId('gitChanges').querySelectorAll('[data-stage]').forEach(button=>{const change=state.changes.find(value=>value.path===button.dataset.stage);if(change.staged){button.textContent='−';button.setAttribute('aria-label','Unstage '+change.path);if(!managementAvailable){button.disabled=true;button.title='Restart Relay to enable unstage';}}button.onclick=guard(()=>runGit([change.staged?'unstage':'add',button.dataset.stage]));});
+    byId('consoleScope').textContent=state.console_available ? 'Private snapshot · approved commands · no host shell' : state.console_unavailable_reason || 'Command execution requires the authenticated local owner';
     const selectedCwd=byId('commandCwd').value;
     const folders=new Set(['']); for (const file of state.files) { const parts=file.path.split('/'); if (parts.length>1 && !parts[0].startsWith('.')) folders.add(parts.slice(0,-1).join('/')); }
     byId('commandCwd').innerHTML=[...folders].sort().map(folder=>'<option value="' + escape(folder) + '">' + escape(folder || 'Project root') + '</option>').join(''); byId('commandCwd').value=folders.has(selectedCwd) ? selectedCwd : '';
     renderConsole();
   }
   async function refresh(force=false) {
-    if (!project || refreshing || (!force && Date.now()-refreshAt<3000)) return;
+    if(refreshPromise)return refreshPromise;
+    if (!project || (!force && Date.now()-refreshAt<3000)) return;
     refreshing=true; const at=generation, selected=project;
-    try {
+    const work=(async()=>{
       const next=await api('ide/state?' + new URLSearchParams({project_id:selected,client_id:client}));
       if (at!==generation) return;
       const previousHead=state?.checkpoint;
+      if(JSON.stringify(state?.lock)!==JSON.stringify(next.lock))autoFailed=false;
       state=next; refreshAt=Date.now(); renderState();
       if (previousHead && previousHead!==next.checkpoint) {
         for (const buffer of buffers.values()) if (buffer.project===selected && !buffer.dirty && !buffer.virtual) {
           try { const file=await api('ide/file?' + new URLSearchParams({project_id:selected,path:buffer.path})); if (!buffer.dirty) { replaceBuffer(buffer,file.content); buffer.saved=file.content; buffer.version=file.version; } } catch {}
         }
       }
-    } finally { refreshing=false; }
+    })();
+    refreshPromise=work;
+    try{await work;}finally{if(refreshPromise===work){refreshPromise=null;refreshing=false;}}
   }
-  byId('refreshWorkspace').onclick=guard(()=>refresh(true));
+  byId('refreshWorkspace').onclick=guard(()=>{autoFailed=false;return refresh(true);});
   async function runGit(arguments_) {
     if (arguments_[0]==='commit' && !arguments_[2]?.trim()) throw new Error('Enter a commit message.');
+    if(['add','unstage','commit','branch','switch'].includes(arguments_[0]) && (arguments_[0]!=='branch' || arguments_.length>1)) {
+      if(!mine())await acquire();await saveAll();
+    }
     const at=generation;
     const result=await api('ide/git',{...context(),arguments:arguments_});
     if (at!==generation) return;
@@ -322,6 +428,18 @@
   }
   document.querySelectorAll('[data-git]').forEach(button=>button.onclick=guard(()=>runGit([button.dataset.git])));
   byId('stageAll').onclick=guard(()=>runGit(['add','.']));
+  byId('unstageAll').onclick=guard(()=>runGit(['unstage','.']));
+  byId('stagedDiff').onclick=guard(()=>runGit(['diff','--staged']));
+  async function reviewTask(task) {
+    const at=generation;
+    const result=await api('ide/review?'+new URLSearchParams({project_id:project,task_id:task}));
+    if(at!==generation)return;
+    virtualFile('Agent checkpoint changes.diff',result.attribution+'\n\n'+result.files.join('\n')+'\n\n'+(result.diff || 'No saved source changes.'));
+  }
+  byId('compareCheckpoints').onclick=guard(async()=>{
+    const at=generation,result=await api('ide/review?'+new URLSearchParams({project_id:project,before:byId('compareBefore').value,after:byId('compareAfter').value}));
+    if(at===generation)virtualFile('Checkpoint comparison.diff',result.diff || 'No saved source changes.');
+  });
   byId('commitChanges').onclick=guard(()=>runGit(['commit','-m',byId('commitMessage').value]));
   byId('createBranch').onclick=guard(()=>runGit(['branch',byId('branchName').value]));
   byId('switchBranch').onclick=guard(()=>runGit(['switch',byId('branchName').value]));
@@ -330,23 +448,23 @@
   function consoleKey() { return 'relay-console:' + user + ':' + project; }
   function renderConsole() {
     const item=consoleSession;
-    byId('consoleState').textContent=item ? item.state + (item.exit_code!=null ? ' · exit ' + item.exit_code + ' · ' + (item.duration_ms/1000).toFixed(1) + 's' : '') : 'Not authorized';
-    byId('enableConsole').hidden=!!item && !item.closed;
-    byId('closeConsole').disabled=!item || item.closed;
-    const canRun=item && !item.closed && ['ready','finished'].includes(item.state);
+    byId('consoleState').textContent=commandStarting ? 'Preparing command…' : item ? item.state + (item.exit_code!=null ? ' · exit ' + item.exit_code + ' · ' + (item.duration_ms/1000).toFixed(1) + 's' : '') : state?.console_available ? 'Ready · enter an approved command' : 'Command sandbox unavailable for this session';
+    byId('closeConsole').disabled=!item || item.closed || commandStarting;
+    const canRun=!!state?.console_available && canReserve() && !transitioning && !commandStarting && (!item || item.closed || ['ready','finished'].includes(item.state));
     byId('commandInput').disabled=byId('runCommand').disabled=!canRun;
-    byId('applyConsole').disabled=!canRun;
+    byId('applyConsole').disabled=!item || item.closed || commandStarting || !['ready','finished'].includes(item.state);
     byId('cancelCommand').disabled=item?.state!=='running';
     byId('stdinForm').hidden=item?.state!=='running';
   }
   function startConsolePoll() {
     clearTimeout(consoleTimer);
+    const version=++consoleVersion;
     const poll=async()=>{
-      if (!consoleSession?.id || consoleSession.closed) return;
+      if (version!==consoleVersion || !consoleSession?.id || consoleSession.closed) return;
       const identity=consoleSession.id, at=generation;
       try {
         const result=await api('ide/console?' + new URLSearchParams({session_id:identity}));
-        if (at!==generation || consoleSession?.id!==identity) return;
+        if (version!==consoleVersion || at!==generation || consoleSession?.id!==identity) return;
         const changed=result.output!==consoleSession.output || result.command!==consoleSession.command;
         consoleSession=result;
         if (changed) {
@@ -356,7 +474,7 @@
         }
         renderConsole();
       } catch (error) {
-        if (at!==generation) return;
+        if (version!==consoleVersion || at!==generation) return;
         consoleSession=null; sessionStorage.removeItem(consoleKey()); renderConsole();
         notice('The previous console is closed or no longer authorized. Saved project files and recorded command events are retained.');
         return;
@@ -365,27 +483,46 @@
     };
     poll();
   }
-  byId('enableConsole').onclick=guard(async()=>{
-    if (!mine()) throw new Error('Acquire the project edit lock before authorizing a console.');
-    if ([...buffers.values()].some(buffer=>buffer.project===project && buffer.dirty)) throw new Error('Save or discard your drafts before opening the console snapshot.');
+  async function ensureConsole() {
+    const started=generation,target=context();
+    if(!mine())await acquire();
+    await saveAll();
+    if(started!==generation)throw new Error('Project changed before preparing its command environment.');
+    if(!workflowAvailable && consoleSession && !consoleSession.closed && ['ready','finished'].includes(consoleSession.state))return;
     const at=generation,key=consoleKey();
-    const result=await api('ide/console/open',{...context(),authorize:true});
+    const result=await api(workflowAvailable?'ide/console/ensure':'ide/console/open',{...target,authorize:true});
     sessionStorage.setItem(key,result.id);
-    if (at!==generation) return;
+    if (at!==generation) throw new Error('Project changed while preparing its command environment.');
     consoleSession=result;
     byId('consoleOutput').textContent='Preparing a private project snapshot and approved runtime…';
-    renderConsole(); startConsolePoll();
-  });
+    renderConsole();
+    const deadline=Date.now()+30000;
+    while(consoleSession.state==='preparing' && Date.now()<deadline) {
+      await new Promise(resolve=>setTimeout(resolve,150));
+      const next=await api('ide/console?'+new URLSearchParams({session_id:result.id}));
+      if(at!==generation)throw new Error('Project changed while preparing its command environment.');
+      consoleSession=next;renderConsole();
+    }
+    if(!['ready','finished'].includes(consoleSession.state)){startConsolePoll();throw new Error(consoleSession.error || 'The command environment is still preparing. Wait briefly and try again.');}
+  }
   byId('commandForm').onsubmit=guard(async event=>{
-    event.preventDefault(); if (!consoleSession) return;
+    event.preventDefault();
+    if(commandStarting)return;
     const command=byId('commandInput').value.trim(); if (!command) return;
+    commandStarting=true;consoleVersion++;clearTimeout(consoleTimer);renderConsole();
+    try {
+    const selectedProject=project,selectedCwd=byId('commandCwd').value;
+    byId('runCommand').disabled=true;
+    await ensureConsole();
+    if(selectedProject!==project)throw new Error('Project changed before command execution. Enter the command in the intended project.');
     const identity=consoleSession.id;
     const at=generation;
     consoleSession={...consoleSession,state:'starting',exit_code:null};renderConsole();
-    try {const result=await api('ide/console/run',{session_id:identity,command,cwd:byId('commandCwd').value});if(at!==generation)return;consoleSession=result;}
+    try {const result=await api('ide/console/run',{session_id:identity,command,cwd:selectedCwd});if(at!==generation)return;consoleSession=result;}
     catch(error){startConsolePoll();throw error;}
     commandHistory.push(command); historyPosition=commandHistory.length; byId('commandInput').value='';
     byId('consoleOutput').textContent='$ ' + command + '\n'; renderConsole(); startConsolePoll();
+    }finally{commandStarting=false;renderConsole();}
   });
   byId('commandInput').onkeydown=event=>{
     if (event.key==='ArrowUp' || event.key==='ArrowDown') { event.preventDefault(); historyPosition=Math.max(0,Math.min(commandHistory.length,historyPosition+(event.key==='ArrowUp' ? -1 : 1))); byId('commandInput').value=commandHistory[historyPosition] || ''; }
@@ -422,7 +559,7 @@
   });
   window.addEventListener('beforeunload',event=>{if ([...buffers.values()].some(buffer=>buffer.dirty && buffer.syncedText!==buffer.text)) {event.preventDefault();event.returnValue='Wait for your draft to finish synchronizing.';}});
   function signOut() {
-    generation++; clearTimeout(consoleTimer); project=null;state=null;current=null;opened=[];consoleSession=null;refreshAt=0;
+    generation++; clearTimeout(consoleTimer); project=null;state=null;current=null;opened=[];consoleSession=null;refreshAt=0;transitioning=false;autoFailed=false;acquiring=null;commandStarting=false;refreshPromise=null;
     for (const buffer of buffers.values()) {clearTimeout(buffer.timer);buffer.listener?.dispose();buffer.model?.dispose();}
     buffers.clear();editor?.setModel(null);renderTabs();
     byId('editorWelcome').hidden=false;byId('monacoEditor').hidden=true;byId('editorFallback').hidden=true;byId('editorFallback').value='';byId('consoleOutput').textContent='Sign in to access your project console.';byId('fileTree').replaceChildren();
@@ -430,9 +567,11 @@
   }
   async function update(value) {
     if (!bridge) return;
+    managementAvailable=value.managementAvailable===true;
+    workflowAvailable=value.automaticWorkflow===true;
     const changed=project!==value.project || user!==value.user;
     if (changed) {
-      generation++;clearTimeout(consoleTimer);project=value.project;user=value.user;state=null;refreshAt=0;opened=[];current=null;consoleSession=null;refreshing=false;
+      generation++;clearTimeout(consoleTimer);project=value.project;user=value.user;state=null;refreshAt=0;opened=[];current=null;consoleSession=null;refreshing=false;autoFailed=false;acquiring=null;transitioning=false;refreshPromise=null;
       byId('editorWelcome').hidden=false;byId('monacoEditor').hidden=true;byId('editorFallback').hidden=true;renderTabs();
       commandHistory=[];historyPosition=0;
     }
@@ -445,6 +584,15 @@
     byId('taskObjectiveFull').textContent=value.objective || '';
     byId('latestCheckpoint').textContent=value.checkpoint?.slice(0,8) || '—';
     byId('selectedWorkerLabel').textContent=value.selectedWorker || 'Select worker';
+    const checkpoints=value.checkpoints || [];
+    for(const id of ['compareBefore','compareAfter']) {
+      const selected=byId(id).value;
+      byId(id).innerHTML=checkpoints.map(item=>'<option value="'+escape(item.git_commit)+'">'+escape(item.git_commit.slice(0,9)+' · '+item.reason)+'</option>').join('');
+      if(checkpoints.some(item=>item.git_commit===selected))byId(id).value=selected;
+      else if(id==='compareBefore' && checkpoints.length>1)byId(id).value=checkpoints[1].git_commit;
+    }
+    byId('compareCheckpoints').disabled=checkpoints.length<2 || !managementAvailable;
+    byId('compareCheckpoints').title=checkpoints.length<2?'Save at least two project checkpoints to compare their changes':!managementAvailable?'Restart Relay to provide checkpoint review':'Compare the selected recorded checkpoints';
     await refresh(changed);
     updateEditing();
     if (changed && project) {
@@ -459,6 +607,6 @@
   byId('newConversation').onclick=()=>bridge?.newConversation();
   byId('showCheckpoint').onclick=()=>{pane('agents');document.querySelector('.workspace-records').open=true;document.querySelector('[data-tab="checkpoints"]').click();};
   async function flushDrafts(){for(const buffer of buffers.values())if(buffer.dirty && !buffer.virtual && !buffer.readonly)await flushDraft(buffer);}
-  window.RelayIDE={connect(value){bridge=value;ensureEditor();},update,openFile,virtualFile,refresh,pane,bottom,signOut,updateEditing,flushDrafts,
+  window.RelayIDE={connect(value){bridge=value;ensureEditor();},update,openFile,virtualFile,refresh,pane,bottom,signOut,updateEditing,flushDrafts,reviewTask,prepareForAgent,finishTransition,leaveProject,
     getState:()=>state,get clientId(){return client;},get editor(){return editor;},get activeFile(){return activeBuffer()?.path;}};
 })();
