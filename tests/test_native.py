@@ -15,7 +15,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from relay.app_server import AppServerClient
+from relay.app_server import AppServerClient,AppServerError,sandbox_python
 from relay.native import initialize_profiles,close_native_sessions,profile_paths,native_readiness
 from relay.store import Relay
 
@@ -149,3 +149,27 @@ class NativeAdapterTests(unittest.TestCase):
         checks,details=native_readiness();self.assertFalse(all(ok for _,ok in checks));self.assertIn('ChatGPT login',' '.join(details))
 
 if __name__=='__main__':unittest.main()
+
+
+class SandboxPythonTests(unittest.TestCase):
+    """Sandboxed commands must use the runtime the permission profile grants."""
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.root=Path(self.tmp.name).resolve()
+        self.base=self.root/'Framework/Versions/3.14';(self.base/'bin').mkdir(parents=True)
+        self.real=self.base/'bin'/('python%d.%d'%sys.version_info[:2]);self.real.write_text('');self.real.chmod(0o755)
+        self.venv=self.root/'home/project/.venv';(self.venv/'bin').mkdir(parents=True)
+    def tearDown(self):self.tmp.cleanup()
+    def runtime(self,executable,prefix):
+        return patch.multiple(sys,executable=str(executable),prefix=str(prefix),base_prefix=str(self.base))
+
+    def test_base_interpreter_is_used_unchanged(self):
+        with self.runtime(self.real,self.base):self.assertEqual(sandbox_python(),self.real)
+
+    @unittest.skipIf(os.name=='nt','Windows keeps its own interpreter selection')
+    def test_virtual_environment_resolves_to_granted_base_runtime(self):
+        link=self.venv/'bin/python3';link.symlink_to(self.real)
+        with self.runtime(link,self.venv):self.assertEqual(sandbox_python(),self.real)
+        copy=self.venv/'bin/python';copy.write_text('')  # a copied venv binary
+        with self.runtime(copy,self.venv):self.assertEqual(sandbox_python(),self.real)
+        self.real.unlink()
+        with self.runtime(copy,self.venv),self.assertRaises(AppServerError):sandbox_python()

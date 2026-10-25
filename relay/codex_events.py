@@ -10,6 +10,10 @@ def progress_from_message(text):
     if not isinstance(value,dict): return {}
     result={key:[str(item)[:2000] for item in value[key][:20]] for key in PROGRESS_KEYS if isinstance(value.get(key),list)}
     if isinstance(value.get('summary'),str): result['summary']=value['summary'][:12000]
+    if value.get('completion_state') in ('completed','continue','blocked','needs_authorization','uncertain'):
+        result['completion_state']=value['completion_state']
+    if isinstance(value.get('acceptance_evidence'),list):
+        result['acceptance_evidence']=[str(item)[:2000] for item in value['acceptance_evidence'][:20]]
     return result
 
 def provider_error(event):

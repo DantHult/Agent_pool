@@ -101,33 +101,98 @@ class Management:
             except PermissionError:pass
         current = next((t for t in visible if t['worker_id']==worker and t['state'] not in ('completed','cancelled','failed','queued')), None)
         selected = current or (visible[0] if visible else None)
-        event = None
-        for t in visible:
-            candidates = r.rows("SELECT event_type,content,metadata,timestamp,task_id,conversation_id FROM events WHERE task_id=? AND worker_id=? AND event_type IN ('tool_invocation','tool_output','response','agent_delta','checkpoint','error','execution_result','native_environment') ORDER BY sequence DESC LIMIT 1", (t['id'], worker))
-            if candidates and (not event or candidates[0]['timestamp']>event['timestamp']):event = candidates[0]
-        runs = r.rows('SELECT state,started_at,finished_at,duration_ms FROM execution_runs WHERE worker_id=? ORDER BY rowid DESC LIMIT 1', (worker,)) if selected else []
-        # Do not expose runs from inaccessible projects.
-        if runs and selected:
-            runs = r.rows('SELECT state,started_at,finished_at,duration_ms FROM execution_runs WHERE worker_id=? AND task_id=? ORDER BY rowid DESC LIMIT 1', (worker, selected['id']))
-        changed_files = set()
-        last_command, checkpoint = [], []
+        events=r.rows("SELECT event_type,content,metadata,timestamp,task_id,conversation_id,sequence FROM events WHERE task_id=? AND worker_id=? ORDER BY sequence DESC LIMIT 160",(selected['id'],worker)) if selected else []
+        observable=('tool_invocation','tool_output','response','agent_delta','checkpoint','error','provider_error','execution_result','native_environment','file_change','turn_started','continuation','task_blocked','stop')
+        event=next((e for e in events if e['event_type'] in observable),None)
+        runs=r.rows('SELECT state,started_at,finished_at,duration_ms FROM execution_runs WHERE worker_id=? AND task_id=? ORDER BY rowid DESC LIMIT 1',(worker,selected['id'])) if selected else []
+        changed_files=set();checkpoint=[]
+        command=next((e for e in events if e['event_type']=='tool_invocation'),None)
+        result=next((e for e in events if e['event_type']=='tool_output' and 'exit_code' in json.loads(e['metadata'])),None)
+        executing=command if current and current['state']=='running' else None
+        if executing:
+            key=json.loads(executing['metadata'])
+            for e in events:
+                if e['sequence']<=executing['sequence']:break
+                meta=json.loads(e['metadata'])
+                if e['event_type']=='tool_output' and meta.get('provider_item_id')==key.get('provider_item_id') and meta.get('native_turn_id')==key.get('native_turn_id'):
+                    executing=None;break
         if selected:
-            last_command = r.rows("SELECT content,timestamp FROM events WHERE task_id=? AND worker_id=? AND event_type='tool_invocation' ORDER BY sequence DESC LIMIT 1", (selected['id'], worker))
-            checkpoint = r.rows('SELECT git_commit,reason,created_at FROM workspace_checkpoints WHERE task_id=? AND worker_id=? ORDER BY rowid DESC LIMIT 1', (selected['id'], worker))
-            for row in r.rows("SELECT metadata,content FROM events WHERE task_id=? AND worker_id=? AND event_type IN ('tool_invocation','tool_output','native_patch')", (selected['id'], worker)):
-                metadata = json.loads(row['metadata'])
-                changes = metadata.get('changes', [])
+            checkpoint=r.rows('SELECT git_commit,reason,created_at FROM workspace_checkpoints WHERE task_id=? AND worker_id=? ORDER BY rowid DESC LIMIT 1',(selected['id'],worker))
+            # File counts come from actual file-change events or final context,
+            # never from model text that says it intends to edit something.
+            for row in r.rows("SELECT metadata,content FROM events WHERE task_id=? AND worker_id=? AND event_type IN ('file_change','tool_output') ORDER BY sequence DESC LIMIT 1000",(selected['id'],worker)):
+                meta=json.loads(row['metadata']);changes=meta.get('changes',[])
                 if not changes:
-                    try:changes = json.loads(row['content'])
-                    except (ValueError, TypeError):changes = []
-                for change in changes if isinstance(changes, list) else []:
-                    if isinstance(change, dict) and isinstance(change.get('path'), str):changed_files.add(change['path'])
-        return {'current_task': current, 'latest_task': selected, 'last_action': event,
-                'phase': current['state'] if current else 'idle', 'latest_run': runs[0] if runs else None,
-                'reported_changed_files': sorted(changed_files),
-                'last_command': last_command[0] if last_command else None, 'checkpoint': checkpoint[0] if checkpoint else None,
-                'provider': 'Codex' if selected and selected['execution_mode'] in LIVE_MODES else None,
-                'model': os.environ.get('RELAY_NATIVE_MODEL') if selected and selected['execution_mode']=='native' else None}
+                    try:changes=json.loads(row['content'])
+                    except (ValueError,TypeError):changes=[]
+                for change in changes if isinstance(changes,list) else []:
+                    if isinstance(change,dict) and isinstance(change.get('path'),str):changed_files.add(change['path'])
+            contexts=r.rows('SELECT data FROM contexts WHERE task_id=? ORDER BY version DESC LIMIT 1',(selected['id'],))
+            if contexts:changed_files.update(json.loads(contexts[0]['data']).get('files_changed',[]))
+        errors=[e for e in events if e['event_type'] in ('error','provider_error','task_blocked','capacity_blocked')][:3]
+        phase='idle'
+        if selected:
+            state=selected['state'];progress=json.loads(selected.get('progress_json') or '{}')
+            if state=='queued':phase='waiting_for_resource' if r.one('SELECT state FROM workers WHERE id=?',(worker,))['state']!='available' else 'queued'
+            elif state=='pausing':phase='stopping' if selected.get('pending_action')=='cancel' else 'pausing'
+            elif state=='handoff_pending':phase='blocked' if selected.get('last_error') or progress.get('completion_state') in ('blocked','uncertain','needs_authorization') else 'paused'
+            elif state=='cancelled':phase='stopped'
+            elif state=='running':phase='running' if events else 'starting'
+            else:phase=state
+        # Stop interrupts a live execution; Cancel discards a queued or paused
+        # task without touching other workers. Both use the same exact-task route.
+        can_stop=False;stop_action=None;stop_target=None
+        queued=next((t for t in visible if worker in (t['worker_id'],t['requested_worker_id']) and t['state']=='queued'),None)
+        target=current if current and current['state'] in ('running','pausing','handoff_pending') else queued
+        if target:
+            try:
+                r.write_access(user,target['project_id'])
+                if target['execution_mode']!='native' or user==r.native_actor():
+                    stop_target=target['id'];stop_action='stop' if target['state'] in ('running','pausing') else 'cancel';can_stop=stop_action=='stop'
+            except PermissionError:pass
+        return {'current_task':current,'latest_task':selected,'last_action':event,'phase':phase,
+                'latest_run':runs[0] if runs else None,'reported_changed_files':sorted(changed_files),
+                'last_command':command,'executing_command':executing,'last_tool_result':result,
+                'checkpoint':checkpoint[0] if checkpoint else None,'recent_errors':errors,
+                'blocker':selected.get('last_error') if selected else None,'can_stop':can_stop,'stop_action':stop_action,'stop_task_id':stop_target,
+                'activity':self._activity(phase,executing,event,command,result),
+                'provider':'Codex' if selected and selected['execution_mode'] in LIVE_MODES else None,
+                'model':os.environ.get('RELAY_NATIVE_MODEL') if selected and selected['execution_mode']=='native' else None}
+
+    @staticmethod
+    def _activity(phase,executing,event,command,result):
+        # One line derived only from recorded events; never inferred intent.
+        if executing:return 'Running command: '+executing['content'][:180]
+        if phase not in ('running','starting','stopping','pausing'):return phase.replace('_',' ').capitalize()
+        kind=event['event_type'] if event else None
+        if kind=='tool_output' and result:
+            code=json.loads(result['metadata']).get('exit_code')
+            return 'Command finished (exit '+str(code)+')'+(': '+command['content'][:150] if command else '')
+        labels={'file_change':'Applying file changes','agent_delta':'Writing response','response':'Reported progress',
+                'turn_started':'Working on the objective; waiting for the next model or tool event','continuation':'Continuing after a checkpoint',
+                'checkpoint':'Saved checkpoint','native_environment':'Preparing the project environment','stop':'Stopping: waiting for process cleanup',
+                'provider_error':'Provider reported an error'}
+        return labels.get(kind,phase.replace('_',' ').capitalize())
+
+    def activity(self,user,after=''):
+        import hashlib
+        r=self.relay;r.org_member(user);items=[]
+        for w in r.rows("SELECT * FROM workers WHERE organization_id='orgdemo' AND removed_at IS NULL ORDER BY id"):
+            if w['execution_mode']=='native' and not r.native_enabled:continue
+            owner=w['owner_type']=='user' and w['owner_id']==user
+            shared=r.rows('SELECT 1 FROM worker_projects w JOIN memberships m ON m.project_id=w.project_id WHERE w.worker_id=? AND m.user_id=?',(w['id'],user))
+            if owner or shared or r.is_admin(user):
+                items.append({'id':w['id'],'status':w['state'],'observation':self.observation(user,w['id'])})
+        cursor=hashlib.sha256(json.dumps(items,sort_keys=True).encode()).hexdigest()
+        return {'cursor':cursor,'unchanged':cursor==after,'agents':[] if cursor==after else items}
+
+    def stop(self,user,data):
+        r=self.relay;t=r.task(user,data['task_id']);r.write_access(user,r.project(t))
+        if data['worker_id'] not in (t['worker_id'],t.get('requested_worker_id')):raise WorkspaceConflict('This task belongs to a different agent; refresh its activity')
+        if t['execution_mode']=='native' and user!=r.native_actor():raise PermissionError('Only the pinned local owner can control native execution')
+        if t['state'] in ('completed','failed','cancelled'):return t
+        if t['state']=='pausing' and t.get('pending_action')=='cancel':return t
+        return r.cancel(user,t)
 
     def review(self, user, project, task=None, before=None, after=None):
         r = self.relay

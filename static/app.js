@@ -36,6 +36,8 @@ let projectTasks = [];
 let assignmentTarget = '';
 let activityFrame = null;
 let hasOlderActivity=false, activityLoading=false, workersLoading=false, workerTimer=null, artifactLoading=false;
+let agentsCursor='',agentsPolling=false;
+const agentExpanded=new Set(),agentSignatures=new Map();
 const activityView = new RelayActivity.View($('timeline'), workerName);
 
 const esc = value => String(value ?? '').replace(/[&<>"']/g, character => ({
@@ -111,6 +113,7 @@ function invalidateView() {
   liveSource = null;
   if (liveTimer) clearTimeout(liveTimer);
   liveTimer = null;
+  agentsCursor='';agentSignatures.clear();
   viewVersion += 1;
   refreshSerial += 1;
   lastConversation = null;
@@ -272,8 +275,13 @@ function renderWorkerSelectors(workers, task) {
   const startOptions = workers.filter(worker => worker.execution_mode !== 'personal_supported' &&
     (eligible(worker) || (['organization_api', 'native'].includes(worker.execution_mode) && worker.authorized === true)));
   // Explicit selection can precede the deferred directory response. Keep its identity.
+  // The local owner can always pick Codex A, B or C; choosing one not yet
+  // approved for this project approves it, exactly like Select on its card.
+  const listed = new Set(startOptions.map(worker => worker.native_profile).filter(Boolean));
+  const profiles = authMode === 'local-owner' ? (nativeProfiles?.profiles || []).filter(profile => !listed.has(profile.profile)) : [];
   $('startWorker').innerHTML = '<option value="">Choose an eligible worker automatically</option>' + startOptions.map(worker =>
-    `<option value="${esc(worker.id)}">${esc(worker.display_name || worker.name)} · ${esc(executionModes[worker.execution_mode] || worker.execution_mode)}${eligible(worker) ? '' : ' · queued until runtime ready'}</option>`).join('');
+    `<option value="${esc(worker.id)}">${esc(worker.display_name || worker.name)} · ${esc(executionModes[worker.execution_mode] || worker.execution_mode)}${eligible(worker) ? '' : ' · queued until runtime ready'}</option>`).join('') + profiles.map(profile =>
+    `<option value="native:${esc(profile.profile)}">Native ${esc(profile.profile.toUpperCase())} · ${esc(executionModes.native || 'native')} · ${profile.available ? 'add to this project' : esc(profile.status.replaceAll('_', ' '))}</option>`).join('');
   $('startWorker').value = selectedStartWorker;
   const targetOptions = workers.filter(worker => eligible(worker) && worker.id !== task?.worker_id && (!task || worker.execution_mode === task.execution_mode));
   // A freshly enrolled handoff target may not be in the cached directory yet.
@@ -294,10 +302,11 @@ function canDispatch(worker) {
 
 function renderWorkerActions(worker) {
   if(!overview?.features?.agent_management)return '<p class="permission-note">Restart the Relay backend to enable direct assignments and agent management.</p>';
-  const observed=worker.observation || {},task=observed.current_task,latest=observed.latest_task,action=observed.last_action;
-  const run=observed.latest_run;
-  const elapsed=run?.started_at ? Math.max(0,Math.floor(((run.finished_at?Date.parse(run.finished_at):Date.now())-Date.parse(run.started_at))/1000))+'s' : 'No execution observed';
-  return `<div class="agent-observation"><strong>${esc(task?.objective || latest?.objective || 'No assigned task')}</strong><small>${esc((task || latest)?.project_name || 'No project')} · ${esc((task || latest)?.conversation_title || 'No conversation')}</small><div class="agent-last-action">${esc(action ? 'Last observed: '+action.event_type+' · '+action.content.slice(0,180) : 'No observable execution event recorded')}</div><small>${esc(displayDate(action?.timestamp))} · ${esc(observed.phase || 'idle')} · ${esc(elapsed)}</small><div class="agent-last-action">${esc(observed.last_command ? 'Last command: '+observed.last_command.content.slice(0,150) : 'No command recorded for this task')}<br>${observed.reported_changed_files?.length ? esc(observed.reported_changed_files.length+' files reported changed') : 'No file-change events reported'}${observed.checkpoint ? '<br>Checkpoint '+esc(observed.checkpoint.git_commit.slice(0,10)) : ''}</div><small>Provider: ${esc(worker.execution_mode==='simulation'?'Simulated fixture':'Codex')} · Profile: ${esc(worker.native_profile?.toUpperCase() || worker.execution_mode)} · Model: ${esc(observed.model || 'Not reported')}</small></div><div class="agent-controls"><button class="primary compact" data-assign-worker="${esc(worker.id)}" ${!worker.authorized || !currentCanWrite() || busy ? 'disabled' : ''} title="${esc(worker.assignment_reason || worker.eligibility_reason)}">${canDispatch(worker)?'Assign Task':'Queue Task'}</button>${latest?`<button class="outline compact" data-agent-task="${esc(latest.id)}" data-task-project="${esc(latest.project_id)}" data-task-conversation="${esc(latest.conversation_id)}">View activity</button>`:''}${canManage(worker)?`<button class="quiet" data-remove-project="${esc(worker.id)}" ${!worker.permitted_project_ids.includes(project)?'disabled':''}>Remove from project</button><button class="quiet danger" data-remove-worker="${esc(worker.id)}">Remove enrollment</button>`:''}</div>`;
+  const observed=worker.observation || {},task=observed.current_task,latest=observed.latest_task,action=observed.last_action,run=observed.latest_run;
+  const phase=(observed.phase || worker.status || 'idle').replaceAll('_',' ');
+  const result=observed.last_tool_result,meta=result?RelayActivity.metadata(result):{};
+  return `<div data-agent-observation="${esc(worker.id)}"><div class="agent-live-summary"><strong>${esc(phase)} · ${esc(observed.activity || 'No activity observed')}</strong>${observed.stop_action?`<button class="outline compact danger" data-stop-agent="${esc(worker.id)}" data-stop-task="${esc(observed.stop_task_id)}" data-stop-label="${observed.stop_action==='stop'?'Stop':'Cancel task'}" title="${observed.stop_action==='stop'?'Interrupt this agent’s running execution; completed changes are checkpointed':'Cancel this agent’s queued or paused task'}" ${phase==='stopping'?'disabled':''}>${phase==='stopping'?'Stopping…':observed.stop_action==='stop'?'Stop':'Cancel task'}</button>`:''}</div><div class="agent-observation"><strong>${esc(task?.objective || latest?.objective || 'No assigned task')}</strong><small>${esc((task || latest)?.project_name || 'No project')} · ${esc((task || latest)?.conversation_title || 'No conversation')}</small><small>Profile ${esc(worker.native_profile?.toUpperCase() || worker.execution_mode)} · <span data-agent-elapsed data-start="${esc(run?.started_at || '')}" data-finish="${esc(run?.finished_at || '')}"></span></small></div><details class="agent-details" data-agent-details="${esc(worker.id)}" ${agentExpanded.has(worker.id)?'open':''}><summary>Activity details</summary><div class="agent-last-action">${esc(action ? 'Last observed: '+action.event_type+' · '+action.content.slice(0,240) : 'No observable execution event recorded')}</div><small>Last activity: ${esc(displayDate(action?.timestamp))}</small><div class="agent-last-action">${esc(observed.last_command?'Last command: '+observed.last_command.content.slice(0,240):'No command recorded')}<br>${esc(result?'Last result: exit '+(meta.exit_code ?? 'unknown')+' · '+result.content.slice(0,240):'No command result recorded')}<br>${observed.reported_changed_files?.length ? esc(observed.reported_changed_files.length+' files changed (observed)') : 'No file changes observed'}${observed.checkpoint?'<br>Checkpoint '+esc(observed.checkpoint.git_commit.slice(0,10)):''}</div><div class="agent-runtime-error">${esc(observed.blocker || '')}${(observed.recent_errors || []).map(e=>'<br>'+esc(e.content.slice(0,500))).join('')}</div><small>Provider: ${esc(worker.execution_mode==='simulation'?'Simulated fixture':'Codex')} · Model: ${esc(observed.model || 'Not reported')}</small></details><div class="agent-controls"><button class="primary compact" data-assign-worker="${esc(worker.id)}" ${!worker.authorized || !currentCanWrite() || busy?'disabled':''} title="${esc(worker.assignment_reason || worker.eligibility_reason)}">${canDispatch(worker)?'Assign Task':'Queue Task'}</button>${latest?`<button class="outline compact" data-agent-task="${esc(latest.id)}" data-task-project="${esc(latest.project_id)}" data-task-conversation="${esc(latest.conversation_id)}">View activity</button>`:''}${canManage(worker)?`<button class="quiet" data-remove-project="${esc(worker.id)}" ${!worker.permitted_project_ids.includes(project)?'disabled':''}>Remove from project</button><button class="quiet danger" data-remove-worker="${esc(worker.id)}">Remove enrollment</button>`:''}</div></div>`;
+
 }
 
 async function openTask(identity,conversationId,projectId=project) {
@@ -434,7 +443,7 @@ function render() {
   if (authMode==='local-owner' && !selectedStartWorker) document.querySelector('.send').disabled=true;
   RelayIDE.update({project,user:overview.user.id,conversation:detail.conversation.id,projectName:currentProject?.name || project,
     worker:task?.worker_id ? workerName(task.worker_id) : detail.tasks[0]?.worker_id ? workerName(detail.tasks[0].worker_id) : '',
-    developmentTerminal:!!overview.features?.development_terminal,automaticWorkflow:!!overview.features?.automatic_workflow,managementAvailable:!!overview.features?.agent_management,checkpoints:detail.checkpoints,state:task?.state || detail.tasks[0]?.state,objective:task?.objective || detail.tasks[0]?.objective,checkpoint:detail.workspace.checkpoint,
+    developmentTerminal:!!overview.features?.development_terminal,editorLeases:!!overview.features?.editor_leases,automaticWorkflow:!!overview.features?.automatic_workflow,managementAvailable:!!overview.features?.agent_management,checkpoints:detail.checkpoints,state:task?.state || detail.tasks[0]?.state,objective:task?.objective || detail.tasks[0]?.objective,checkpoint:detail.workspace.checkpoint,
     selectedWorker:workers.find(worker => worker.id === selectedStartWorker)?.display_name || workers.find(worker => worker.id === selectedStartWorker)?.name}).catch(showError);
 }
 
@@ -479,7 +488,40 @@ async function newConversation() {
   await selectConversation(created.id);
 }
 
+function updateAgentElapsed() {
+  document.querySelectorAll('[data-agent-elapsed]').forEach(node=>{
+    if(!node.dataset.start){node.textContent='No execution observed';return;}
+    const seconds=Math.max(0,Math.floor(((node.dataset.finish?Date.parse(node.dataset.finish):Date.now())-Date.parse(node.dataset.start))/1000));
+    node.textContent=Math.floor(seconds/60)+'m '+seconds%60+'s';
+  });
+}
+async function pollAgents() {
+  if(agentsPolling || !overview?.features?.live_agents || !detail || document.body.classList.contains('signed-out'))return;
+  agentsPolling=true;const version=viewVersion;
+  try {
+    const data=await api('agents/activity?'+new URLSearchParams({after:agentsCursor}));
+    if(version!==viewVersion)return;
+    agentsCursor=data.cursor;
+    if(!data.unchanged)for(const item of data.agents){
+      const worker=detail.workers.find(w=>w.id===item.id);if(!worker)continue;
+      const signature=JSON.stringify(item);if(agentSignatures.get(item.id)===signature)continue;agentSignatures.set(item.id,signature);
+      worker.observation=item.observation;worker.status=item.status;
+      const node=document.querySelector('[data-agent-observation="'+CSS.escape(worker.id)+'"]');
+      const markup=renderWorkerActions(worker);
+      if(node && node.outerHTML!==markup){node.outerHTML=markup;}
+    }
+    bindWorkerSettings();updateAgentElapsed();
+  }catch(error){if(error.status!==401)console.debug('Agent activity reconnecting');}
+  finally{agentsPolling=false;}
+}
 function bindWorkerSettings() {
+  updateAgentElapsed();
+  document.querySelectorAll('[data-agent-details]').forEach(node=>node.ontoggle=()=>{if(node.open)agentExpanded.add(node.dataset.agentDetails);else agentExpanded.delete(node.dataset.agentDetails);});
+  document.querySelectorAll('[data-stop-agent]').forEach(button=>button.onclick=async()=>{
+    button.disabled=true;button.textContent='Stopping…';
+    try {await api('workers/stop',{worker_id:button.dataset.stopAgent,task_id:button.dataset.stopTask,request_id:crypto.randomUUID()});agentsCursor='';await pollAgents();await load(true);}
+    catch(error){showError(error);button.disabled=false;button.textContent=button.dataset.stopLabel || 'Stop';}
+  });
   document.querySelectorAll('[data-assign-worker]').forEach(button=>button.onclick=()=>openAssignment(button.dataset.assignWorker));
   document.querySelectorAll('[data-agent-task]').forEach(button=>button.onclick=()=>openTask(button.dataset.agentTask,button.dataset.taskConversation,button.dataset.taskProject).catch(showError));
   document.querySelectorAll('[data-remove-worker]').forEach(button=>button.onclick=()=>{
@@ -568,7 +610,11 @@ $('composer').onsubmit = event => {
     ...(selectedStartWorker ? {worker_id: selectedStartWorker} : {})
   });
 };
-$('startWorker').onchange = () => { selectedStartWorker = $('startWorker').value; render(); };
+$('startWorker').onchange = () => {
+  const value = $('startWorker').value;
+  if (value.startsWith('native:')) { $('startWorker').value = selectedStartWorker; selectNativeProfile(value.slice(7)); return; }
+  selectedStartWorker = value; render();
+};
 $('switchTarget').onchange = () => { selectedTarget = $('switchTarget').value; render(); };
 $('switchReason').onchange = () => { selectedReason = $('switchReason').value; };
 $('switch').onclick = () => {
@@ -713,25 +759,36 @@ $('enrollmentForm').onsubmit = async event => {
     ? 'Worker registered as unsupported. Personal subscription execution remains disabled.' : 'Worker enrolled. Eligibility is evaluated against project approval, owner opt-in, capacity, and runtime health.');
 };
 
+// Provider-reported usage windows for a native ChatGPT profile.
+function usageLine(usage) {
+  const windows = Object.entries(usage?.windows || {});
+  if (!windows.length) return '';
+  const label = {five_hour:'5-hour', weekly:'Weekly'};
+  return '<p class="profile-usage">' + windows.map(([name, window]) => esc(label[name] + ' ' + window.used_percent + '% used' + (window.resets_at ? ' · resets ' + new Date(window.resets_at * 1000).toLocaleString([], {weekday:'short', hour:'2-digit', minute:'2-digit'}) : ''))).join('<br>') + '</p>';
+}
+
 function renderNativeProfiles(selectedProject = project) {
   $('localNativePanel').hidden = authMode !== 'local-owner';
   if (!nativeProfiles || authMode !== 'local-owner') return;
   $('localNativeOwner').textContent = 'Pinned owner: ' + (overview?.user.name || nativeProfiles.profiles[0]?.owner_name || 'Local owner');
-  $('localNativeProfiles').innerHTML = nativeProfiles.profiles.map(profile => `<article class="native-profile"><strong>Codex ${esc(profile.profile.toUpperCase())}</strong><span class="pill">${esc(profile.status)}</span><p class="profile-project">${esc((profile.assigned_projects || []).map(item => item.name).join(', ') || 'No current project')} · ${esc(profile.owner_name || 'Local owner')}</p><p>${esc(profile.reason)}</p><button class="outline" data-native-profile="${esc(profile.profile)}" ${busy || loading || !detail || !selectedProject || !profile.available ? 'disabled' : ''}>${activeTask() ? 'Prepare ' + esc(profile.profile.toUpperCase()) + ' for handoff' : 'Select ' + esc(profile.profile.toUpperCase()) + ' for this project'}</button>${!profile.available && profile.status!=='busy'?`<button class="quiet" data-native-setup="${esc(profile.profile)}">Profile setup / resolve prerequisite</button>`:''}</article>`).join('');
+  $('localNativeProfiles').innerHTML = nativeProfiles.profiles.map(profile => `<article class="native-profile"><strong>Codex ${esc(profile.profile.toUpperCase())}</strong><span class="pill">${esc(profile.status)}</span><p class="profile-project">${esc((profile.assigned_projects || []).map(item => item.name).join(', ') || 'No current project')} · ${esc(profile.owner_name || 'Local owner')}</p><p>${esc(profile.reason)}</p>${usageLine(profile.usage)}<button class="outline" data-native-profile="${esc(profile.profile)}" ${busy || loading || !detail || !selectedProject || !profile.available ? 'disabled' : ''}>${activeTask() ? 'Prepare ' + esc(profile.profile.toUpperCase()) + ' for handoff' : 'Select ' + esc(profile.profile.toUpperCase()) + ' for this project'}</button>${!profile.available && profile.status!=='busy'?`<button class="quiet" data-native-setup="${esc(profile.profile)}">Profile setup / resolve prerequisite</button>`:''}</article>`).join('');
   document.querySelectorAll('[data-native-setup]').forEach(button=>button.onclick=()=>{const profile=nativeProfiles.profiles.find(item=>item.profile===button.dataset.nativeSetup);$('nativeSetupReason').textContent='Profile '+profile.profile.toUpperCase()+': '+profile.reason;$('nativeSetupDialog').showModal();});
-  document.querySelectorAll('[data-native-profile]').forEach(button => button.onclick = async () => {
-    if (busy || !selectedProject) return;
-    busy = true;
-    try {
-      const worker = await api('native/profiles/enroll', {profile: button.dataset.nativeProfile, project_id: selectedProject});
-      detail.workers=[...projectWorkers().filter(item=>item.id!==worker.id),worker];overview.workers=detail.workers;
-      if (activeTask()) selectedTarget = worker.id;
-      else selectedStartWorker = worker.id;
-      await load(true);
-      showNotice(activeTask() ? 'Native successor prepared. Use Request Handoff to authorize its execution explicitly.' : 'NATIVE LOCAL profile selected. Enter your coding objective; no simulation will be substituted.');
-    } catch (failure) { showError(failure); }
-    finally { busy = false; if (detail) render(); }
-  });
+  document.querySelectorAll('[data-native-profile]').forEach(button => button.onclick = () => selectNativeProfile(button.dataset.nativeProfile, selectedProject));
+}
+
+// Approve a native profile for this project (enrolling it if needed) and select it.
+async function selectNativeProfile(profile, selectedProject = project) {
+  if (busy || !selectedProject) return;
+  busy = true;
+  try {
+    const worker = await api('native/profiles/enroll', {profile, project_id: selectedProject});
+    detail.workers=[...projectWorkers().filter(item=>item.id!==worker.id),worker];overview.workers=detail.workers;
+    if (activeTask()) selectedTarget = worker.id;
+    else selectedStartWorker = worker.id;
+    await load(true);
+    showNotice(activeTask() ? 'Native successor prepared. Use Request Handoff to authorize its execution explicitly.' : 'NATIVE LOCAL profile selected. Enter your coding objective; no simulation will be substituted.');
+  } catch (failure) { showError(failure); }
+  finally { busy = false; if (detail) render(); }
 }
 
 $('closeNativeSetup').onclick=()=>$('nativeSetupDialog').close();
@@ -799,6 +856,7 @@ function subscribe(conversation, after) {
         if(event.event_type==='state')task.state=event.content;
       }
     }
+    if(event.event_type!=='agent_delta' && event.event_type!=='runtime_output')pollAgents();
     if (!activityFrame) activityFrame=requestAnimationFrame(()=>{activityFrame=null;renderConversation();});
     if (!['agent_delta','runtime_output','tool_invocation','tool_output'].includes(event.event_type) && !liveTimer) liveTimer=setTimeout(()=>{
       liveTimer=null;
@@ -884,8 +942,13 @@ async function init() {
     catch (failure) { if (failure.status === 403) await login(); else showError(failure); }
   }
 }
-RelayIDE.connect({api,showError,showNotice,openTask:task=>{if(task)openTask(task.id,task.conversation_id).catch(showError);},refresh:()=>load(true),canWrite:currentCanWrite,newConversation:()=>newConversation().catch(showError),loadHistory:()=>{if (!historyEvents.length) $('more').onclick();}});
+// Unload-safe request for a closing tab; carries the same CSRF header as api().
+function beacon(path, body) {
+  try { fetch('/api/' + path, {method:'POST', keepalive:true, headers:{'Content-Type':'application/json', ...(csrfToken ? {'X-Relay-CSRF':csrfToken} : {})}, body:JSON.stringify(body)}).catch(() => {}); } catch {}
+}
+RelayIDE.connect({api,beacon,showError,showNotice,openTask:task=>{if(task)openTask(task.id,task.conversation_id).catch(showError);},refresh:()=>load(true),canWrite:currentCanWrite,newConversation:()=>newConversation().catch(showError),loadHistory:()=>{if (!historyEvents.length) $('more').onclick();}});
 init().catch(showError);
+setInterval(()=>{updateAgentElapsed();pollAgents();},1000);
 setInterval(() => {
   const editingWorker = document.activeElement?.closest('.worker-settings');
   if (!document.body.classList.contains('signed-out') && !busy && !loading && !$('enrollmentDialog').open && !$('assignDialog').open && !editingWorker && !document.querySelector('.worker-settings[open]')) load().catch(showError);

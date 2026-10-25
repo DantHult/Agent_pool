@@ -41,6 +41,7 @@ def migrate(db):
     if db.execute('SELECT 1 FROM schema_migrations WHERE version=2').fetchone():
         migrate_live(db)
         migrate_management(db)
+        migrate_reservation_leases(db)
         return
     timestamp=datetime.now(timezone.utc).isoformat()
     db.execute('BEGIN IMMEDIATE')
@@ -79,6 +80,7 @@ def migrate(db):
         db.execute('ROLLBACK'); raise
     migrate_live(db)
     migrate_management(db)
+    migrate_reservation_leases(db)
 
 
 def migrate_live(db):
@@ -178,6 +180,20 @@ def migrate_management(db):
         db.execute('DROP INDEX one_native_profile')
         db.execute("CREATE UNIQUE INDEX one_native_profile ON workers(native_profile) WHERE execution_mode='native' AND removed_at IS NULL")
         db.execute('INSERT INTO schema_migrations VALUES(8,?)',(datetime.now(timezone.utc).isoformat(),))
+        db.execute('COMMIT')
+    except Exception:
+        db.execute('ROLLBACK');raise
+
+
+def migrate_reservation_leases(db):
+    if db.execute('SELECT 1 FROM schema_migrations WHERE version=9').fetchone():return
+    db.execute('BEGIN IMMEDIATE')
+    try:
+        # Existing reservations keep their owner; a NULL heartbeat is measured
+        # from process start, so a live browser can reconnect after upgrade.
+        db.execute('ALTER TABLE human_workspace_locks ADD COLUMN heartbeat_at REAL')
+        db.execute('ALTER TABLE human_workspace_locks ADD COLUMN label TEXT')
+        db.execute('INSERT INTO schema_migrations VALUES(9,?)',(datetime.now(timezone.utc).isoformat(),))
         db.execute('COMMIT')
     except Exception:
         db.execute('ROLLBACK');raise

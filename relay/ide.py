@@ -1,7 +1,9 @@
 """Project-scoped editor and constrained Git operations for the existing Relay.
 
 Human reservations are durable and managed automatically by normal IDE actions.
-They do not expire silently while a browser has unsaved work.
+Browsers renew a lease while they hold one. An expired lease never deletes the
+reservation, its drafts or Git state: it only lets the same account move the
+reservation to a new browser tab. Other users and agents remain blocked.
 All entry points run under Relay.lock, alongside the existing agent scheduler.
 """
 import hashlib
@@ -26,6 +28,8 @@ PROTECTED = {'.git', '.codex', '.aws', '.ssh', '.venv', '.native', '.tmp', '.dep
              'node_modules', '__pycache__', 'auth.json', 'credentials', 'id_rsa', 'id_ed25519',
              '.npmrc', '.pypirc', '.netrc'}
 MAX_TEXT = 512_000
+# Browsers renew every 15 s; hidden tabs may slow timers to once a minute.
+LEASE_SECONDS = 120
 
 
 def file_path(value, write=False):
@@ -107,47 +111,142 @@ class ProjectIDE:
         if self.relay.rows('SELECT 1 FROM workspace_leases WHERE project_id=?', (project,)):
             raise WorkspaceConflict('The agent owns this project. Pause and wait for its checkpoint before editing or changing Git.')
 
+    @staticmethod
+    def _holds(row, user, client, session_hash):
+        return (row['user_id'], row['client_id'], row['session_hash']) == (user, client, session_hash)
+
+    @staticmethod
+    def _label(value):
+        if not isinstance(value, str):return None
+        return clean(''.join(char for char in value if char.isprintable()).strip())[:80] or None
+
+    def _commands_active(self, project):
+        return bool(self.console and self.console.active(project))
+
+    def _session_open(self, session_hash):
+        return bool(self.relay.rows('SELECT 1 FROM sessions WHERE digest=? AND expires_at>?', (session_hash, time.time())))
+
+    def _lease(self, row):
+        """Liveness of one reservation. A command session always counts as live.
+
+        heartbeat_at 0 records that the browser reported closing. NULL (an
+        upgraded row) and older heartbeats are measured from process start, so
+        a backend restart gives open tabs one lease period to reconnect.
+        """
+        commands = self._commands_active(row['project_id'])
+        closed = row['heartbeat_at'] == 0
+        seen = None if closed else max(row['heartbeat_at'] or 0, self.relay.started)
+        idle = None if closed else max(0, time.time() - seen)
+        # Only local-owner sessions are durable rows; demo sessions are in memory.
+        ended = self.local_owner and not self._session_open(row['session_hash'])
+        stale = not commands and (closed or ended or idle > LEASE_SECONDS)
+        return {'stale': stale, 'commands_active': commands, 'closed': closed, 'session_ended': bool(ended),
+                'idle_seconds': None if idle is None else int(idle), 'expires_in': None if idle is None else max(0, int(LEASE_SECONDS - idle))}
+
+    def _auto_recoverable(self, row, user):
+        return bool(self.local_owner and user == self.relay.local_owner_id and row['user_id'] == user and self._lease(row)['stale'])
+
     def _reservation(self, user, project, client, session_hash):
         self.relay.write_access(user, project)
         self._require_editor_support()
         self._agent_idle(project)
         rows = self.relay.rows('SELECT * FROM human_workspace_locks WHERE project_id=?', (project,))
-        if not rows or (rows[0]['user_id'], rows[0]['client_id'], rows[0]['session_hash']) != (user, client, session_hash):
+        if not rows or not self._holds(rows[0], user, client, session_hash):
             raise WorkspaceConflict('Acquire the project edit lock in this browser before writing files or changing Git.')
+        # Every authorized write by the holder also renews its lease.
+        self.relay.db.execute('UPDATE human_workspace_locks SET heartbeat_at=? WHERE project_id=?', (time.time(), project))
         return rows[0]
 
-    def acquire(self, user, project, client, session_hash, recover=False):
+    def acquire(self, user, project, client, session_hash, recover=False, label=None, automatic=False):
+        """Reserve the project, or explicitly move this account's reservation here.
+
+        recover is a user action (or an automatic recovery of a stale lease by
+        prepare). It is refused for other users and while a command runs.
+        """
         self.relay.write_access(user, project)
         self._require_editor_support()
         self._agent_idle(project)
         if not isinstance(client, str) or not re.fullmatch('[A-Za-z0-9-]{16,80}', client):
             raise ValueError('Invalid editor client identifier')
         rows = self.relay.rows('SELECT * FROM human_workspace_locks WHERE project_id=?', (project,))
-        if rows and (rows[0]['user_id'], rows[0]['client_id'], rows[0]['session_hash']) != (user, client, session_hash):
-            if not recover or rows[0]['user_id'] != user or (self.console and self.console.active(project)):
+        moved = bool(rows) and not self._holds(rows[0], user, client, session_hash)
+        if moved:
+            if not recover or rows[0]['user_id'] != user:
                 raise WorkspaceConflict('This project is reserved by another editor. Its owner must explicitly release or recover the lock.')
+            if self._commands_active(project):
+                raise WorkspaceConflict('A command session is still open for this project in the editor that holds it. Stop or close it there before moving editing here.')
+        stamp = time.time()
         if not rows:
-            self.relay.db.execute('INSERT INTO human_workspace_locks VALUES(?,?,?,?,?)', (project, user, client, session_hash, now()))
-        elif recover:
-            self.relay.db.execute('UPDATE human_workspace_locks SET client_id=?,session_hash=? WHERE project_id=?', (client, session_hash, project))
-        self.relay.audit(user, 'editor_lock_acquired', project=project)
+            self.relay.db.execute('INSERT INTO human_workspace_locks(project_id,user_id,client_id,session_hash,created_at,heartbeat_at,label) VALUES(?,?,?,?,?,?,?)',
+                                  (project, user, client, session_hash, now(), stamp, self._label(label)))
+        else:
+            self.relay.db.execute('UPDATE human_workspace_locks SET client_id=?,session_hash=?,heartbeat_at=?,label=COALESCE(?,label) WHERE project_id=?',
+                                  (client, session_hash, stamp, self._label(label), project))
+        if moved:
+            self.relay.audit(user, 'editor_lock_recovered', project=project, metadata={'automatic': automatic, 'stale': self._lease(rows[0])['stale']})
+        else:
+            self.relay.audit(user, 'editor_lock_acquired', project=project)
         return self.state(user, project, client, session_hash)
 
-    def prepare(self, user, project, client, session_hash):
-        """Reserve an editable workspace without an edit-mode activation step."""
+    def prepare(self, user, project, client, session_hash, label=None):
+        """Reserve an editable workspace without an edit-mode activation step.
+
+        The local owner's own stale reservation moves here without a click. A
+        live tab of the same account, an open command or another user never does.
+        """
         self.relay.write_access(user, project)
         self._require_editor_support()
         self._agent_idle(project)
         rows = self.relay.rows('SELECT * FROM human_workspace_locks WHERE project_id=?', (project,))
         if rows:
             prior = rows[0]
-            if prior['user_id']==user and prior['client_id']==client and prior['session_hash']!=session_hash:
-                valid = self.relay.rows('SELECT 1 FROM sessions WHERE digest=? AND expires_at>?', (prior['session_hash'], time.time()))
-                if not valid and not (self.console and self.console.active(project)):
-                    return self.acquire(user, project, client, session_hash, recover=True)
+            if not self._holds(prior, user, client, session_hash) and prior['user_id'] == user:
+                reauthenticated = prior['client_id'] == client and not self._session_open(prior['session_hash']) and not self._commands_active(project)
+                if reauthenticated or self._auto_recoverable(prior, user):
+                    return self.acquire(user, project, client, session_hash, recover=True, label=label, automatic=True)
             self._reservation(user, project, client, session_hash)
             return self.state(user, project, client, session_hash)
-        return self.acquire(user, project, client, session_hash)
+        return self.acquire(user, project, client, session_hash, label=label)
+
+    def heartbeat(self, user, project, client, session_hash, label=None):
+        """Renew this browser's lease. Reports, and never takes, another holder."""
+        self.relay.write_access(user, project)
+        rows = self.relay.rows('SELECT * FROM human_workspace_locks WHERE project_id=?', (project,))
+        held = bool(rows) and self._holds(rows[0], user, client, session_hash)
+        if held:
+            self.relay.db.execute('UPDATE human_workspace_locks SET heartbeat_at=?,label=COALESCE(?,label) WHERE project_id=?', (time.time(), self._label(label), project))
+        return {'held': held, 'lock': self._lock_view(user, project, client, session_hash)}
+
+    def _give_up(self, user, row, reason):
+        """Release a clean reservation, or mark it closed and keep protecting it.
+
+        Saved drafts, uncommitted source or staged Git changes keep the row so
+        no agent can start over them; nothing is checkpointed or discarded.
+        """
+        project = row['project_id']
+        if not self.relay.rows('SELECT 1 FROM editor_drafts WHERE project_id=?', (project,)) and not self.relay.ws.status(project):
+            self.relay.db.execute('DELETE FROM human_workspace_locks WHERE project_id=?', (project,))
+            self.relay.audit(user, 'editor_lock_released', project=project, metadata={'automatic': True, 'reason': reason})
+            return {'released': True}
+        self.relay.db.execute('UPDATE human_workspace_locks SET heartbeat_at=0 WHERE project_id=?', (project,))
+        self.relay.audit(user, 'editor_lock_detached', project=project, metadata={'reason': reason})
+        return {'released': False, 'detached': True}
+
+    def detach(self, user, project, client, session_hash):
+        """A closing or handing-over browser tab gives up its reservation."""
+        self.relay.write_access(user, project)
+        rows = self.relay.rows('SELECT * FROM human_workspace_locks WHERE project_id=?', (project,))
+        if not rows or not self._holds(rows[0], user, client, session_hash):
+            return {'released': False, 'detached': False}
+        if self._commands_active(project):
+            raise WorkspaceConflict('Stop or close the open command session before handing over this project')
+        return self._give_up(user, rows[0], 'browser closed or handed over')
+
+    def detach_session(self, session_hash):
+        """Logout: give up every reservation bound to that login session."""
+        for row in self.relay.rows('SELECT * FROM human_workspace_locks WHERE session_hash=?', (session_hash,)):
+            if not self._commands_active(row['project_id']):
+                self._give_up(row['user_id'], row, 'signed out')
 
     def finish(self, user, project, client, session_hash, conversation=None):
         """Release clean human work before navigation or an explicit AI action.
@@ -325,18 +424,30 @@ class ProjectIDE:
                     break
         return files
 
-    def _state_metadata(self, user, project, client, session_hash, files):
-        workspace = self.relay.ws.path(project)
+    def _lock_view(self, user, project, client, session_hash):
         agent = self.relay.rows('SELECT task_id,worker_id FROM workspace_leases WHERE project_id=?', (project,))
         human = self.relay.rows('SELECT * FROM human_workspace_locks WHERE project_id=?', (project,))
-        lock = None
         if human:
             row = human[0]
-            lock = {'kind': 'human', 'user_id': row['user_id'], 'name': self.relay.user(row['user_id'])['name'],
-                    'mine': (row['user_id'], row['client_id'], row['session_hash']) == (user, client, session_hash),
-                    'recoverable': row['user_id'] == user, 'created_at': row['created_at']}
-        elif agent:
-            lock = {'kind': 'agent', **agent[0]}
+            own = row['user_id'] == user
+            mine = self._holds(row, user, client, session_hash)
+            lease = self._lease(row)
+            lock = {'kind': 'human', 'user_id': row['user_id'], 'name': self.relay.user(row['user_id'])['name'], 'mine': mine,
+                    'recoverable': own and not mine and not lease['commands_active'],
+                    'auto_recoverable': not mine and self._auto_recoverable(row, user),
+                    'stale': lease['stale'], 'commands_active': lease['commands_active'], 'created_at': row['created_at']}
+            if own:
+                # Session details are shown only to the account that holds them.
+                lock.update({'label': row['label'], 'same_browser': row['session_hash'] == session_hash,
+                             **{name: lease[name] for name in ('closed', 'session_ended', 'idle_seconds', 'expires_in')}})
+            return lock
+        if agent:
+            return {'kind': 'agent', **agent[0]}
+        return None
+
+    def _state_metadata(self, user, project, client, session_hash, files):
+        workspace = self.relay.ws.path(project)
+        lock = self._lock_view(user, project, client, session_hash)
         drafts = self.relay.rows('SELECT path,base_version,content,updated_at FROM editor_drafts WHERE project_id=? AND user_id=?', (project, user))
         tasks = self.relay.rows("SELECT t.id,t.conversation_id,t.worker_id,t.state,t.generation FROM tasks t JOIN conversations c ON c.id=t.conversation_id WHERE c.project_id=? AND t.state NOT IN ('completed','failed','cancelled','queued') LIMIT 1", (project,))
         console_owner = self.local_owner and user == self.relay.local_owner_id

@@ -137,6 +137,7 @@ class Handler(BaseHTTPRequestHandler):
                 elif path=='/api/ide/entry':
                     try:result=self.server.ide.files.inspect(user,q.get('project_id',[''])[0],q.get('path',[''])[0])
                     except OSError as exc:raise ValueError('Cannot inspect project entry: '+(exc.strerror or 'filesystem error')) from None
+                elif path=='/api/agents/activity':result=relay.management.activity(user,q.get('after',[''])[0])
                 elif path=='/api/tasks':result=relay.management.tasks(user,q.get('project_id',[''])[0],q.get('worker_id',[None])[0])
                 elif path=='/api/ide/review':result=relay.management.review(user,q.get('project_id',[''])[0],q.get('task_id',[None])[0],q.get('before',[None])[0],q.get('after',[None])[0])
                 elif path=='/api/ide/conversations':result=self.server.ide.conversations(user,q.get('project_id',[''])[0])
@@ -188,6 +189,7 @@ class Handler(BaseHTTPRequestHandler):
             user=self.identity();self.csrf()
             if method in ('logout','auth/logout-all'):
                 if self.server.ide.console:self.server.ide.console.close_auth(digest(self.token()))
+                with relay.lock:self.server.ide.detach_session(digest(self.token()))
                 if method=='auth/logout-all' and self.server.auth_mode!='demo':provider.revoke_sessions(user)
                 else:provider.logout(self.token())
                 return self.reply(200,{'ok':True},cookie=self.cookie(''))
@@ -207,8 +209,10 @@ class Handler(BaseHTTPRequestHandler):
             if method.startswith('ide/'):
                 ide=self.server.ide;project=data['project_id'];binding=digest(self.token());client=data.get('client_id','')
                 with relay.lock:
-                    if method=='ide/lock':result=ide.acquire(user,project,client,binding,data.get('recover') is True)
-                    elif method=='ide/prepare':result=ide.prepare(user,project,client,binding)
+                    if method=='ide/lock':result=ide.acquire(user,project,client,binding,data.get('recover') is True,data.get('label'))
+                    elif method=='ide/prepare':result=ide.prepare(user,project,client,binding,data.get('label'))
+                    elif method=='ide/heartbeat':result=ide.heartbeat(user,project,client,binding,data.get('label'))
+                    elif method=='ide/detach':result=ide.detach(user,project,client,binding)
                     elif method=='ide/finish':result=ide.finish(user,project,client,binding,data.get('conversation_id'))
                     elif method=='ide/save':result=ide.save(user,project,client,binding,data['path'],data.get('version'),data['content'],data.get('conversation_id'))
                     elif method=='ide/draft':result=ide.draft(user,project,client,binding,data['path'],data.get('version'),data['content'])

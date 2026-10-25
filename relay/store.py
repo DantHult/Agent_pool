@@ -31,6 +31,7 @@ class Relay:
             if self.root.is_symlink() or (uid is not None and self.root.stat().st_uid!=uid):raise ValueError('Shared data directory must be owned by this OS user and cannot be a symlink')
             self.root.chmod(0o700)
         self.lock=threading.RLock()
+        self.started=time.time()
         self.db=sqlite3.connect(self.root/'relay.sqlite',check_same_thread=False,isolation_level=None,timeout=15)
         self.db.row_factory=sqlite3.Row
         self.jobs={}
@@ -50,6 +51,7 @@ class Relay:
             if demo:self._seed()
             else:self.db.execute("UPDATE organizations SET is_demo=0,name=CASE WHEN name='Relay Labs (demo)' THEN 'Relay organization' ELSE name END WHERE id='orgdemo'")
             self._recover()
+            self._restore_relay_paused_workers()
         except Exception:
             # Windows cannot delete a TemporaryDirectory while SQLite still holds the file.
             try:self.db.close()
@@ -80,10 +82,11 @@ class Relay:
                 profiles.append({'profile':profile,'status':'unavailable','available':False,'reason':'This profile belongs to a different worker owner; use a dedicated local-owner data directory'})
                 continue
             health=self.worker_health(w,cached);status=health.get('status','unavailable')
+            if enrolled:w=self._quota_recovered(w,health)
             if w['state']=='quota_blocked':status='quota_blocked'
             elif w['state']=='busy':status='busy'
             elif w['state'] in ('paused','offline') or not w['opt_in']:status='paused' if w['state']!='offline' else 'unavailable'
-            profiles.append({'profile':profile,'status':status,'available':status=='available','authentication':health.get('authentication','unknown'),'worker_id':w['id'] if enrolled else None,'owner_name':self.user(user)['name'],'reason':health.get('reason','Unavailable'),'remaining_quota':None,'assigned_projects':self.worker_assignments(user,w['id'])})
+            profiles.append({'profile':profile,'status':status,'available':status=='available','authentication':health.get('authentication','unknown'),'worker_id':w['id'] if enrolled else None,'owner_name':self.user(user)['name'],'reason':health.get('reason','Unavailable'),'remaining_quota':None,'usage':health.get('usage'),'assigned_projects':self.worker_assignments(user,w['id'])})
         return {'profiles':profiles,'execution_mode':'native','owner_id':user,'scope':'authenticated local owner; loopback only'}
     def enroll_native_profile(self,user,profile,project):
         self.write_access(user,project)
@@ -145,6 +148,18 @@ class Relay:
                 self._insert_worker(worker,name,'user',owner,'simulation',True,1,None)
                 self._grant(owner,worker,'demo')
                 if owner=='bob': self._grant(owner,worker,'private')
+    def _restore_relay_paused_workers(self):
+        """Earlier releases paused idle workers after handoffs, errors and restarts.
+
+        Only an owner's own pause (recorded in the audit log) or opt-out keeps
+        a worker paused; anything else was Relay's and is undone once.
+        """
+        for w in self.rows("SELECT * FROM workers WHERE state='paused' AND opt_in=1 AND removed_at IS NULL"):
+            if self.rows("SELECT 1 FROM assignments WHERE worker_id=? AND status='active'",(w['id'],)):continue
+            owner=self.rows("SELECT json_extract(metadata,'$.availability') AS state FROM audit_events WHERE worker_id=? AND action='worker_configured' AND json_extract(metadata,'$.availability') IS NOT NULL ORDER BY rowid DESC LIMIT 1",(w['id'],))
+            if owner and owner[0]['state']=='paused':continue
+            self._capacity(w['id'],'available')
+            self.audit(w['owner_id'],'worker_unpaused',w['id'],metadata={'reason':'paused by Relay, not by its owner'})
     def _recover(self):
         # A crashed operation may have changed Git without its final SQL update.
         # Never replay unknown or non-idempotent model/tool actions automatically.
@@ -161,7 +176,9 @@ class Relay:
                 self.db.execute("UPDATE tasks SET state='handoff_pending',pending_action=NULL,last_error=? WHERE id=?",('Interrupted process; inspect saved files before retry',t['id']))
                 self.db.execute("UPDATE assignments SET status='interrupted',finished_at=? WHERE task_id=? AND status='active'",(now(),t['id']))
                 self.db.execute("UPDATE execution_runs SET state='interrupted',finished_at=?,summary='Backend interrupted; no coding operation was replayed' WHERE task_id=? AND state='running'",(now(),t['id']))
-                if t['worker_id']: self._capacity(t['worker_id'],'paused')
+                # Cleanup was verified, so the idle worker may take new work; the
+                # interrupted task itself still waits for an explicit resume.
+                if t['worker_id']: self._release(t,status='interrupted')
                 self.event(t,'recovery','Execution interrupted. Worktree retained; inspect files and use Switch Worker to resume. No tool action was replayed.')
             for lease in self.rows('SELECT * FROM workspace_leases'):
                 if lease['task_id'] not in self.unsafe_tasks:
@@ -200,9 +217,13 @@ class Relay:
         self.db.execute('UPDATE conversations SET updated_at=? WHERE id=?',(now(),t['conversation_id']))
 
     def assert_no_human_writer(self,project):
+        from .ide import WorkspaceConflict
+        # A stale reservation still blocks: only its owner may recover or release it.
         if self.rows('SELECT 1 FROM human_workspace_locks WHERE project_id=?',(project,)):
-            from .ide import WorkspaceConflict
             raise WorkspaceConflict('A human holds the project edit lock. Save drafts, checkpoint and release it before starting or handing off an agent.')
+        commands=getattr(self,'human_commands',None)
+        if commands and commands(project):
+            raise WorkspaceConflict('A human command session is open for this project. Stop or close it before starting or handing off an agent.')
     def state(self,t,state):
         self.db.execute('UPDATE tasks SET state=? WHERE id=?',(state,t['id'])); t['state']=state
         self.event(t,'state',state)
@@ -254,6 +275,8 @@ class Relay:
             return health
         prior=self.health_cache.get(key)
         if prior and time.monotonic()-prior[0]<(0.5 if prior[1].get('status')=='busy' else 5):return prior[1]
+        # Keep showing the last result while it refreshes; an actual start
+        # always runs its own uncached check.
         if key not in self.health_jobs and not self.closing:
             adapter=self.adapter(dict(w))
             def probe():
@@ -264,10 +287,23 @@ class Relay:
                     self.health_jobs.pop(key,None)
             job=threading.Thread(target=probe,name='relay-health',daemon=True)
             self.health_jobs[key]=job;job.start()
+        if prior:return prior[1]
         return {'available':False,'connected':False,'status':'checking','reason':'Checking authentication, runtime and sandbox readiness in the background'}
+    def _quota_recovered(self,w,health):
+        """Lift a provider-reported usage block once the provider allows usage again."""
+        if w['state']!='quota_blocked' or not health.get('quota_recovered'):return w
+        # An owner who set quota_blocked by hand keeps that decision.
+        if self.one('SELECT source FROM capacity_sources WHERE worker_id=?',(w['id'],))['source']!='provider_reported':return w
+        state='available' if w['opt_in'] else 'paused'
+        self._capacity(w['id'],state,source='provider_reported')
+        self.audit(w['owner_id'],'worker_quota_recovered',w['id'],metadata={'usage':health.get('usage')})
+        return {**w,'state':state}
     def eligibility(self,w,project,user=None,health=None):
         approved,reason=self.approval(w,project,user)
         if not approved: return False,reason
+        if w['state']=='quota_blocked':
+            health=self.adapter(w).health() if health is None else health
+            w=self._quota_recovered(w,health)
         if w['state']!='available': return False,'Capacity is '+w['state']
         if self.db.execute("SELECT COUNT(*) FROM assignments WHERE worker_id=? AND status='active'",(w['id'],)).fetchone()[0]>=w['max_parallel_tasks']:
             return False,'Worker concurrency limit reached'
@@ -290,6 +326,7 @@ class Relay:
             except PermissionError: pass
         managed=self.is_admin(user,w['organization_id']) or (w['owner_type']=='user' and w['owner_id']==user)
         health=self.worker_health(w,cached)
+        w=self._quota_recovered(w,health)
         eligible,reason=self.eligibility(w,project,user,health) if project else (False,'Select a project to check eligibility')
         public={k:v for k,v in w.items() if k!='credential_ref'}
         public.update({'display_name':w['name'],'status':w['state'],'owner_name':owner,'opt_in':bool(w['opt_in']),'can_manage':managed,'permitted_project_ids':visible,'capacity':self.one('SELECT * FROM capacity_sources WHERE worker_id=?',(w['id'],)),'authorized':self.approval(w,project,user)[0] if project else False,'eligible':eligible,'eligibility_reason':reason,'health':health,'last_seen_at':now() if health.get('available') else None,'last_seen_source':'local adapter health check'})
@@ -512,6 +549,16 @@ class Relay:
             t=self.one('SELECT * FROM tasks WHERE id=?',(task_id,))
             metadata=dict(metadata or {}); metadata['origin']='codex' if t['execution_mode'] in LIVE_MODES else 'simulation'
             job=self.jobs.get(task_id,{})
+            if kind=='continuation_checkpoint':
+                # This callback is synchronous: the adapter cannot start its
+                # next turn until Git and durable working context are saved.
+                if t.get('pending_action') or self.closing or job.get('cancel',threading.Event()).is_set():
+                    return {'checkpoint':self.ws.git(self.ws.path(self.project(t)),'rev-parse','HEAD'),'stopping':True}
+                t['progress_json']=json.dumps(scrub(metadata.get('progress',{})))
+                t['execution_phase']=t.get('execution_phase',0)+1
+                self.db.execute('UPDATE tasks SET progress_json=?,execution_phase=? WHERE id=?',(t['progress_json'],t['execution_phase'],task_id))
+                checkpoint=self.checkpoint(t,'Intermediate native progress')
+                return self.context(t,checkpoint)
             if job.get('run_id'): metadata['execution_run_id']=job['run_id']
             if kind=='session_started' and metadata.get('native_thread_id'):
                 native=clean(metadata['native_thread_id'])
@@ -542,21 +589,22 @@ class Relay:
                     if not getattr(result,'safe_to_release',True):
                         self.unsafe_tasks.add(t['id'])
                         self.state(current,'pausing')
-                        self.db.execute('UPDATE tasks SET last_error=? WHERE id=?',('Container shutdown unverified; writer lease retained. Restore Docker and restart Relay.',t['id']))
-                        self.event(current,'error','Container shutdown could not be verified. No replacement worker may write until cleanup is confirmed.')
+                        self.db.execute('UPDATE tasks SET last_error=? WHERE id=?',('Execution process cleanup unverified; writer lease retained. Review the runtime before restarting Relay.',t['id']))
+                        self.event(current,'error','Execution process cleanup could not be verified. No replacement worker may write until cleanup is confirmed.')
                         return
                     if result.state=='quota_blocked': self._block_quota(current,w,result)
                     if self.closing:
                         self.db.execute("UPDATE tasks SET state='handoff_pending',pending_action=NULL WHERE id=?",(t['id'],))
                         self.event(current,'stop','Backend shutting down; execution stopped without reassigning or replaying tools.')
-                        self._release(current,capacity='paused')
+                        self._release(current)
                         self.jobs.pop(t['id'],None)
                         return
                     if result.state=='quota_blocked':
                         self.jobs.pop(t['id'],None)
                         if current['pending_action']=='cancel': self._cancel_stopped(current,current['pending_authorized_by'])
                         else:
-                            self.db.execute('UPDATE tasks SET pending_action=NULL WHERE id=?',(t['id'],))
+                            # Recorded as the task blocker so every view reports the provider limit.
+                            self.db.execute('UPDATE tasks SET pending_action=NULL,last_error=? WHERE id=?',('Provider usage limit reported: '+clean(result.summary)[:500],t['id']))
                             self._complete_handoff(current,None,'provider_limit','Provider reported capacity unavailable. Wait for this quota scope; no automatic native account rotation.' if current['execution_mode']=='native' else 'Provider reported shared organization API exhaustion; wait or resolve billing before retry.',current['pending_authorized_by'] or current['requested_by'])
                         return
                     if current['pending_action']:
@@ -574,10 +622,13 @@ class Relay:
                         pending=(w['execution_mode'] in LIVE_MODES and result.state=='completed' and bool(getattr(result,'progress',{}).get('pending_steps')))
                         retryable=getattr(result,'error_category',None) in ('timeout','transport_error','provider_unavailable') or (w['execution_mode']=='native' and result.state=='failed')
                         if w['execution_mode']=='native' and result.state=='failed':self.db.execute('UPDATE tasks SET last_error=? WHERE id=?',(clean(result.summary),t['id']))
-                        if boundary or pending or retryable:
+                        if boundary or pending or retryable or result.state=='blocked':
                             current['execution_phase']=current.get('execution_phase',0)+1; self.db.execute('UPDATE tasks SET execution_phase=? WHERE id=?',(current['execution_phase'],t['id']))
                             self.state(current,'handoff_pending')
-                            self.event(current,'pause_boundary','Safe execution boundary saved. Choose another approved live worker to continue.' if boundary or pending else 'Execution failed transiently; review the saved work before explicit retry.')
+                            reason=('Explicit handoff boundary saved.' if boundary else result.summary if result.state=='blocked' else 'Execution stopped; review preserved work before an explicit retry.')
+                            self.event(current,'pause_boundary',reason)
+                            if not boundary:
+                                self.db.execute('UPDATE tasks SET last_error=? WHERE id=?',(clean(result.summary),t['id']))
                         else: self.state(current,result.state if result.state in TERMINAL else 'failed')
                         self.event(current,'response',result.summary,'assistant')
                         self.context(current,checkpoint); self._release(current)
@@ -611,7 +662,7 @@ class Relay:
                 t['state']='pausing'
                 return
         self.db.execute("UPDATE tasks SET state='handoff_pending',last_error=?,pending_action=NULL WHERE id=?",(message,t['id']))
-        t['state']='handoff_pending'; self._release(t,status='interrupted',capacity='paused')
+        t['state']='handoff_pending'; self._release(t,status='interrupted')
         # Preserve working files. Never reset/check out or silently replay a tool.
     def _request_handoff(self,user,t,target,reason_code,reason,check_access=True):
         if check_access: self.access(user,self.project(t))
@@ -646,7 +697,7 @@ class Relay:
             self.db.execute('INSERT INTO handoffs(id,task_id,source,target,reason,checkpoint,context_version,timestamp,status,reason_code,authorized_by,result,error) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',(handoff,t['id'],source,target,reason,None,None,now(),'failed',code,user,'recoverable',clean(str(exc))[:1000]))
             self.audit(user,'handoff_failed',source,self.project(t),{'reason_code':code})
             return self.one('SELECT * FROM tasks WHERE id=?',(t['id'],))
-        self._release(t,capacity='available' if code=='task_pause' else 'paused'); self.state(t,'handoff_pending')
+        self._release(t); self.state(t,'handoff_pending')
         mode=t['execution_mode']
         w=None
         try:
@@ -723,7 +774,7 @@ class Relay:
             p['role']='admin' if self.is_admin(user) else self.one('SELECT role FROM memberships WHERE user_id=? AND project_id=?',(user,p['id']))['role']
             p['can_write']=p['role']!='viewer' and self.org_member(user)['role']!='viewer'
         return {'user':u,'users':people,'organizations':self.rows('SELECT * FROM organizations'),'projects':projects,'workers':directory['workers'],
-            'features':{'agent_management':True,'explorer_operations':True,'checkpoint_reviews':True,'automatic_workflow':True,'recent_history':True,'development_terminal':True},
+            'features':{'agent_management':True,'explorer_operations':True,'checkpoint_reviews':True,'automatic_workflow':True,'recent_history':True,'development_terminal':True,'live_agents':True,'editor_leases':True},
             'auth':{'mode':'local-owner' if self.local_owner_id else 'local_demo' if self.demo else 'invite','production_ready':not self.demo and not self.local_owner_id,'description':'Pinned local owner; loopback only' if self.local_owner_id else 'Seeded local identities' if self.demo else 'Invite-only Relay accounts; HTTPS required','native_enabled':self.native_enabled,'local_owner_id':self.local_owner_id},
             'personal_subscription':directory['personal_subscription'],
             'execution':{'mode':'mixed','connected':any(w['execution_mode'] in LIVE_MODES and w['health'].get('connected',False) for w in directory['workers']),'detail':'Native profiles use the local owner’s ChatGPT subscriptions and explicit handoffs. Simulated capacity is labeled; organization API capacity is shared by organization.'}}
@@ -788,7 +839,7 @@ class Relay:
                 cached=json.loads(prior[0]['result'])
                 if isinstance(cached,dict) and cached.get('conversation_id'):
                     self.access(user,self.project(cached))
-                if method.startswith('workers/') or method=='availability':
+                if (method.startswith('workers/') and method!='workers/stop') or method=='availability':
                     self.manage(user,self.one('SELECT * FROM workers WHERE id=?',(data.get('worker_id') or cached['id'],)))
                 return cached
             if method=='projects': result=self.create_project(user,data['name'])
@@ -804,6 +855,7 @@ class Relay:
             elif method=='workers/configure': result=self.configure(user,data)
             elif method=='workers/revoke': result=self.configure(user,data,True)
             elif method=='workers/remove': result=self.management.remove(user,data)
+            elif method=='workers/stop': result=self.management.stop(user,data)
             elif method=='tasks/assign': result=self.management.assign(user,data)
             elif method=='tasks/start': result=self.management.start(user,data['task_id'])
             elif method=='membership':

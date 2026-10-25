@@ -42,14 +42,15 @@
         const meta = metadata(event);
         const run = event.task_id + ':' + (event.worker_id || 'human');
         if (event.event_type === 'session_started' || event.event_type === 'assignment') this.sessions.set(run, event.sequence);
-        const base = run + ':' + (this.sessions.get(run) || 'initial');
+        const sessionBase=run + ':' + (this.sessions.get(run) || 'initial');
+        const base = sessionBase + (meta.native_turn_id?':turn:'+meta.native_turn_id:'');
         const item = meta.provider_item_id;
         const type = event.event_type;
         if (/reasoning/i.test(type)) continue;
         let key, group;
         if (type === 'agent_delta' || type === 'response') {
           if (type==='response' && !item && meta.origin==='relay') {
-            const previous=this.groups.slice().reverse().find(entry=>entry.kind==='assistant' && entry.complete && entry.key.startsWith(base+':message:'));
+            const previous=this.groups.slice().reverse().find(entry=>entry.kind==='assistant' && entry.complete && entry.key.startsWith(sessionBase+':'));
             if (previous) {
               let summary=previous.text;try {summary=JSON.parse(previous.text).summary || summary;} catch {}
               if (String(summary).trim()===String(event.content).trim()) {previous.updated=event.sequence;continue;}
@@ -80,7 +81,7 @@
               if (Array.isArray(changes) && changes.every(change => change && typeof change.path === 'string')) group.files = changes.map(change => change.path);
             } catch {}
           }
-        } else if (['handoff','checkpoint','pause_boundary','stop','error','provider_error','recovery','queue','native_environment','human_edit'].includes(type)) {
+        } else if (['handoff','checkpoint','pause_boundary','stop','error','provider_error','recovery','queue','native_environment','human_edit','continuation','task_blocked','file_change'].includes(type)) {
           group = this.add(identity, ['error','provider_error'].includes(type) ? 'error' : 'milestone', event, meta);
           group.text = event.content || '';
           group.complete = true;

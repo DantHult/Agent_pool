@@ -118,6 +118,22 @@ class AppServerClient:
 
 PERMISSION_NAME='relay-native'
 
+def sandbox_python():
+    """The interpreter sandboxed commands execute: the runtime server_command grants.
+
+    Relay itself may run from a virtual environment (sys.prefix), often inside
+    the user's home, which the sandbox deliberately cannot read or execute.
+    """
+    executable=Path(sys.executable)
+    if os.name=='nt' or sys.prefix==sys.base_prefix:return executable
+    runtime=Path(sys.base_prefix).resolve()
+    resolved=executable.resolve()
+    if resolved.is_relative_to(runtime):return resolved
+    for name in ('python%d.%d'%sys.version_info[:2],'python3'):
+        candidate=runtime/'bin'/name
+        if candidate.is_file():return candidate
+    raise AppServerError('Relay runs from a virtual environment whose base Python was not found; start Relay with its base interpreter')
+
 def server_command(codex):
     # Native tool subprocesses get minimal runtime reads, this turn's private
     # workspace, and no other profiles/canonical project/auth paths or network.

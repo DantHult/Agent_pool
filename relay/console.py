@@ -17,7 +17,7 @@ import shutil
 import threading
 import time
 
-from .app_server import AppServerClient, AppServerError, PERMISSION_NAME, server_command, server_environment
+from .app_server import AppServerClient, AppServerError, PERMISSION_NAME, sandbox_python, server_command, server_environment
 from .ide import WorkspaceConflict, file_path, reject_secret_content
 from .native import profile_paths
 from .native_environment import RUNTIME_NAMES, hydrate, private_directory, root, workspace_environment
@@ -57,6 +57,8 @@ class CommandConsole:
         self.ide = server.ide
         self.sessions = {}
         self.closing = False
+        # Agent dispatch checks open human commands as well as reservations.
+        self.relay.human_commands = self.active
         self.reaper = threading.Thread(target=self._reap, daemon=True)
         self.reaper.start()
 
@@ -173,7 +175,7 @@ class CommandConsole:
                 item.update({'state': 'failed', 'error': clean(str(exc))[:500] if isinstance(exc, (ValueError, AppServerError)) else 'Unable to prepare the isolated command environment', 'thread': None})
 
     def view(self, item):
-        return {name: item[name] for name in ('id', 'project', 'state', 'output', 'command', 'exit_code', 'duration_ms', 'closed', 'error', 'sequence')}
+        return {name: item.get(name) for name in ('id', 'project', 'state', 'output', 'command', 'exit_code', 'duration_ms', 'input_wait_ms', 'closed', 'error', 'sequence')}
 
     def poll(self, user, identity, session_hash):
         with self.relay.lock:
@@ -217,7 +219,8 @@ class CommandConsole:
             if cwd.is_symlink() or not cwd.resolve().is_relative_to(item['working']) or not cwd.is_dir():
                 raise PermissionError('Command directory must stay inside this private project snapshot')
             process = uid()
-            item.update({'state': 'running', 'output': '', 'command': text, 'exit_code': None, 'duration_ms': None, 'error': None, 'process_id': process, 'request_sent': threading.Event()})
+            item.update({'state': 'running', 'output': '', 'command': text, 'exit_code': None, 'duration_ms': None, 'error': None, 'process_id': process, 'request_sent': threading.Event(),
+                         'input_wait_ms': 0, 'last_output': None, 'last_input': None})
             self.ide._event(user, item['project'], item['conversation'], 'tool_invocation', text, {'provider_item_id': process, 'console_id': item['id'], 'channel': 'human_console'})
             item['thread'] = threading.Thread(target=self._execute, args=(item, argv, cwd), daemon=True)
             item['thread'].start()
@@ -245,8 +248,7 @@ class CommandConsole:
         launcher = ('import os,sys; os.chdir(sys.argv[1]); os.execvpe(sys.argv[2],sys.argv[2:],os.environ)')
         python = item['working'] / '.venv/bin/python'
         if not python.exists():
-            import sys
-            python = Path(sys.executable)
+            python = sandbox_python()
         argv = [str(python), '-I', '-c', launcher, str(cwd), *argv]
         waiting = threading.Thread(target=request, daemon=True)
         waiting.start()
@@ -270,6 +272,7 @@ class CommandConsole:
                 with self.relay.lock:
                     item['output'] = (item['output'] + decoded)[-512000:]
                     item['sequence'] += 1
+                    item['last_output'] = time.monotonic()
                     self.ide._event(item['user'], item['project'], item['conversation'], 'runtime_output', decoded,
                                     {'provider_item_id': item['process_id'], 'channel': params.get('stream', 'stdout'), 'console_id': item['id']})
         except Exception:
@@ -281,7 +284,7 @@ class CommandConsole:
                          'error': result.get('error'), 'duration_ms': int((time.monotonic() - started) * 1000), 'thread': None})
             try:
                 self.ide._event(item['user'], item['project'], item['conversation'], 'tool_output', item['output'] or item['error'] or '(no output)',
-                                {'provider_item_id': item['process_id'], 'exit_code': item['exit_code'], 'duration_ms': item['duration_ms'], 'console_id': item['id']})
+                                {'provider_item_id': item['process_id'], 'exit_code': item['exit_code'], 'duration_ms': item['duration_ms'], 'input_wait_ms': item['input_wait_ms'], 'console_id': item['id']})
             except PermissionError:
                 pass  # Revocation must stop execution without an unauthorized read.
 
@@ -294,6 +297,12 @@ class CommandConsole:
             if not isinstance(text, str) or len(text.encode()) > 4096:
                 raise ValueError('Input must be at most 4096 bytes')
             client, process, sent = item['client'], item['process_id'], item['request_sent']
+            # A program that printed and then went quiet until this input was
+            # waiting for the person typing; report that apart from run time.
+            arrived = time.monotonic()
+            if item.get('last_output'):
+                item['input_wait_ms'] += int(max(0, arrived - max(item['last_output'], item.get('last_input') or 0)) * 1000)
+            item['last_input'] = arrived
         if not sent.wait(5):
             raise WorkspaceConflict('The command is still starting; wait for its first output before sending input')
         client.request('command/exec/write', {'processId': process, 'deltaBase64': base64.b64encode(text.encode()).decode(), 'closeStdin': data.get('close_stdin') is True})

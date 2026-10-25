@@ -311,8 +311,10 @@ class RealConsoleTests(unittest.TestCase):
             if 'ready-input' in live['output']:break
             time.sleep(.05)
         self.assertIn('ready-input',live['output'])
+        time.sleep(.5)  # the person reading the prompt and typing
         self.client.post('ide/console/input',{'session_id':identity,'input':'hello\n'})
         done=self.wait(identity,{'finished'});self.assertEqual(done['exit_code'],0);self.assertIn('echo:hello',done['output'])
+        self.assertGreaterEqual(done['input_wait_ms'],400)
         self.client.post('ide/console/run',{'session_id':identity,'command':"python3 -c 'raise SystemExit(7)'"})
         self.assertEqual(self.wait(identity,{'finished'})['exit_code'],7)
         self.client.post('ide/console/run',{'session_id':identity,'command':"python3 -c 'import time; time.sleep(60)'"})

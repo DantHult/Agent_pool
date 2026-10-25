@@ -25,9 +25,9 @@ def parse(command, cwd=''):
     if sub=='push':raise ValueError('Remote Git pushes are unavailable. Relay grants no network or host Git credentials; use your separately authorized Git client outside Relay.')
     if sub=='restore' and values[:1]==['--staged']:
         sub,values='unstage',values[1:]
-    allowed=(sub=='status' and values in ([],['--short'])) or (sub=='diff' and values in ([],['--staged'])) or (sub=='log' and not values) or (sub=='branch' and len(values)<=1) or (sub=='switch' and (len(values)==1 or len(values)==2 and values[0]=='-c')) or (sub=='commit' and len(values)==2 and values[0]=='-m') or (sub in ('add','unstage') and bool(values))
+    allowed=(sub=='status' and values in ([],['--short'])) or (sub=='diff' and values in ([],['--staged'])) or (sub=='log' and values in ([],['--oneline'])) or (sub=='branch' and len(values)<=1) or (sub=='switch' and (len(values)==1 or len(values)==2 and values[0]=='-c')) or (sub=='commit' and len(values)==2 and values[0]=='-m') or (sub in ('add','unstage') and bool(values))
     if not allowed:raise ValueError('Supported Git: status, diff [--staged], add PATH…, restore --staged PATH…, commit -m "message", log, branch [NAME], switch [-c] NAME. Arbitrary flags and remote operations are unavailable.')
-    if sub=='status':values=[]
+    if sub in ('status','log'):values=[]
     if sub in ('add','unstage'):
         mapped=[]
         for name in values:

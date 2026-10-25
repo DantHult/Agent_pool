@@ -3,8 +3,25 @@
 (function () {
   const byId = id => document.getElementById(id);
   const escape = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
-  const client = sessionStorage.getItem('relay-editor-client') || crypto.randomUUID();
+  // One editor identity per tab. sessionStorage survives a reload but is copied
+  // into a duplicated tab, so a tab that finds its identity held by another
+  // live tab (Web Locks) takes a fresh one.
+  let client = sessionStorage.getItem('relay-editor-client') || crypto.randomUUID();
   sessionStorage.setItem('relay-editor-client', client);
+  const identity = (async () => {
+    if (!navigator.locks || !window.AbortSignal?.timeout) return;
+    const hold = id => new Promise(resolve => navigator.locks.request('relay-editor-client:' + id, {signal:AbortSignal.timeout(800)}, () => { resolve(true); return new Promise(() => {}); }).catch(() => resolve(false)));
+    if (await hold(client)) return;
+    client = crypto.randomUUID(); sessionStorage.setItem('relay-editor-client', client);
+    await hold(client);
+  })();
+  const sessionLabel = (() => {
+    const agent = navigator.userAgent;
+    const browser = /Edg\//.test(agent) ? 'Edge' : /Firefox\//.test(agent) ? 'Firefox' : /Chrome\//.test(agent) ? 'Chrome' : /Safari\//.test(agent) ? 'Safari' : 'Browser';
+    const system = /iPhone|iPad/.test(agent) ? 'iOS' : /Android/.test(agent) ? 'Android' : /Mac OS X/.test(agent) ? 'macOS' : /Windows/.test(agent) ? 'Windows' : /Linux/.test(agent) ? 'Linux' : '';
+    return browser + (system ? ' on ' + system : '') + ' · tab opened ' + new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+  })();
+  const channel = 'BroadcastChannel' in window ? new BroadcastChannel('relay-editor') : null;
   const buffers = new Map();
   let bridge, project, user, conversation, state, current, editor, diffEditor;
   let opened = [], refreshAt = 0, refreshing = false, generation = 0, consoleSession = null, consoleTimer;
@@ -16,10 +33,13 @@
   let refreshPromise = null;
   let consoleVersion = 0, treeSignature = null;
   let terminalEntries=[],activeEntry=null,lastTerminalResult=null,terminalAvailable=false;
+  let leasesAvailable=false, handedOver=false, pendingHandover=null;
   const language = name => ({py:'python',js:'javascript',jsx:'javascript',mjs:'javascript',ts:'typescript',tsx:'typescript',html:'html',css:'css',scss:'css',json:'javascript',md:'markdown',yml:'yaml',yaml:'yaml',sh:'shell',sql:'sql',diff:'diff'}[name.split('.').pop()] || 'plaintext');
+  // Time a program spent waiting for typed input is not its run time.
+  const inputWait=ms=>ms>=100?' (' + (ms/1000).toFixed(1) + ' s of it waiting for input)':'';
   const bufferKey = name => [user, project, name].join(':');
   const mine = () => state?.lock?.kind === 'human' && state.lock.mine;
-  const canReserve = () => project && state?.editor_writable!==false && bridge?.canWrite()!==false && (!state?.lock || mine());
+  const canReserve = () => project && state?.editor_writable!==false && bridge?.canWrite()!==false && (!state?.lock || mine() || state.lock.auto_recoverable);
   const context = () => ({project_id: project, client_id: client, conversation_id: conversation});
   const notifyError = error => bridge?.showError(error);
   const notice = text => bridge?.showNotice(text);
@@ -51,6 +71,7 @@
     document.querySelectorAll('[data-bottom]').forEach(button => button.classList.toggle('active', button.dataset.bottom === name));
     if (name === 'debug' && show) bridge?.loadHistory();
     editor?.layout(); diffEditor?.layout();
+    if(name==='console' && show)focusTerminal();
   }
   document.querySelectorAll('[data-bottom]').forEach(button => button.onclick = () => bottom(button.dataset.bottom));
   byId('toggleTerminal').onclick = byId('toggleBottom').onclick = () => bottom('console', byId('bottomPanel').hidden);
@@ -68,7 +89,8 @@
       document.body.classList.add('resizing');
       let last = horizontal ? event.clientX : event.clientY;
       const move = next => { const position = horizontal ? next.clientX : next.clientY; change((position - last) * (reverse ? -1 : 1)); last = position; };
-      const end = () => { document.body.classList.remove('resizing'); handle.removeEventListener('pointermove', move); handle.removeEventListener('pointerup', end); handle.removeEventListener('pointercancel', end); };
+      const focused=document.activeElement;
+      const end = () => { if(focused?.closest('#consolePane'))focused.focus();document.body.classList.remove('resizing'); handle.removeEventListener('pointermove', move); handle.removeEventListener('pointerup', end); handle.removeEventListener('pointercancel', end); };
       handle.addEventListener('pointermove', move); handle.addEventListener('pointerup', end); handle.addEventListener('pointercancel', end);
     });
     handle.addEventListener('keydown', event => { if (['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(event.key)) { event.preventDefault(); change((['ArrowRight','ArrowDown'].includes(event.key) ? 12 : -12) * (reverse ? -1 : 1)); } });
@@ -203,13 +225,58 @@
     if(acquiring && !recover)return acquiring;
     const at=generation;
     acquiring=(async()=>{
-      const result=await api(workflowAvailable && !recover ? 'ide/prepare' : 'ide/lock', {...context(),recover});
+      const result=await api(workflowAvailable && !recover ? 'ide/prepare' : 'ide/lock', {...context(),recover,label:sessionLabel});
       if(at!==generation)throw new Error('Project changed while reserving the workspace. Return to that project to continue.');
-      state=result;autoFailed=false;renderState();
+      state=result;autoFailed=false;handedOver=false;renderState();
     })();
     try{await acquiring;}catch(error){autoFailed=true;throw error;}finally{acquiring=null;updateEditing();}
   }
-  byId('recoverLock').onclick = guard(() => acquire(true));
+  byId('recoverLock').onclick = guard(async () => {
+    const lock=state?.lock;
+    if(lock && !lock.stale && !confirm('Your other Relay session for this project is still active. Taking over makes that session read-only. Its saved drafts and Git state are kept, but text it has not synchronized yet stays only in that tab. Take over here?'))return;
+    await acquire(true);
+  });
+  byId('requestHandover').onclick = guard(async () => {
+    if(!channel)throw new Error('This browser cannot message other tabs. Switch to the tab that is editing, or take over here.');
+    const at=generation;
+    await new Promise((resolve,reject)=>{
+      const timer=setTimeout(()=>{pendingHandover=null;reject(new Error('No tab in this browser answered. If it was closed or is suspended, use Take over editing here.'));},4000);
+      pendingHandover=result=>{clearTimeout(timer);pendingHandover=null;result.ok?resolve():reject(new Error(result.error || 'That tab could not hand over editing.'));};
+      channel.postMessage({type:'handover',user,project,from:client});
+    });
+    if(at===generation)await acquire(true);
+  });
+  // Another tab of this browser asks for the project: give it up cooperatively.
+  async function handOver(requester) {
+    const reply={type:'handover-result',to:requester};
+    try {
+      if(consoleSession && !consoleSession.closed)throw new Error('A command session is open in the other tab. Stop or close it there first.');
+      handedOver=true;
+      await flushDrafts();
+      await api('ide/detach',{project_id:project,client_id:client});
+      reply.ok=true;
+      notice('Editing moved to another tab. This tab is read-only until you edit here again.');
+    } catch(error) { handedOver=false; reply.error=error.message; }
+    channel.postMessage(reply);
+    await refresh(true);
+  }
+  if(channel)channel.onmessage=event=>{
+    const message=event.data || {};
+    if(message.type==='handover' && message.user===user && message.project===project && mine())handOver(message.from).catch(notifyError);
+    if(message.type==='handover-result' && message.to===client)pendingHandover?.(message);
+  };
+  // Leases: the holder renews while open; a closing tab gives the project up.
+  async function heartbeat() {
+    if(!leasesAvailable || !project || !mine() || handedOver)return;
+    const at=generation, result=await api('ide/heartbeat',{project_id:project,client_id:client,label:sessionLabel});
+    if(at!==generation || result.held)return;
+    notice('Editing for this project moved to another session. Open files here are read-only; text not yet synchronized stays in this tab.');
+    await refresh(true);
+  }
+  (function renew(){setTimeout(()=>heartbeat().catch(()=>{}).finally(renew),15000);})();
+  window.addEventListener('pagehide',()=>{if(leasesAvailable && project && mine() && !(consoleSession && !consoleSession.closed))bridge?.beacon('ide/detach',{project_id:project,client_id:client});});
+  window.addEventListener('pageshow',event=>{if(event.persisted && project)refresh(true).then(heartbeat).catch(()=>{});});
+  document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible' && project)heartbeat().then(()=>refresh(true)).catch(()=>{});});
   byId('saveFile').onclick = guard(saveCurrent);
   async function saveAll() {
     for(const buffer of buffers.values())if(buffer.project===project && buffer.dirty && !buffer.virtual)await save(buffer);
@@ -223,7 +290,12 @@
   }
   async function prepareForAgent() {
     transitioning=true;updateEditing();
-    try{if(acquiring)await acquiring;await saveAll();await finishReservation();}
+    try{
+      if(acquiring)await acquiring;
+      // A stale reservation from this account's closed tab is checkpointed too.
+      if(state?.lock?.kind==='human' && state.lock.auto_recoverable)await acquire();
+      await saveAll();await finishReservation();
+    }
     catch(error){transitioning=false;updateEditing();bottom('console',!!consoleSession);throw error;}
   }
   async function finishTransition(){try{await refresh(true);}finally{transitioning=false;updateEditing();}}
@@ -338,6 +410,7 @@
     byId('discardDraft').disabled = !mine() || !buffer?.dirty;
     byId('saveState').textContent = buffer?.dirty ? buffer.syncedText===buffer.text ? 'Draft retained' : 'Saving draft…' : buffer?.virtual ? 'Recorded view' : buffer?.readonly ? 'Protected file' : writable && buffer ? 'Saved' : acquiring ? 'Preparing workspace…' : state?.lock?.kind==='agent' ? 'Agent writing' : state?.lock && !mine() ? 'Another editor is active' : bridge?.canWrite()===false ? 'Project permission required' : state?.editor_writable===false ? 'Secure writes unavailable on this platform' : 'Ready';
     byId('recoverLock').hidden = !(state?.lock?.kind === 'human' && state.lock.recoverable && !state.lock.mine);
+    byId('requestHandover').hidden = !(channel && state?.lock?.kind === 'human' && state.lock.recoverable && !state.lock.mine && state.lock.same_browser && !state.lock.stale);
     byId('newFile').disabled = !project || !canReserve() || transitioning;
     byId('newFolder').disabled=byId('newFile').disabled || !managementAvailable;
     byId('saveAsFile').disabled=byId('newFile').disabled || !buffer || buffer.virtual;
@@ -345,7 +418,7 @@
     byId('unstageAll').disabled=!canReserve() || !managementAvailable || transitioning;
     for(const id of ['newFolder','renameEntry','deleteEntry','unstageAll'])if(!managementAvailable)byId(id).title='Restart Relay to enable this operation';
     byId('stageAll').disabled = byId('commitChanges').disabled = byId('createBranch').disabled = byId('switchBranch').disabled = !canReserve() || transitioning;
-    if(buffer && !buffer.readonly && !buffer.virtual && canReserve() && !mine() && !transitioning && !acquiring && !autoFailed)acquire().catch(notifyError);
+    if(buffer && !buffer.readonly && !buffer.virtual && canReserve() && !mine() && !transitioning && !acquiring && !autoFailed && !handedOver)acquire().catch(notifyError);
     if (state?.active_project_task && state.active_project_task.conversation_id!==conversation) document.querySelector('.send').disabled=true;
   }
   function treeFiles() {
@@ -384,6 +457,14 @@
   document.addEventListener('click', event => { const button=event.target.closest('[data-open-file]'); if (button && project) openFile(button.dataset.openFile).catch(notifyError); });
   document.addEventListener('click',event=>{const button=event.target.closest('[data-artifact]');if(!button || !project)return;const at=generation;api('artifacts/'+encodeURIComponent(button.dataset.artifact)).then(record=>{if(at===generation)virtualFile('Recorded output',record.content);}).catch(notifyError);});
   byId('fileFilter').oninput = renderTree;
+  const ago = seconds => seconds==null ? 'recently' : seconds<60 ? seconds + ' s ago' : Math.round(seconds/60) + ' min ago';
+  function humanLockText(lock) {
+    if(!('same_browser' in lock))return lock.name + ' is editing this project' + (lock.stale ? ' but has not been active recently' : '') + '. Their reservation stays until they save and finish.';
+    const where=(lock.same_browser ? 'another tab in this browser' : 'another browser or device') + (lock.label ? ' (' + lock.label + ')' : '');
+    if(lock.commands_active)return 'A command session is open for this project in ' + where + '. Stop or close it there before editing here.';
+    if(lock.stale)return 'Your earlier session in ' + where + ' is no longer active (' + (lock.closed ? 'tab closed' : lock.session_ended ? 'signed out' : 'last seen ' + ago(lock.idle_seconds)) + '). ' + (lock.auto_recoverable ? 'Relay moves editing here as soon as you edit. Drafts and Git state are kept.' : 'Use Take over editing here to continue. Drafts and Git state are kept.');
+    return 'You are editing this project in ' + where + ', active ' + ago(lock.idle_seconds) + '. ' + (lock.same_browser ? 'Switch to that tab, or ask it to hand over.' : 'Return to that session, or take over here.') + ' If it stops responding, it can be recovered after about ' + Math.ceil((lock.expires_in || 0)/60) + ' min.';
+  }
   function renderState() {
     if (!state) return;
     renderTree(); updateEditing();
@@ -393,7 +474,7 @@
     byId('statusBranch').textContent='⑂ ' + state.branch;
     const lock=state.lock;
     const otherTask=state.active_project_task && state.active_project_task.conversation_id!==conversation;
-    const text=lock?.kind==='agent' ? 'An agent is writing this project. Wait for its checkpoint, or open its task and request Pause / Checkpoint to edit safely.' : lock?.kind==='human' ? (lock.mine ? 'Your edits are protected. Relay saves and releases this reservation automatically before an agent starts.' : lock.name + ' is editing this project in another session. Ask that editor to save and finish, or recover your own previous session if it is no longer in use.') : otherTask ? 'An unfinished task in another conversation owns this project. Finish or cancel it before starting another task.' : 'Ready. Editing and Git reserve this project automatically.';
+    const text=lock?.kind==='agent' ? 'An agent is writing this project. Wait for its checkpoint, or open its task and request Pause / Checkpoint to edit safely.' : lock?.kind==='human' ? (lock.mine ? 'Your edits are protected. Relay saves and releases this reservation automatically before an agent starts.' : humanLockText(lock)) : otherTask ? 'An unfinished task in another conversation owns this project. Finish or cancel it before starting another task.' : 'Ready. Editing and Git reserve this project automatically.';
     byId('workspaceLock').textContent=text; byId('workspaceLock').hidden=(!lock || mine()) && !otherTask;
     byId('viewWriter').hidden=lock?.kind!=='agent' && !otherTask;
     byId('workspaceLock').classList.toggle('agent-locked',lock?.kind==='agent');
@@ -412,10 +493,14 @@
     if (!project || (!force && Date.now()-refreshAt<3000)) return;
     refreshing=true; const at=generation, selected=project;
     const work=(async()=>{
+      await identity;
       const next=await api('ide/state?' + new URLSearchParams({project_id:selected,client_id:client}));
       if (at!==generation) return;
       const previousHead=state?.checkpoint;
-      if(JSON.stringify(state?.lock)!==JSON.stringify(next.lock))autoFailed=false;
+      const holder=lock=>JSON.stringify(lock && {...lock,idle_seconds:null,expires_in:null});
+      if(holder(state?.lock)!==holder(next.lock))autoFailed=false;
+      // A handover is complete once another editor holds the project.
+      if(next.lock && !next.lock.mine)handedOver=false;
       state=next; refreshAt=Date.now(); renderState();
       if (previousHead && previousHead!==next.checkpoint) {
         for (const buffer of buffers.values()) if (buffer.project===selected && !buffer.dirty && !buffer.virtual) {
@@ -463,12 +548,22 @@
   byId('openHandoff').onclick=guard(()=>openFile('.relay/HANDOFF.md'));
 
   function consoleKey() { return 'relay-console:' + user + ':' + project; }
+  const terminalReady=()=>!!(state?.terminal_available || state?.console_available) && bridge?.canWrite()!==false;
   function renderConsole() {
     const item=consoleSession;
-    byId('consoleState').textContent=commandStarting ? 'Preparing command…' : lastTerminalResult?.kind==='rejected' ? 'Command rejected' : lastTerminalResult?.kind==='git' ? 'finished · exit '+lastTerminalResult.exit_code+(lastTerminalResult.duration_ms!=null?' · '+lastTerminalResult.duration_ms+' ms':'') : item ? item.state + (item.exit_code!=null ? ' · exit ' + item.exit_code + ' · ' + (item.duration_ms/1000).toFixed(1) + 's' : '') : state?.console_available ? 'Ready · enter an approved command' : state?.terminal_available ? 'Ready · project Git available' : 'Command sandbox unavailable for this session';
+    byId('consoleState').textContent=commandStarting ? 'Preparing command…' : lastTerminalResult?.kind==='rejected' ? 'Command rejected' : lastTerminalResult?.kind==='git' ? 'finished · exit '+lastTerminalResult.exit_code+(lastTerminalResult.duration_ms!=null?' · '+lastTerminalResult.duration_ms+' ms':'') : item ? item.state + (item.exit_code!=null ? ' · exit ' + item.exit_code + ' · ' + (item.duration_ms/1000).toFixed(1) + 's' + inputWait(item.input_wait_ms) : '') : state?.console_available ? 'Ready · enter an approved command' : state?.terminal_available ? 'Ready · project Git available' : 'Command sandbox unavailable for this session';
     byId('closeConsole').disabled=!item || item.closed || commandStarting;
-    const canRun=!!(state?.terminal_available || state?.console_available) && bridge?.canWrite()!==false && !transitioning && !commandStarting && (!item || item.closed || ['ready','finished'].includes(item.state));
-    byId('commandInput').disabled=byId('runCommand').disabled=!canRun;
+    // A failed preparation is re-prepared by the next command, so it must not
+    // leave the prompt locked.
+    const canRun=terminalReady() && !transitioning && !commandStarting && (!item || item.closed || ['ready','finished','failed'].includes(item.state));
+    const running=item?.state==='running';
+    const input=byId('commandInput');
+    // Never readOnly: typing ahead is allowed while a command starts; submission is gated instead.
+    input.disabled=!terminalReady();input.readOnly=false;
+    byId('runCommand').disabled=!canRun && !running;
+    byId('runCommand').textContent=running?'Send ↵':'Run ↵';
+    byId('terminalPrompt').textContent=running?'stdin ›':'$';
+    input.placeholder=input.disabled?(bridge?.canWrite()===false?'Project write permission is required to run commands':state?.console_unavailable_reason || 'Select a project to use the terminal'):running?'Type program input and press Enter · Ctrl+C stops execution':commandStarting || ['preparing','starting','reconnecting'].includes(item?.state)?'Preparing… you can type the next command now':'Type an approved command · Enter to run · ↑ ↓ history';
     byId('applyConsole').disabled=!item || item.closed || commandStarting || !['ready','finished'].includes(item.state);
     byId('cancelCommand').disabled=item?.state!=='running';
     byId('stdinForm').hidden=item?.state!=='running';
@@ -489,7 +584,7 @@
         consoleSession=result;
         if (changed || !activeEntry || activeEntry.exit!==result.exit_code || activeEntry.duration!==result.duration_ms) {
           if(!activeEntry || activeEntry.session!==identity)activeEntry=terminalEntry(result.command || 'Restored command',byId('commandCwd').value,'isolated command workspace');
-          activeEntry.session=identity;activeEntry.output=result.output || result.error || '';activeEntry.exit=result.exit_code;activeEntry.duration=result.duration_ms;
+          activeEntry.session=identity;activeEntry.output=result.output || result.error || '';activeEntry.exit=result.exit_code;activeEntry.duration=result.duration_ms;activeEntry.inputWait=result.input_wait_ms;
           renderTerminal();
         }
         renderConsole();
@@ -533,7 +628,7 @@
   }
   function renderTerminal(force=false) {
     const output=byId('consoleOutput'),follow=force || output.scrollHeight-output.clientHeight-output.scrollTop<80;
-    let text=terminalEntries.map(entry=>'$ '+entry.command+'\n'+(entry.cwd?'cwd: '+entry.cwd+' · ':'')+(entry.scope || '')+'\n\n'+entry.output.slice(entry.offset || 0)+(entry.exit!=null?'\n\nExit '+entry.exit+(entry.duration!=null?' · '+entry.duration+' ms':''):'')).join('\n\n');
+    let text=terminalEntries.map(entry=>'$ '+entry.command+'\n'+(entry.cwd?'cwd: '+entry.cwd+' · ':'')+(entry.scope || '')+'\n\n'+entry.output.slice(entry.offset || 0)+(entry.exit!=null?'\n\nExit '+entry.exit+(entry.duration!=null?' · '+entry.duration+' ms'+inputWait(entry.inputWait):''):'')).join('\n\n');
     if(text.length>1000000)text='[Older visible output omitted; recorded events remain available]\n'+text.slice(-1000000);
     output.textContent=text;if(follow)output.scrollTop=output.scrollHeight;
   }
@@ -548,7 +643,7 @@
       const plan=terminalAvailable?await api(file?'ide/run-file':'ide/terminal',{...target,command,cwd,path:file}):file?(()=>{throw new Error('Restart Relay to enable Run File.');})():{kind:'sandbox',command,cwd};
       if(at!==generation)return;
       entry.command=plan.command;entry.cwd=plan.cwd;
-      commandHistory.push(plan.command);historyPosition=commandHistory.length;byId('commandInput').value='';
+      commandHistory.push(plan.command);historyPosition=commandHistory.length;if(!file && byId('commandInput').value.trim()===command.trim())byId('commandInput').value='';
       if(plan.kind==='git') {
         entry.scope='authoritative project Git';entry.output=plan.output || '(no output)';entry.exit=plan.exit_code;entry.duration=plan.duration_ms;lastTerminalResult=plan;
         await refresh(true);await bridge.refresh();
@@ -564,7 +659,24 @@
     }catch(error){entry.output='Command rejected: '+error.message;entry.scope='Execution error';lastTerminalResult={kind:'rejected'};renderTerminal(true);if(consoleSession && ['running','starting','preparing','reconnecting'].includes(consoleSession.state))startConsolePoll();throw error;}
     finally{commandStarting=false;renderConsole();updateEditing();}
   }
-  byId('commandForm').onsubmit=guard(async event=>{event.preventDefault();await executeCommand(byId('commandInput').value.trim(),byId('commandCwd').value);});
+  function focusTerminal() {
+    if(!byId('bottomPanel').hidden && !byId('consolePane').hidden && !byId('commandInput').disabled)byId('commandInput').focus({preventScroll:true});
+  }
+  // The output fills most of the terminal. Clicking its empty area must put
+  // the caret at the prompt, while selection/copy of output stays native.
+  byId('consoleOutput').addEventListener('pointerup',()=>{
+    if(!window.getSelection()?.toString())focusTerminal();
+  });
+  byId('commandForm').addEventListener('click',event=>{if(event.target===byId('commandForm') || event.target===byId('terminalPrompt'))focusTerminal();});
+  byId('commandForm').onsubmit=guard(async event=>{
+    event.preventDefault();
+    const input=byId('commandInput');
+    if(consoleSession?.state==='running') {
+      await api('ide/console/input',{session_id:consoleSession.id,input:input.value+'\n'});input.value='';focusTerminal();
+    }else if(byId('runCommand').disabled) {
+      if(input.value.trim())notice('The previous command is still starting; your command is kept in the prompt. Press Enter again when it finishes.');
+    }else {await executeCommand(input.value.trim(),byId('commandCwd').value);focusTerminal();}
+  });
   byId('runFile').onclick=guard(()=>executeCommand('', '', activeBuffer()?.path));
   byId('stopFile').onclick=guard(()=>api('ide/console/cancel',{session_id:consoleSession.id}));
   byId('clearTerminal').onclick=()=>{terminalEntries=[];activeEntry=null;if(consoleSession?.state==='running'){activeEntry=terminalEntry(consoleSession.command,'','Continuing command output');activeEntry.session=consoleSession.id;activeEntry.offset=consoleSession.output?.length || 0;}renderTerminal();};
@@ -572,10 +684,11 @@
   byId('commandCwd').onchange=renderConsole;
   document.addEventListener('keydown',event=>{
     if(event.key==='F5' && activeBuffer() && !byId('runFile').disabled){event.preventDefault();byId('runFile').click();}
-    if(event.ctrlKey && event.key.toLowerCase()==='c' && consoleSession?.state==='running' && event.target.closest('#consolePane') && !window.getSelection()?.toString()) {event.preventDefault();byId('cancelCommand').click();}
+    const selected=event.target.selectionStart!=null && event.target.selectionStart!==event.target.selectionEnd;
+    if(event.ctrlKey && !event.metaKey && event.key.toLowerCase()==='c' && event.target.closest('#consolePane') && !selected && !window.getSelection()?.toString()) {event.preventDefault();if(consoleSession?.state==='running')byId('cancelCommand').click();else byId('commandInput').value='';}
   });
   byId('commandInput').onkeydown=event=>{
-    if (event.key==='ArrowUp' || event.key==='ArrowDown') { event.preventDefault(); historyPosition=Math.max(0,Math.min(commandHistory.length,historyPosition+(event.key==='ArrowUp' ? -1 : 1))); byId('commandInput').value=commandHistory[historyPosition] || ''; }
+    if (consoleSession?.state!=='running' && (event.key==='ArrowUp' || event.key==='ArrowDown')) { event.preventDefault(); historyPosition=Math.max(0,Math.min(commandHistory.length,historyPosition+(event.key==='ArrowUp' ? -1 : 1))); byId('commandInput').value=commandHistory[historyPosition] || ''; }
   };
   byId('cancelCommand').onclick=guard(()=>api('ide/console/cancel',{session_id:consoleSession.id}));
   byId('stdinForm').onsubmit=guard(async event=>{event.preventDefault();await api('ide/console/input',{session_id:consoleSession.id,input:byId('stdinInput').value+'\n'});byId('stdinInput').value='';});
@@ -618,7 +731,7 @@
   async function update(value) {
     if (!bridge) return;
     managementAvailable=value.managementAvailable===true;
-    workflowAvailable=value.automaticWorkflow===true;terminalAvailable=value.developmentTerminal===true;
+    workflowAvailable=value.automaticWorkflow===true;terminalAvailable=value.developmentTerminal===true;leasesAvailable=value.editorLeases===true;
     const changed=project!==value.project || user!==value.user;
     if (changed) {
       generation++;clearTimeout(consoleTimer);project=value.project;user=value.user;state=null;refreshAt=0;opened=[];current=null;consoleSession=null;refreshing=false;autoFailed=false;acquiring=null;transitioning=false;refreshPromise=null;
@@ -646,6 +759,7 @@
     await refresh(changed);
     updateEditing();
     if (changed && project) {
+      heartbeat().catch(()=>{});
       let restore=[];try {restore=JSON.parse(sessionStorage.getItem('relay-open-files:' + user + ':' + project) || '[]');} catch {}
       for (const path of restore.slice(0,12)) await openFile(path).catch(()=>{});
       for (const draft of state?.drafts || []) await openFile(draft.path,true).catch(()=>{});

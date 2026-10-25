@@ -49,7 +49,10 @@ def main():
             def wait_exit(code,marker):
                 page.wait_for_function('([code,marker])=>document.getElementById("consoleState").textContent.includes("exit "+code) && document.getElementById("consoleOutput").textContent.includes(marker)',arg=[code,marker],timeout=45000)
             def command(text):
-                page.locator('#commandInput').fill(text);page.locator('#commandInput').press('Enter')
+                page.locator('#consoleOutput').click(position={'x':40,'y':20})
+                page.wait_for_function('() => document.activeElement.id==="commandInput" && !document.getElementById("commandInput").readOnly')
+                # Individual key events, as a person types; no programmatic value set.
+                page.keyboard.type(text);page.keyboard.press('Enter')
 
             create('hello.py','print("hello from Relay")\n')
             page.locator('#runFile').click();wait_exit(0,'hello from Relay')
@@ -80,9 +83,16 @@ def main():
             create('package.json',json.dumps({'name':'terminal-proof','version':'1.0.0','scripts':{'build':'node hello.js'}}))
             command('npm run build');wait_exit(0,'terminal-proof@1.0.0 build')
             command('python3 hello.py');page.wait_for_function('() => document.getElementById("consoleState").textContent==="running" && !document.getElementById("stdinForm").hidden',timeout=45000)
-            page.locator('#stdinInput').fill('Lin');page.locator('#stdinForm button:not([type]), #stdinForm button[type=submit]').first.click();wait_exit(0,'hello Lin')
+            page.locator('#consoleOutput').click(position={'x':40,'y':20});page.keyboard.type('Lin');page.keyboard.press('Enter');wait_exit(0,'hello Lin')
             report['checks'].append('Actual typed npm run build and python3 hello.py with stdin, without network/package installation')
 
+            # Focus survives a panel switch and drag resize; use actual keys.
+            page.locator('#debugTab').click();page.locator('#consoleTab').click()
+            assert page.evaluate('document.activeElement.id')=='commandInput'
+            handle=page.locator('#bottomResize').bounding_box()
+            page.mouse.move(handle['x']+50,handle['y']+2);page.mouse.down();page.mouse.move(handle['x']+50,handle['y']-35);page.mouse.up()
+            assert page.evaluate('document.activeElement.id')=='commandInput'
+            page.keyboard.type('git statuz');page.keyboard.press('Backspace');page.keyboard.type('s');page.keyboard.press('Home');page.keyboard.press('End');page.keyboard.press('Enter');wait_exit(0,'hello.py')
             command('git status');wait_exit(0,'hello.py')
             command('git add .');wait_exit(0,'authoritative project Git')
             command('git restore --staged hello.py');wait_exit(0,'git restore --staged hello.py')
@@ -91,10 +101,11 @@ def main():
             workspace=case.server.relay.ws.path(case.project)
             commit=case.server.relay.ws.git(workspace,'rev-parse','HEAD')
             assert case.server.relay.ws.git(workspace,'log','-1','--format=%s')=='slight improvements'
-            command('git log');wait_exit(0,'slight improvements')
+            command('git log --oneline');wait_exit(0,'slight improvements')
             command('git branch terminal-check');wait_exit(0,'terminal-check')
             command('git switch terminal-check');wait_exit(0,'terminal-check')
             page.locator('#commandInput').press('ArrowUp');assert page.locator('#commandInput').input_value()=='git switch terminal-check'
+            page.evaluate('navigator.clipboard.writeText("git status")');page.locator('#consoleOutput').click(position={'x':40,'y':20});page.keyboard.press('Control+c');page.wait_for_function('() => document.getElementById("commandInput").value===""');page.keyboard.press('Meta+v');page.wait_for_function('() => document.getElementById("commandInput").value==="git status"');page.keyboard.press('Enter');wait_exit(0,'authoritative project Git')
             command('python3 -c "print(\'quoted args\')"');wait_exit(0,'quoted args')
             report.update({'commit':commit,'commit_subject':'slight improvements'})
             report['checks'].append('Typed status/add/restore/quoted commit/log/branch/switch, actual Git commit, quoted Python argv and command history')
