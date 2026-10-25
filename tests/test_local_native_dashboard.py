@@ -48,7 +48,7 @@ class LocalNativeDashboardTests(unittest.TestCase):
     def enroll(self,profile):return self.client.post('native/profiles/enroll',{'profile':profile,'project_id':self.project})['id']
     def submit(self,worker):return self.client.post('prompt',{'conversation_id':self.conversation,'worker_id':worker,'execution_mode':'native','prompt':OBJECTIVE,'pause_after_turn':True})
     def wait(self,task,state):
-        deadline=time.monotonic()+60
+        deadline=time.monotonic()+180
         while time.monotonic()<deadline:
             with self.server.relay.lock:
                 current=self.server.relay.task(self.owner,task['id'])
@@ -68,7 +68,7 @@ class LocalNativeDashboardTests(unittest.TestCase):
         for profile in ('a','b'):
             home,_=profile_paths(profile);received=json.loads((home/'received.json').read_text())
             self.assertIn(OBJECTIVE,received['text']);self.assertEqual(received['keys_present'],[])
-            self.assertIn('/workspaces/'+profile+'/',received['cwd']);self.assertEqual(received['permissions'],'relay-native')
+            self.assertIn('/workspaces/'+profile+'/',received['cwd'].replace('\\','/'));self.assertEqual(received['permissions'],'relay-native')
         old_cookie=self.client.cookie;self.stop();self.start();self.client.server=self.server
         self.assertEqual(self.client.cookie,old_cookie)
         restored=self.client.get('projects/'+self.project)

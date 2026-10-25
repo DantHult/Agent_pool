@@ -6,9 +6,9 @@ Observed evidence: three member browser sessions plus independent Organizer/Outs
 
 The local-owner native dashboard now requires `--auth local-owner --backend native` and an offline-pinned account; it rejects demo/shared/public/proxied use. See [LOCAL_NATIVE_DASHBOARD.md](../docs/LOCAL_NATIVE_DASHBOARD.md). It does not authorize cross-person subscription execution.
 
-# Native Codex on macOS
+# Native Codex on macOS and Windows
 
-Relay can run three local `codex app-server --stdio` processes. Each process has its own private `CODEX_HOME`, independent ChatGPT login and private Git clones. The native backend needs Python, Git, macOS and the official Codex CLI. **Docker, `RELAY_ORG_OPENAI_API_KEY`, `RELAY_CODEX_MODEL`, the inference proxy and separate API billing are not required.** The default model comes from Codex; `RELAY_NATIVE_MODEL` is optional.
+Relay can run three local `codex app-server --stdio` processes. Each process has its own private `CODEX_HOME`, independent ChatGPT login and private Git clones. The native backend needs Python, Git, and the official Codex CLI on macOS or Windows. **Docker, `RELAY_ORG_OPENAI_API_KEY`, `RELAY_CODEX_MODEL`, the inference proxy and separate API billing are not required.** The default model comes from Codex; `RELAY_NATIVE_MODEL` is optional. macOS uses Seatbelt permissions. Windows uses the Codex CLI sandbox on that host. Both refuse a model turn until the workspace isolation probe passes. The human project console and preview sandbox remain macOS-only.
 
 This is a local client for the person controlling the signed-in accounts. The configured Relay owner (default `alice`, displayed as Alex) must initiate tasks and explicitly select handoff targets. A different Relay user, including an administrator, cannot spend these subscriptions. This does not enable hosted cross-user subscription pooling or automatic account rotation when usage limits are reached.
 

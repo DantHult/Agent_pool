@@ -34,7 +34,8 @@ def private_directory(path):
         if parent.is_symlink():
             raise ValueError('Native environment directories must not contain symlinks')
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if path.stat().st_uid != os.getuid() or path.stat().st_mode & 0o077:
+    # Windows permission bits do not record a Unix owner or mode 0700.
+    if os.name != 'nt' and (path.stat().st_uid != os.getuid() or path.stat().st_mode & 0o077):
         raise ValueError('Native environment directories must be owned by this user with mode 0700')
     return path
 
@@ -87,7 +88,7 @@ def toolchain():
     if (path / 'approved.json').is_symlink():
         raise ValueError('Approved toolchain metadata must not be a symlink')
     info = json.loads((path / 'approved.json').read_text())
-    if info.get('uid') != os.getuid() or info.get('digest') != tree_digest(path / 'runtime'):
+    if (os.name != 'nt' and info.get('uid') != os.getuid()) or info.get('digest') != tree_digest(path / 'runtime'):
         raise ValueError('Approved native toolchain changed; provision it again')
     return path / 'runtime'
 
@@ -97,24 +98,38 @@ def toolchain_signature():
     return digest(runtime.parent / 'approved.json') if runtime else ''
 
 
+def _venv_directory(root):
+    return Path(root) / '.venv' / ('Scripts' if os.name == 'nt' else 'bin')
+
+
 def clean_environment(home, runtime=None):
+    from .fs_lock import null_device
     home = Path(home)
-    bins = [home.parent / '.venv/bin']
+    null = null_device()
+    bins = [_venv_directory(home.parent)]
     if runtime:
-        bins.append(Path(runtime) / 'bin')
-    bins.extend((Path(sys.executable).resolve().parent, Path('/usr/bin'), Path('/bin'), Path('/usr/sbin'), Path('/sbin')))
-    return {'PATH': ':'.join(map(str, bins)), 'HOME': str(home), 'ZDOTDIR': str(home),
+        bins.append(Path(runtime) / ('Scripts' if os.name == 'nt' else 'bin'))
+    bins.append(Path(sys.executable).resolve().parent)
+    if os.name != 'nt':
+        bins.extend((Path('/usr/bin'), Path('/bin'), Path('/usr/sbin'), Path('/sbin')))
+    env = {'PATH': os.pathsep.join(map(str, bins)), 'HOME': str(home), 'ZDOTDIR': str(home),
             'TMPDIR': str(home.parent.parent / '.tmp'), 'TMP': str(home.parent.parent / '.tmp'),
             'TEMP': str(home.parent.parent / '.tmp'), 'TMPPREFIX': str(home.parent.parent / '.tmp/zsh'),
             'XDG_CONFIG_HOME': str(home / 'config'), 'XDG_CACHE_HOME': str(home / 'cache'),
-            'PYTHONNOUSERSITE': '1', 'PIP_CONFIG_FILE': '/dev/null', 'PIP_NO_INDEX': '1',
-            'PIP_DISABLE_PIP_VERSION_CHECK': '1', 'NPM_CONFIG_USERCONFIG': '/dev/null',
+            'PYTHONNOUSERSITE': '1', 'PIP_CONFIG_FILE': null, 'PIP_NO_INDEX': '1',
+            'PIP_DISABLE_PIP_VERSION_CHECK': '1', 'NPM_CONFIG_USERCONFIG': null,
             'NPM_CONFIG_GLOBALCONFIG': str(home / 'empty-global-npmrc'), 'NPM_CONFIG_CACHE': str(home / 'npm-cache'),
             'NPM_CONFIG_IGNORE_SCRIPTS': 'true', 'NPM_CONFIG_OFFLINE': 'true',
             # Node's optional host OpenSSL config is outside the approved reads.
             # Use library defaults; HTTPS certificate verification stays enabled.
-            'OPENSSL_CONF': '/dev/null',
-            'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_CONFIG_NOSYSTEM': '1', 'LANG': 'en_US.UTF-8'}
+            'OPENSSL_CONF': null,
+            'GIT_CONFIG_GLOBAL': null, 'GIT_CONFIG_NOSYSTEM': '1', 'LANG': 'en_US.UTF-8'}
+    if os.name == 'nt':
+        env['USERPROFILE'] = str(home)
+        for name in ('SystemRoot', 'WINDIR', 'PATHEXT', 'COMSPEC'):
+            if os.environ.get(name):
+                env[name] = os.environ[name]
+    return env
 
 
 def workspace_environment(working):
@@ -144,7 +159,7 @@ def workspace_environment(working):
         (working / '.native/home').mkdir(parents=True, exist_ok=True)
     home = working / '.native/home'
     env = clean_environment(home, toolchain())
-    env['PATH'] = str(working / '.venv/bin') + ':' + ':'.join(env['PATH'].split(':')[1:])
+    env['PATH'] = str(_venv_directory(working)) + os.pathsep + os.pathsep.join(env['PATH'].split(os.pathsep)[1:])
     env['RELAY_NATIVE_PATH'] = env['PATH']
     if (working / '.venv/pyvenv.cfg').is_file():
         env['VIRTUAL_ENV'] = str(working / '.venv')
@@ -402,7 +417,7 @@ def hydrate(workspace):
     if info['requirements']:
         run([sys.executable, '-I', '-m', 'venv', workspace / '.venv'], workspace, env)
         wheels = sorted((payload / 'wheels').glob('*.whl'))
-        run([workspace / '.venv/bin/python', '-I', '-m', 'pip', '--isolated', 'install', '--no-index', '--no-deps', *wheels], workspace, env)
+        run([_venv_directory(workspace) / ('python.exe' if os.name == 'nt' else 'python'), '-I', '-m', 'pip', '--isolated', 'install', '--no-index', '--no-deps', *wheels], workspace, env)
     for name in info['files']:
         if Path(name).name == 'package.json':
             relative = Path(name).parent

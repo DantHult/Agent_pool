@@ -1,4 +1,5 @@
 """Policy/cleanup regressions; no model calls or implicit network provisioning."""
+import json
 import os
 from pathlib import Path
 import signal
@@ -42,10 +43,10 @@ class NativePreviewTests(unittest.TestCase):
         self.assertNotIn('(allow network-outbound)', policy)
         self.assertNotIn('(allow sysctl-read)', policy)
         self.assertNotIn('kern.procargs', policy)
-        self.assertNotIn(str(self.root / 'profiles'), policy)
-        self.assertNotIn(str(self.root / 'environments'), policy)
-        self.assertIn(str(self.workspace / '.git'), policy)
-        self.assertIn(str(self.workspace / '.relay'), policy)
+        self.assertNotIn(json.dumps(str(self.root / 'profiles')), policy)
+        self.assertNotIn(json.dumps(str(self.root / 'environments')), policy)
+        self.assertIn(json.dumps(str(self.workspace / '.git')), policy)
+        self.assertIn(json.dumps(str(self.workspace / '.relay')), policy)
         self.assertIn('[.]env$', policy)
 
     def test_canonical_or_parent_workspace_cannot_be_granted(self):
@@ -55,7 +56,10 @@ class NativePreviewTests(unittest.TestCase):
 
     def test_symlink_workspace_cannot_grant_another_directory(self):
         link = self.workspace.parent / ('b' * 32)
-        link.symlink_to(self.workspace, target_is_directory=True)
+        try:
+            link.symlink_to(self.workspace, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest('Symlink creation requires privileges or Developer Mode on Windows: ' + str(exc))
         with self.assertRaisesRegex(ValueError, 'symlinks'):
             preview.private_workspace(link)
 
@@ -66,6 +70,7 @@ class NativePreviewTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             preview.preview_policy(self.workspace, runtime='/')
 
+    @unittest.skipUnless(hasattr(os, 'killpg') and hasattr(signal, 'SIGKILL'), 'POSIX process-group cleanup')
     def test_child_uses_sandbox_clean_environment_and_group_cleanup(self):
         fake = Mock(pid=12345)
         fake.poll.return_value = None
@@ -84,6 +89,7 @@ class NativePreviewTests(unittest.TestCase):
             self.assertEqual(kill.call_args_list[1].args, (12345, signal.SIGKILL))
             self.assertEqual(fake.wait.call_count, 2)
 
+    @unittest.skipUnless(hasattr(os, 'killpg') and hasattr(signal, 'SIGKILL'), 'POSIX process-group cleanup')
     def test_cleanup_kills_timed_out_process_group(self):
         fake = Mock(pid=12345)
         fake.wait.side_effect = [subprocess.TimeoutExpired('preview', 5), 0]

@@ -142,7 +142,16 @@ def server_command(codex):
 def server_environment(home):
     # No organization API credential, cookie, access token, AWS credential or
     # inherited CODEX_HOME can affect this locally authenticated profile.
-    env={name:os.environ[name] for name in ('PATH','HOME','LANG','LC_CTYPE') if name in os.environ}
+    home=Path(home).resolve()
+    inherited=('PATH','SystemRoot','WINDIR','PATHEXT','COMSPEC') if os.name=='nt' else ('PATH','HOME','LANG','LC_CTYPE')
+    env={name:os.environ[name] for name in inherited if name in os.environ}
     from .fs_lock import host_path
-    env['CODEX_HOME']=str(Path(home).resolve());env.setdefault('PATH',host_path())
+    env['CODEX_HOME']=str(home);env.setdefault('PATH',host_path())
+    if os.name=='nt':
+        # Keep Codex's files inside this profile. Do not inherit the operator's
+        # USERPROFILE or APPDATA, which can point at another Codex login.
+        env['HOME']=str(home);env['USERPROFILE']=str(home)
+        env['APPDATA']=str(home/'AppData'/'Roaming');env['LOCALAPPDATA']=str(home/'AppData'/'Local')
+        env['TEMP']=str(home/'Temp');env['TMP']=env['TEMP']
+        for path in (env['APPDATA'],env['LOCALAPPDATA'],env['TEMP']):Path(path).mkdir(parents=True,exist_ok=True)
     return env

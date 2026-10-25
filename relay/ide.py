@@ -193,7 +193,7 @@ class ProjectIDE:
     @staticmethod
     def _require_editor_support():
         if not workspace_api._USE_DIR_FD:
-            raise ValueError('Secure editor writes require POSIX directory-descriptor protection. This platform supports the read-only workspace and demo; native execution remains macOS-only.')
+            raise ValueError('Secure editor writes require POSIX directory-descriptor protection. This platform supports the read-only workspace, the demo, and native Codex execution.')
 
     def read_file(self, user, project, name, create=False):
         self.relay.access(user, project)
